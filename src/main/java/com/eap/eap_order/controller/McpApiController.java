@@ -2,7 +2,9 @@ package com.eap.eap_order.controller;
 
 import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.dto.*;
+import com.eap.eap_order.application.AuctionStatusService;
 import com.eap.eap_order.application.OrderQueryService;
+import com.eap.eap_order.application.PlaceAuctionBidService;
 import com.eap.eap_order.application.PlaceBuyOrderService;
 import com.eap.eap_order.application.PlaceSellOrderService;
 import com.eap.eap_order.application.OutBound.EapMatchEngine;
@@ -43,15 +45,21 @@ public class McpApiController {
 
     @Autowired
     private PlaceBuyOrderService placeBuyOrderService;
-    
+
     @Autowired
     private PlaceSellOrderService placeSellOrderService;
-    
+
     @Autowired
     private OrderQueryService orderQueryService;
-    
+
     @Autowired
     private EapMatchEngine eapMatchEngine;
+
+    @Autowired
+    private PlaceAuctionBidService placeAuctionBidService;
+
+    @Autowired
+    private AuctionStatusService auctionStatusService;
 
     @Operation(summary = "統一下單", description = "支援買賣雙向的統一下單接口")
     @ApiResponse(responseCode = "200", description = "下單成功")
@@ -268,17 +276,71 @@ public class McpApiController {
     @ApiResponse(responseCode = "200", description = "服務正常")
     @GetMapping("/health")
     public ResponseEntity<HealthResponse> health() {
-        
+
         // 檢查依賴服務狀態
         Map<String, String> dependencies = new HashMap<>();
         dependencies.put("placeBuyOrderService", "UP");
         dependencies.put("placeSellOrderService", "UP");
         dependencies.put("orderQueryService", "UP");
         dependencies.put("eapMatchEngine", "UP");
-        
+
         HealthResponse response = HealthResponse.up("mcp-api", "1.0.0");
         response.setDependencies(dependencies);
-        
+
         return ResponseEntity.ok(response);
+    }
+
+    // --- Auction MCP Endpoints ---
+
+    @Operation(summary = "Submit auction bid", description = "Submit a sealed bid for the current auction")
+    @ApiResponse(responseCode = "200", description = "Bid submitted")
+    @PostMapping("/auction/bid")
+    public ResponseEntity<AuctionBidResponse> submitAuctionBid(
+            @Valid @RequestBody AuctionBidRequest request) {
+
+        log.info("MCP auction bid: auctionId={}, userId={}, side={}",
+            request.getAuctionId(), request.getUserId(), request.getSide());
+
+        try {
+            AuctionBidResponse response = placeAuctionBidService.submitBid(request);
+            if (response.isSuccess()) {
+                return ResponseEntity.ok(response);
+            } else {
+                return ResponseEntity.badRequest().body(response);
+            }
+        } catch (Exception e) {
+            log.error("MCP auction bid failed", e);
+            return ResponseEntity.internalServerError().body(
+                AuctionBidResponse.failure("Auction bid failed: " + e.getMessage()));
+        }
+    }
+
+    @Operation(summary = "Get auction status", description = "Get current auction session status")
+    @ApiResponse(responseCode = "200", description = "Success")
+    @GetMapping("/auction/status")
+    public ResponseEntity<AuctionStatusDto> getAuctionStatus() {
+        log.info("MCP query auction status");
+        try {
+            AuctionStatusDto status = auctionStatusService.getCurrentAuctionStatus();
+            return ResponseEntity.ok(status);
+        } catch (Exception e) {
+            log.error("MCP get auction status failed: {}", e.getMessage());
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    @Operation(summary = "Get auction results", description = "Get clearing results for a specific auction")
+    @ApiResponse(responseCode = "200", description = "Success")
+    @GetMapping("/auction/results")
+    public ResponseEntity<AuctionResultDto> getAuctionResults(
+            @Parameter(description = "Auction ID") @RequestParam String auctionId) {
+        log.info("MCP query auction results: auctionId={}", auctionId);
+        try {
+            AuctionResultDto results = auctionStatusService.getAuctionResults(auctionId);
+            return ResponseEntity.ok(results);
+        } catch (Exception e) {
+            log.error("MCP get auction results failed: {}", e.getMessage());
+            return ResponseEntity.internalServerError().build();
+        }
     }
 }
