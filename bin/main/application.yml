@@ -1,0 +1,51 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /eap-order
+
+spring:
+  application:
+    name: eap-order
+  datasource:
+    url: jdbc:postgresql://localhost:5432/eapdb
+    username: admin
+    password: admin123
+
+  liquibase:
+    enabled: true
+    change-log: classpath:db/changelog/db.changelog-master.xml
+    contexts: dev
+    drop-first: false
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: admin
+    password: admin123
+    template:
+      message-converter: jackson2JsonMessageConverter
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+
+
+logging:
+  level:
+    '[com.eap.eap_order]': DEBUG
+    '[org.springframework.web]': DEBUG
+
+eap:
+  wallet:
+    base-url: http://localhost:8081/eap-wallet
+  matchEngine:
+    base-url: http://localhost:8082/match-engine

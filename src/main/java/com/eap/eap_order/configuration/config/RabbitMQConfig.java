@@ -1,0 +1,99 @@
+package com.eap.eap_order.configuration.config;
+
+import org.springframework.amqp.core.Binding;
+import org.springframework.amqp.core.BindingBuilder;
+import org.springframework.amqp.core.FanoutExchange;
+import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.core.QueueBuilder;
+import org.springframework.amqp.core.TopicExchange;
+import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
+import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import static com.eap.common.constants.RabbitMQConstants.*;
+
+/**
+ * Order Module RabbitMQ Configuration
+ * 
+ * This module consumes:
+ * - order.created events (for status updates after wallet validation)
+ * - order.matched events (for status updates and trade recording)
+ * - order.failed events (for failure handling)
+ * 
+ * This module publishes:
+ * - order.create events (initial order placement)
+ * 
+ * Topology: Each module gets its own queues bound to shared routing keys
+ */
+@Configuration
+public class RabbitMQConfig {
+
+  @Bean
+  public MessageConverter jsonMessageConverter() {
+    return new Jackson2JsonMessageConverter();
+  }
+
+  @Bean
+  public TopicExchange orderExchange() {
+    return new TopicExchange(ORDER_EXCHANGE);
+  }
+
+  // --- Dead Letter Exchange / Queue (ADR-001) ---
+
+  @Bean
+  public FanoutExchange deadLetterExchange() {
+    return new FanoutExchange(DEAD_LETTER_EXCHANGE);
+  }
+
+  @Bean
+  public Queue deadLetterQueue() {
+    return QueueBuilder.durable(DEAD_LETTER_QUEUE).build();
+  }
+
+  @Bean
+  public Binding dlqBinding(Queue deadLetterQueue, FanoutExchange deadLetterExchange) {
+    return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange);
+  }
+
+  // --- Order module queues (with DLX binding) ---
+
+  @Bean
+  public Queue orderOrderConfirmedQueue() {
+    return QueueBuilder.durable(ORDER_ORDER_CONFIRMED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
+  public Queue orderOrderMatchedQueue() {
+    return QueueBuilder.durable(ORDER_ORDER_MATCHED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
+  public Queue orderOrderFailedQueue() {
+    return QueueBuilder.durable(ORDER_ORDER_FAILED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
+  public Binding orderOrderConfirmedBinding(@Qualifier("orderOrderConfirmedQueue") Queue orderOrderConfirmedQueue, 
+      TopicExchange orderExchange) {
+    return BindingBuilder.bind(orderOrderConfirmedQueue).to(orderExchange).with(ORDER_CONFIRMED_KEY);
+  }
+
+  @Bean
+  public Binding orderOrderMatchedBinding(@Qualifier("orderOrderMatchedQueue") Queue orderOrderMatchedQueue, 
+      TopicExchange orderExchange) {
+    return BindingBuilder.bind(orderOrderMatchedQueue).to(orderExchange).with(ORDER_MATCHED_KEY);
+  }
+
+  @Bean
+  public Binding orderOrderFailedBinding(@Qualifier("orderOrderFailedQueue") Queue orderOrderFailedQueue, 
+      TopicExchange orderExchange) {
+    return BindingBuilder.bind(orderOrderFailedQueue).to(orderExchange).with(ORDER_FAILED_KEY);
+  }
+}

@@ -1,0 +1,3 @@
+rootProject.name = 'eap-order'
+
+includeBuild '../eap-common'

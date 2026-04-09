@@ -1,0 +1,313 @@
+openapi: 3.1.0
+x-stoplight:
+  id: k8tvxtq1wz6cs
+info:
+  title: orderService
+  version: '1.0'
+  summary: api for order module
+  contact:
+    name: et
+  description: |
+    eap平台訂單系統
+servers:
+  - url: 'http://localhost:3000'
+paths:
+  /bid/buy:
+    post:
+      summary: '掛買單'
+      operationId: post-bid-add
+      responses:
+        '200':
+          description: 掛單成功
+        '400':
+          description: 請求錯誤
+      description: 掛單功能 - 買入訂單
+      parameters:
+        - $ref: '#/components/parameters/ID_TOKEN'
+        - $ref: '#/components/parameters/txnSEq'
+      requestBody:
+        $ref: '#/components/requestBodies/PlaceBuyOrderReq'
+      x-internal: false
+    get:
+      summary: '查詢買單列表'
+      operationId: get-bid-buy
+      responses:
+        '200':
+          $ref: '#/components/responses/ListBuyOrderRes'
+        '400':
+          description: 請求錯誤
+      description: 取得目前所有買入訂單
+      parameters:
+        - $ref: '#/components/parameters/txnSEq'
+  /bid/sell:
+    post:
+      summary: '掛賣單'
+      operationId: post-bid-sell
+      responses:
+        '200':
+          description: 掛單成功
+        '400':
+          description: 請求錯誤
+      description: 掛單功能 - 賣出訂單
+      parameters:
+        - $ref: '#/components/parameters/ID_TOKEN'
+        - $ref: '#/components/parameters/txnSEq'
+      requestBody:
+        $ref: '#/components/requestBodies/PlaceSellOrderReq'
+    get:
+      summary: '查詢賣單列表'
+      operationId: get-bid-sell
+      responses:
+        '200':
+          $ref: '#/components/responses/ListSellOrderRes'
+        '400':
+          description: 請求錯誤
+      description: 取得目前所有賣出訂單
+      parameters:
+        - $ref: '#/components/parameters/ID_TOKEN'
+        - $ref: '#/components/parameters/txnSEq'
+  /bid/user-order:
+    get:
+      summary: '查詢用戶訂單'
+      operationId: get-bid-user-order
+      responses:
+        '200':
+          $ref: '#/components/responses/ListUserOrderRes'
+      description: 取得特定用戶的所有訂單
+      parameters:
+        - $ref: '#/components/parameters/ID_TOKEN'
+        - $ref: '#/components/parameters/txnSEq'
+  /bid/match-history:
+    get:
+      summary: '查詢撮合歷史'
+      operationId: get-bid-match-history
+      responses:
+        '200':
+          $ref: '#/components/responses/MatchHistoryRes'
+        '400':
+          description: 請求錯誤
+      description: 取得撮合成交記錄
+      parameters:
+        - $ref: '#/components/parameters/txnSEq'
+components:
+  schemas:
+    BuyOrderDto:
+      type: object
+      properties:
+        buyOrders:
+          type: array
+          items:
+            type: object
+            properties:
+              bidPrice:
+                type: integer
+              amount:
+                type: integer
+              bidder:
+                type: string
+              updateTime:
+                type: string
+      x-examples:
+        Example 1:
+          buyOrders:
+            - bidPrice: 1000
+              amount: 2
+              bidder: tom
+              updateTime: '2025-07-09T18:30:45+08:00'
+    SellOrderDto:
+      type: object
+      properties:
+        sellOrders:
+          type: array
+          items:
+            type: object
+            properties:
+              bidPrice:
+                type: integer
+              amount:
+                type: integer
+              seller:
+                type: string
+              updateTime:
+                type: string
+      x-examples:
+        Example 1:
+          sellOrders:
+            - bidPrice: 1000
+              amount: 2
+              seller: tom
+              updateTime: '2025-07-09T18:30:45+08:00'
+    UserOrderDto:
+      type: object
+      properties:
+        userOrders:
+          type: array
+          items:
+            type: object
+            properties:
+              Price:
+                type: integer
+              amount:
+                type: integer
+              type:
+                type: string
+              updateTime:
+                type: string
+      x-examples:
+        Example 1:
+          userOrders:
+            - Price: 1000
+              amount: 2
+              type: sell
+              updateTime: '2025-07-09T18:30:45+08:00'
+    MatchHistoryDto:
+      type: object
+      properties:
+        matchHistories:
+          type: array
+          items:
+            type: object
+            properties:
+              matchPrice:
+                type: integer
+              amount:
+                type: integer
+              buyer:
+                type: string
+              seller:
+                type: string
+              matchTime:
+                type: string
+      x-examples:
+        Example 1:
+          matchHistories:
+            - matchPrice: 1000
+              amount: 2
+              buyer: tom
+              seller: tommy
+              matchTime: '2025-07-09T18:30:45+08:00'
+  securitySchemes: {}
+  requestBodies:
+    PlaceBuyOrderReq:
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              bidPrice:
+                type: integer
+                description: 買入價格
+              amount:
+                type: integer
+                description: 數量
+              bidder:
+                type: string
+                format: uuid
+                description: 買方 UUID
+            required:
+              - bidPrice
+              - amount
+              - bidder
+          examples:
+            Example 1:
+              value:
+                bidPrice: 1000
+                amount: 1
+                bidder: "550e8400-e29b-41d4-a716-446655440000"
+      description: 掛買單請求
+    PlaceSellOrderReq:
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              sellPrice:
+                type: integer
+                description: 賣出價格
+              amount:
+                type: integer
+                description: 數量
+              seller:
+                type: uuid
+                description: 賣方
+          examples:
+            Example 1:
+              value:
+                sellPrice: 1000
+                amount: 1
+                seller: memberId
+                updateTime: '2025/07/05 12:00:01'
+      description: 掛賣單請求
+  parameters:
+    ID_TOKEN:
+      name: ID_TOKEN
+      in: header
+      required: false
+      schema:
+        type: string
+      description: 驗證用戶登入
+    txnSEq:
+      name: txnSEq
+      in: header
+      required: false
+      schema:
+        type: string
+      description: 交易編號
+  responses:
+    ListBuyOrderRes:
+      description: 買單列表響應
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BuyOrderDto'
+          examples:
+            Example 1:
+              value:
+                buyOrders:
+                  - bidPrice: 1000
+                    amount: 2
+                    bidder: tom
+                    updateTime: '2025-07-09T18:30:45+08:00'
+    ListSellOrderRes:
+      description: 賣單列表響應
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SellOrderDto'
+          examples:
+            Example 1:
+              value:
+                sellOrders:
+                  - bidPrice: 1000
+                    amount: 1
+                    seller: memberId
+                    updateTime: '2025/07/05 12:00:01'
+    ListUserOrderRes:
+      description: 用戶訂單列表響應
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UserOrderDto'
+          examples:
+            Example 1:
+              value:
+                userOrders:
+                  - Price: 1000
+                    amount: 1
+                    type: sell
+                    updateTime: '2025-07-09T18:30:45+08:00'
+    MatchHistoryRes:
+      description: 撮合歷史響應
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MatchHistoryDto'
+          examples:
+            Example 1:
+              value:
+                matchHistories:
+                  - matchPrice: 1000
+                    amount: 2
+                    buyer: tom
+                    seller: tommy
+                    matchTime: '2025-07-09T18:30:45+08:00'

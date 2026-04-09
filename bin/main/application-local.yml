@@ -1,0 +1,4 @@
+# application-local.yml
+eap:
+  wallet:
+    base-url: http://localhost:8081/eap-wallet

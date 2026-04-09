@@ -1,0 +1,195 @@
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <changeSet id="1" author="et">
+        <sql>
+            CREATE SCHEMA IF NOT EXISTS order_service;
+        </sql>
+    </changeSet>
+
+    <changeSet id="2" author="et">
+        <createTable tableName="orders" schemaName="order_service">
+            <column name="id" type="SERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="type" type="VARCHAR(10)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="amount" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="user_uuid" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="update_time" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="3" author="et">
+        <createTable tableName="match_history" schemaName="order_service">
+            <column name="id" type="SERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="amount" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="buyer_uuid" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="seller_uuid" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="update_time" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="4" author="et">
+        <addColumn tableName="orders" schemaName="order_service">
+            <column name="status" type="VARCHAR(32)" defaultValue="PENDING_ASSET_CHECK">
+                <constraints nullable="false"/>
+            </column>
+        </addColumn>
+    </changeSet>
+
+    <changeSet id="5" author="et">
+        <addColumn tableName="match_history" schemaName="order_service">
+            <column name="order_type" type="VARCHAR(10)">
+                <constraints nullable="true"/>
+            </column>
+        </addColumn>
+    </changeSet>
+
+    <changeSet id="6" author="et">
+        <dropTable tableName="orders" schemaName="order_service"/>
+    </changeSet>
+
+    <changeSet id="7" author="eap">
+        <addColumn tableName="match_history" schemaName="order_service">
+            <column name="match_id" type="INTEGER">
+                <constraints nullable="true"/>
+            </column>
+        </addColumn>
+    </changeSet>
+
+    <changeSet id="8" author="eap">
+        <addUniqueConstraint
+            tableName="match_history"
+            schemaName="order_service"
+            columnNames="match_id"
+            constraintName="uk_match_history_match_id"/>
+    </changeSet>
+
+    <changeSet id="9" author="eap">
+        <sql>
+            UPDATE order_service.match_history
+            SET match_id = id
+            WHERE match_id IS NULL;
+        </sql>
+    </changeSet>
+
+    <changeSet id="10" author="eap">
+        <addNotNullConstraint
+            tableName="match_history"
+            schemaName="order_service"
+            columnName="match_id"
+            columnDataType="INTEGER"/>
+    </changeSet>
+
+    <changeSet id="11" author="eap">
+        <sql>
+            UPDATE order_service.match_history
+            SET order_type = 'BUY'
+            WHERE order_type IS NULL;
+        </sql>
+    </changeSet>
+
+    <changeSet id="12" author="eap">
+        <addNotNullConstraint
+            tableName="match_history"
+            schemaName="order_service"
+            columnName="order_type"
+            columnDataType="VARCHAR(10)"/>
+    </changeSet>
+
+    <changeSet id="13" author="eap">
+        <createIndex
+            indexName="idx_match_history_buyer"
+            tableName="match_history"
+            schemaName="order_service">
+            <column name="buyer_uuid"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="14" author="eap">
+        <createIndex
+            indexName="idx_match_history_seller"
+            tableName="match_history"
+            schemaName="order_service">
+            <column name="seller_uuid"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="15" author="eap">
+        <createIndex
+            indexName="idx_match_history_update_time"
+            tableName="match_history"
+            schemaName="order_service">
+            <column name="update_time" descending="true"/>
+        </createIndex>
+    </changeSet>
+
+    <!-- Restore orders table for async backup (ADR-003) -->
+    <changeSet id="16" author="eap">
+        <comment>Restore orders table for async backup (ADR-003)</comment>
+        <createTable tableName="orders" schemaName="order_service">
+            <column name="order_id" type="UUID">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="user_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="amount" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="order_type" type="VARCHAR(4)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="status" type="VARCHAR(20)" defaultValue="CONFIRMED">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP"/>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="17" author="eap">
+        <createIndex indexName="idx_orders_user_id" tableName="orders" schemaName="order_service">
+            <column name="user_id"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="18" author="eap">
+        <createIndex indexName="idx_orders_status" tableName="orders" schemaName="order_service">
+            <column name="status"/>
+        </createIndex>
+    </changeSet>
+
+</databaseChangeLog>
