@@ -1,0 +1,134 @@
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <changeSet id="auction-001" author="eap">
+        <comment>Create auction_sessions table for timed double auction</comment>
+        <createTable tableName="auction_sessions" schemaName="order_service">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="auction_id" type="VARCHAR(20)">
+                <constraints nullable="false" unique="true"/>
+            </column>
+            <column name="status" type="VARCHAR(20)" defaultValue="OPEN">
+                <constraints nullable="false"/>
+            </column>
+            <column name="delivery_hour" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="open_time" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="close_time" type="TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+            <column name="clearing_price" type="INTEGER"/>
+            <column name="clearing_volume" type="INTEGER"/>
+            <column name="participant_count" type="INTEGER" defaultValueNumeric="0"/>
+            <column name="price_floor" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="price_ceiling" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="auction-002" author="eap">
+        <comment>Create auction_bids table with JSONB steps and unique constraint</comment>
+        <createTable tableName="auction_bids" schemaName="order_service">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="auction_id" type="VARCHAR(20)">
+                <constraints nullable="false"
+                             foreignKeyName="fk_auction_bids_session"
+                             references="order_service.auction_sessions(auction_id)"/>
+            </column>
+            <column name="user_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="side" type="VARCHAR(4)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="steps" type="JSONB">
+                <constraints nullable="false"/>
+            </column>
+            <column name="total_locked" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="status" type="VARCHAR(20)" defaultValue="SUBMITTED">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addUniqueConstraint
+            tableName="auction_bids"
+            schemaName="order_service"
+            columnNames="auction_id, user_id, side"
+            constraintName="uk_auction_bids_auction_user_side"/>
+    </changeSet>
+
+    <changeSet id="auction-003" author="eap">
+        <comment>Create auction_results table</comment>
+        <createTable tableName="auction_results" schemaName="order_service">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="auction_id" type="VARCHAR(20)">
+                <constraints nullable="false"
+                             foreignKeyName="fk_auction_results_session"
+                             references="order_service.auction_sessions(auction_id)"/>
+            </column>
+            <column name="user_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="side" type="VARCHAR(4)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="clearing_price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="bid_amount" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="cleared_amount" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="settlement_amount" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="auction-004" author="eap">
+        <comment>Create indexes for auction tables</comment>
+        <createIndex indexName="idx_auction_bids_auction_id" tableName="auction_bids" schemaName="order_service">
+            <column name="auction_id"/>
+        </createIndex>
+        <createIndex indexName="idx_auction_bids_user_id" tableName="auction_bids" schemaName="order_service">
+            <column name="user_id"/>
+        </createIndex>
+        <createIndex indexName="idx_auction_results_auction_id" tableName="auction_results" schemaName="order_service">
+            <column name="auction_id"/>
+        </createIndex>
+        <createIndex indexName="idx_auction_results_user_id" tableName="auction_results" schemaName="order_service">
+            <column name="user_id"/>
+        </createIndex>
+        <createIndex indexName="idx_auction_sessions_status" tableName="auction_sessions" schemaName="order_service">
+            <column name="status"/>
+        </createIndex>
+    </changeSet>
+
+</databaseChangeLog>

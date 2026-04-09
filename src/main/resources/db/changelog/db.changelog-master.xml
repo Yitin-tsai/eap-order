@@ -192,4 +192,6 @@
         </createIndex>
     </changeSet>
 
+    <include file="db/changelog/db.changelog-auction.xml"/>
+
 </databaseChangeLog>
