@@ -92,8 +92,41 @@ public class RabbitMQConfig {
   }
 
   @Bean
-  public Binding orderOrderFailedBinding(@Qualifier("orderOrderFailedQueue") Queue orderOrderFailedQueue, 
+  public Binding orderOrderFailedBinding(@Qualifier("orderOrderFailedQueue") Queue orderOrderFailedQueue,
       TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderFailedQueue).to(orderExchange).with(ORDER_FAILED_KEY);
+  }
+
+  // --- Auction Exchange and Queues ---
+
+  @Bean
+  public TopicExchange auctionExchange() {
+    return new TopicExchange(AUCTION_EXCHANGE);
+  }
+
+  @Bean
+  public Queue orderAuctionClearedQueue() {
+    return QueueBuilder.durable(ORDER_AUCTION_CLEARED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
+  public Queue orderAuctionCreatedQueue() {
+    return QueueBuilder.durable(ORDER_AUCTION_CREATED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
+  public Binding orderAuctionClearedBinding(@Qualifier("orderAuctionClearedQueue") Queue orderAuctionClearedQueue,
+      @Qualifier("auctionExchange") TopicExchange auctionExchange) {
+    return BindingBuilder.bind(orderAuctionClearedQueue).to(auctionExchange).with(AUCTION_CLEARED_KEY);
+  }
+
+  @Bean
+  public Binding orderAuctionCreatedBinding(@Qualifier("orderAuctionCreatedQueue") Queue orderAuctionCreatedQueue,
+      @Qualifier("auctionExchange") TopicExchange auctionExchange) {
+    return BindingBuilder.bind(orderAuctionCreatedQueue).to(auctionExchange).with(AUCTION_CREATED_KEY);
   }
 }
