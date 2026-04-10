@@ -3,7 +3,6 @@ package com.eap.eap_order.application;
 import com.eap.common.dto.AuctionBidRequest;
 import com.eap.common.dto.AuctionBidResponse;
 import com.eap.common.event.AuctionBidSubmittedEvent;
-import com.eap.eap_order.application.OutBound.EapMatchEngine;
 import com.eap.eap_order.configuration.repository.AuctionBidRepository;
 import com.eap.eap_order.domain.entity.AuctionBidEntity;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -11,7 +10,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -21,6 +19,17 @@ import java.util.stream.Collectors;
 
 import static com.eap.common.constants.RabbitMQConstants.*;
 
+/**
+ * Auction bid submission service.
+ *
+ * Follows the wallet-first + outbox pattern (same as CDA order flow):
+ * 1. Validate request
+ * 2. Persist bid to local DB (status=SUBMITTED)
+ * 3. Publish AuctionBidSubmittedEvent → wallet locks funds + outbox → matchEngine
+ *
+ * The bid does NOT go directly to matchEngine. Only wallet-confirmed bids
+ * reach matchEngine via the outbox pattern, ensuring auction fairness.
+ */
 @Service
 @Slf4j
 public class PlaceAuctionBidService {
@@ -30,9 +39,6 @@ public class PlaceAuctionBidService {
 
     @Autowired
     private AuctionBidRepository auctionBidRepository;
-
-    @Autowired
-    private EapMatchEngine eapMatchEngine;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -55,22 +61,7 @@ public class PlaceAuctionBidService {
                 .sum();
         }
 
-        // 3. Forward to matchEngine for Redis collection
-        try {
-            ResponseEntity<AuctionBidResponse> matchResponse = eapMatchEngine.submitAuctionBid(request);
-            if (matchResponse.getBody() == null || !matchResponse.getBody().isSuccess()) {
-                String errorMsg = matchResponse.getBody() != null
-                    ? matchResponse.getBody().getMessage()
-                    : "MatchEngine returned empty response";
-                log.warn("MatchEngine rejected auction bid: {}", errorMsg);
-                return AuctionBidResponse.failure(errorMsg);
-            }
-        } catch (Exception e) {
-            log.error("Failed to forward bid to matchEngine: {}", e.getMessage(), e);
-            return AuctionBidResponse.failure("Failed to submit bid to matching engine: " + e.getMessage());
-        }
-
-        // 4. Persist to local DB
+        // 3. Persist to local DB
         try {
             String stepsJson = objectMapper.writeValueAsString(request.getSteps());
             AuctionBidEntity entity = AuctionBidEntity.builder()
@@ -90,7 +81,7 @@ public class PlaceAuctionBidService {
             return AuctionBidResponse.failure("Internal error: failed to serialize bid steps");
         }
 
-        // 5. Publish event for wallet locking
+        // 4. Publish event to wallet for fund locking (wallet-first pattern)
         List<AuctionBidSubmittedEvent.BidStep> eventSteps = request.getSteps().stream()
             .map(step -> new AuctionBidSubmittedEvent.BidStep(step.getPrice(), step.getAmount()))
             .collect(Collectors.toList());

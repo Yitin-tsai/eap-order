@@ -2,10 +2,8 @@ package com.eap.eap_order.application;
 
 import com.eap.common.dto.AuctionBidRequest;
 import com.eap.common.dto.AuctionBidResponse;
-import com.eap.eap_order.application.OutBound.EapMatchEngine;
 import com.eap.eap_order.configuration.repository.AuctionBidRepository;
 import com.eap.eap_order.domain.entity.AuctionBidEntity;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -17,7 +15,6 @@ import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.http.ResponseEntity;
 
 import java.util.List;
 import java.util.UUID;
@@ -34,9 +31,6 @@ class PlaceAuctionBidServiceTest {
 
     @Mock
     private AuctionBidRepository auctionBidRepository;
-
-    @Mock
-    private EapMatchEngine eapMatchEngine;
 
     @Spy
     private ObjectMapper objectMapper = new ObjectMapper();
@@ -74,16 +68,13 @@ class PlaceAuctionBidServiceTest {
     }
 
     @Test
-    @DisplayName("BUY bid: successful flow should validate, forward to matchEngine, persist, and publish event")
+    @DisplayName("BUY bid: successful flow should validate, persist, and publish event (no Feign to matchEngine)")
     void submitBid_buyBid_successFlow() {
-        AuctionBidResponse matchEngineSuccess = AuctionBidResponse.success(AUCTION_ID, USER_ID, "BUY", 0);
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(matchEngineSuccess));
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
 
         assertThat(result.isSuccess()).isTrue();
-        verify(eapMatchEngine).submitAuctionBid(validBuyRequest);
         verify(auctionBidRepository).save(any(AuctionBidEntity.class));
         verify(rabbitTemplate).convertAndSend(anyString(), anyString(), any(Object.class));
     }
@@ -92,8 +83,6 @@ class PlaceAuctionBidServiceTest {
     @DisplayName("BUY totalLocked = sum(price * amount) for each step")
     void submitBid_buyBid_totalLockedCalculation() {
         // step1: 100*10 = 1000, step2: 90*20 = 1800 → total = 2800
-        AuctionBidResponse matchEngineSuccess = AuctionBidResponse.success(AUCTION_ID, USER_ID, "BUY", 2800);
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(matchEngineSuccess));
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
@@ -110,8 +99,6 @@ class PlaceAuctionBidServiceTest {
     @DisplayName("SELL totalLocked = sum(amount) for each step")
     void submitBid_sellBid_totalLockedCalculation() {
         // step1: 15, step2: 25 → total = 40
-        AuctionBidResponse matchEngineSuccess = AuctionBidResponse.success(AUCTION_ID, USER_ID, "SELL", 40);
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(matchEngineSuccess));
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(validSellRequest);
@@ -125,7 +112,7 @@ class PlaceAuctionBidServiceTest {
     }
 
     @Test
-    @DisplayName("Invalid request (missing userId) should return failure without calling matchEngine")
+    @DisplayName("Invalid request (missing userId) should return failure without persisting or publishing")
     void submitBid_invalidRequest_missingUserId_returnsFailure() {
         AuctionBidRequest invalidRequest = AuctionBidRequest.builder()
             .userId("")
@@ -138,13 +125,12 @@ class PlaceAuctionBidServiceTest {
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getMessage()).isNotBlank();
-        verifyNoInteractions(eapMatchEngine);
         verifyNoInteractions(auctionBidRepository);
         verifyNoInteractions(rabbitTemplate);
     }
 
     @Test
-    @DisplayName("Invalid request (invalid side) should return failure without calling matchEngine")
+    @DisplayName("Invalid request (invalid side) should return failure")
     void submitBid_invalidRequest_invalidSide_returnsFailure() {
         AuctionBidRequest invalidRequest = AuctionBidRequest.builder()
             .userId(USER_ID)
@@ -156,11 +142,11 @@ class PlaceAuctionBidServiceTest {
         AuctionBidResponse result = placeAuctionBidService.submitBid(invalidRequest);
 
         assertThat(result.isSuccess()).isFalse();
-        verifyNoInteractions(eapMatchEngine);
+        verifyNoInteractions(auctionBidRepository);
     }
 
     @Test
-    @DisplayName("Invalid request (empty steps) should return failure without calling matchEngine")
+    @DisplayName("Invalid request (empty steps) should return failure")
     void submitBid_invalidRequest_emptySteps_returnsFailure() {
         AuctionBidRequest invalidRequest = AuctionBidRequest.builder()
             .userId(USER_ID)
@@ -172,54 +158,12 @@ class PlaceAuctionBidServiceTest {
         AuctionBidResponse result = placeAuctionBidService.submitBid(invalidRequest);
 
         assertThat(result.isSuccess()).isFalse();
-        verifyNoInteractions(eapMatchEngine);
-    }
-
-    @Test
-    @DisplayName("MatchEngine returns failure should return failure without persisting or publishing event")
-    void submitBid_matchEngineReturnsFailure_returnsFailure() {
-        AuctionBidResponse matchEngineFailure = AuctionBidResponse.failure("Auction not open");
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(matchEngineFailure));
-
-        AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
-
-        assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getMessage()).isEqualTo("Auction not open");
         verifyNoInteractions(auctionBidRepository);
-        verifyNoInteractions(rabbitTemplate);
-    }
-
-    @Test
-    @DisplayName("MatchEngine returns null body should return failure")
-    void submitBid_matchEngineReturnsNullBody_returnsFailure() {
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(null));
-
-        AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
-
-        assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getMessage()).contains("MatchEngine returned empty response");
-        verifyNoInteractions(auctionBidRepository);
-        verifyNoInteractions(rabbitTemplate);
-    }
-
-    @Test
-    @DisplayName("MatchEngine throws exception should return failure")
-    void submitBid_matchEngineThrowsException_returnsFailure() {
-        when(eapMatchEngine.submitAuctionBid(any())).thenThrow(new RuntimeException("Connection refused"));
-
-        AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
-
-        assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getMessage()).contains("Failed to submit bid to matching engine");
-        verifyNoInteractions(auctionBidRepository);
-        verifyNoInteractions(rabbitTemplate);
     }
 
     @Test
     @DisplayName("Persisted entity should have correct fields")
     void submitBid_persistedEntity_hasCorrectFields() {
-        AuctionBidResponse matchEngineSuccess = AuctionBidResponse.success(AUCTION_ID, USER_ID, "BUY", 2800);
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(matchEngineSuccess));
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         placeAuctionBidService.submitBid(validBuyRequest);
@@ -246,8 +190,6 @@ class PlaceAuctionBidServiceTest {
             .steps(List.of(new AuctionBidRequest.BidStep(100, 10)))
             .build();
 
-        AuctionBidResponse matchEngineSuccess = AuctionBidResponse.success(AUCTION_ID, USER_ID, "BUY", 1000);
-        when(eapMatchEngine.submitAuctionBid(any())).thenReturn(ResponseEntity.ok(matchEngineSuccess));
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(lowerCaseRequest);
