@@ -11,6 +11,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import org.springframework.data.domain.PageRequest;
+
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -93,10 +95,9 @@ public class AuctionStatusService {
      */
     public List<AuctionStatusDto> getAuctionHistory(int limit) {
         List<AuctionSessionEntity> sessions = auctionSessionRepository
-            .findByStatusOrderByCreatedAtDesc("CLEARED");
+            .findByStatusOrderByCreatedAtDesc("CLEARED", PageRequest.of(0, limit));
 
         return sessions.stream()
-            .limit(limit)
             .map(this::buildStatusDto)
             .collect(Collectors.toList());
     }

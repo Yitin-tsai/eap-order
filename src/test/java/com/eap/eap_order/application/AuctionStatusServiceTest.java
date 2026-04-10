@@ -15,12 +15,16 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import org.springframework.data.domain.PageRequest;
+
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -233,11 +237,10 @@ class AuctionStatusServiceTest {
     void getAuctionHistory_multipleClearedSessions_respectsLimit() {
         List<AuctionSessionEntity> clearedSessions = List.of(
             buildClearedSession("A-003", 3),
-            buildClearedSession("A-002", 2),
-            buildClearedSession("A-001", 1)
+            buildClearedSession("A-002", 2)
         );
 
-        when(auctionSessionRepository.findByStatusOrderByCreatedAtDesc("CLEARED"))
+        when(auctionSessionRepository.findByStatusOrderByCreatedAtDesc(eq("CLEARED"), eq(PageRequest.of(0, 2))))
             .thenReturn(clearedSessions);
 
         List<AuctionStatusDto> history = auctionStatusService.getAuctionHistory(2);
@@ -250,7 +253,7 @@ class AuctionStatusServiceTest {
     @Test
     @DisplayName("getAuctionHistory: returns all when limit exceeds available sessions")
     void getAuctionHistory_limitExceedsAvailable_returnsAll() {
-        when(auctionSessionRepository.findByStatusOrderByCreatedAtDesc("CLEARED"))
+        when(auctionSessionRepository.findByStatusOrderByCreatedAtDesc(eq("CLEARED"), eq(PageRequest.of(0, 10))))
             .thenReturn(List.of(clearedSession));
 
         List<AuctionStatusDto> history = auctionStatusService.getAuctionHistory(10);
@@ -263,7 +266,7 @@ class AuctionStatusServiceTest {
     @Test
     @DisplayName("getAuctionHistory: returns empty list when no cleared sessions")
     void getAuctionHistory_noClearedSessions_returnsEmpty() {
-        when(auctionSessionRepository.findByStatusOrderByCreatedAtDesc("CLEARED"))
+        when(auctionSessionRepository.findByStatusOrderByCreatedAtDesc(eq("CLEARED"), eq(PageRequest.of(0, 5))))
             .thenReturn(List.of());
 
         List<AuctionStatusDto> history = auctionStatusService.getAuctionHistory(5);

@@ -92,9 +92,9 @@ class AuctionResultListenerTest {
 
         when(auctionSessionRepository.findByAuctionId(AUCTION_ID)).thenReturn(Optional.of(existingSession));
         when(auctionSessionRepository.save(any())).thenReturn(existingSession);
-        when(auctionBidRepository.findByAuctionIdAndUserId(AUCTION_ID, USER_ID)).thenReturn(List.of(bid));
-        when(auctionBidRepository.save(any())).thenReturn(bid);
-        when(auctionResultRepository.save(any())).thenReturn(new AuctionResultEntity());
+        when(auctionBidRepository.findByAuctionId(AUCTION_ID)).thenReturn(List.of(bid));
+        when(auctionBidRepository.saveAll(anyList())).thenReturn(List.of(bid));
+        when(auctionResultRepository.saveAll(anyList())).thenReturn(List.of(new AuctionResultEntity()));
 
         auctionResultListener.handleAuctionCleared(event);
 
@@ -107,21 +107,24 @@ class AuctionResultListenerTest {
         assertThat(savedSession.getStatus()).isEqualTo("CLEARED");
         assertThat(savedSession.getParticipantCount()).isEqualTo(1);
 
-        // Result saved
-        ArgumentCaptor<AuctionResultEntity> resultCaptor = ArgumentCaptor.forClass(AuctionResultEntity.class);
-        verify(auctionResultRepository).save(resultCaptor.capture());
-        AuctionResultEntity savedResult = resultCaptor.getValue();
-        assertThat(savedResult.getAuctionId()).isEqualTo(AUCTION_ID);
-        assertThat(savedResult.getUserId()).isEqualTo(USER_ID);
-        assertThat(savedResult.getSide()).isEqualTo("BUY");
-        assertThat(savedResult.getClearingPrice()).isEqualTo(95);
-        assertThat(savedResult.getBidAmount()).isEqualTo(100);
-        assertThat(savedResult.getClearedAmount()).isEqualTo(100);
+        // Results saved via saveAll
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<AuctionResultEntity>> resultCaptor = ArgumentCaptor.forClass(List.class);
+        verify(auctionResultRepository).saveAll(resultCaptor.capture());
+        List<AuctionResultEntity> savedResults = resultCaptor.getValue();
+        assertThat(savedResults).hasSize(1);
+        assertThat(savedResults.get(0).getAuctionId()).isEqualTo(AUCTION_ID);
+        assertThat(savedResults.get(0).getUserId()).isEqualTo(USER_ID);
+        assertThat(savedResults.get(0).getSide()).isEqualTo("BUY");
+        assertThat(savedResults.get(0).getClearingPrice()).isEqualTo(95);
+        assertThat(savedResults.get(0).getBidAmount()).isEqualTo(100);
+        assertThat(savedResults.get(0).getClearedAmount()).isEqualTo(100);
 
         // Bid status updated to CLEARED (clearedAmount >= bidAmount)
-        ArgumentCaptor<AuctionBidEntity> bidCaptor = ArgumentCaptor.forClass(AuctionBidEntity.class);
-        verify(auctionBidRepository).save(bidCaptor.capture());
-        assertThat(bidCaptor.getValue().getStatus()).isEqualTo("CLEARED");
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<AuctionBidEntity>> bidCaptor = ArgumentCaptor.forClass(List.class);
+        verify(auctionBidRepository).saveAll(bidCaptor.capture());
+        assertThat(bidCaptor.getValue().get(0).getStatus()).isEqualTo("CLEARED");
 
         // WebSocket push
         verify(messagingTemplate).convertAndSend(eq("/topic/auction/result"), any(Object.class));
@@ -151,15 +154,16 @@ class AuctionResultListenerTest {
 
         when(auctionSessionRepository.findByAuctionId(AUCTION_ID)).thenReturn(Optional.of(existingSession));
         when(auctionSessionRepository.save(any())).thenReturn(existingSession);
-        when(auctionBidRepository.findByAuctionIdAndUserId(AUCTION_ID, USER_ID)).thenReturn(List.of(bid));
-        when(auctionBidRepository.save(any())).thenReturn(bid);
-        when(auctionResultRepository.save(any())).thenReturn(new AuctionResultEntity());
+        when(auctionBidRepository.findByAuctionId(AUCTION_ID)).thenReturn(List.of(bid));
+        when(auctionBidRepository.saveAll(anyList())).thenReturn(List.of(bid));
+        when(auctionResultRepository.saveAll(anyList())).thenReturn(List.of(new AuctionResultEntity()));
 
         auctionResultListener.handleAuctionCleared(event);
 
-        ArgumentCaptor<AuctionBidEntity> bidCaptor = ArgumentCaptor.forClass(AuctionBidEntity.class);
-        verify(auctionBidRepository).save(bidCaptor.capture());
-        assertThat(bidCaptor.getValue().getStatus()).isEqualTo("PARTIAL");
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<AuctionBidEntity>> bidCaptor = ArgumentCaptor.forClass(List.class);
+        verify(auctionBidRepository).saveAll(bidCaptor.capture());
+        assertThat(bidCaptor.getValue().get(0).getStatus()).isEqualTo("PARTIAL");
     }
 
     @Test
@@ -186,15 +190,16 @@ class AuctionResultListenerTest {
 
         when(auctionSessionRepository.findByAuctionId(AUCTION_ID)).thenReturn(Optional.of(existingSession));
         when(auctionSessionRepository.save(any())).thenReturn(existingSession);
-        when(auctionBidRepository.findByAuctionIdAndUserId(AUCTION_ID, USER_ID)).thenReturn(List.of(bid));
-        when(auctionBidRepository.save(any())).thenReturn(bid);
-        when(auctionResultRepository.save(any())).thenReturn(new AuctionResultEntity());
+        when(auctionBidRepository.findByAuctionId(AUCTION_ID)).thenReturn(List.of(bid));
+        when(auctionBidRepository.saveAll(anyList())).thenReturn(List.of(bid));
+        when(auctionResultRepository.saveAll(anyList())).thenReturn(List.of(new AuctionResultEntity()));
 
         auctionResultListener.handleAuctionCleared(event);
 
-        ArgumentCaptor<AuctionBidEntity> bidCaptor = ArgumentCaptor.forClass(AuctionBidEntity.class);
-        verify(auctionBidRepository).save(bidCaptor.capture());
-        assertThat(bidCaptor.getValue().getStatus()).isEqualTo("NOT_CLEARED");
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<AuctionBidEntity>> bidCaptor = ArgumentCaptor.forClass(List.class);
+        verify(auctionBidRepository).saveAll(bidCaptor.capture());
+        assertThat(bidCaptor.getValue().get(0).getStatus()).isEqualTo("NOT_CLEARED");
     }
 
     @Test

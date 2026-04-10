@@ -18,7 +18,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static com.eap.common.constants.RabbitMQConstants.*;
@@ -62,11 +65,18 @@ public class AuctionResultListener {
             }
             auctionSessionRepository.save(session);
 
-            // 2. Save individual results and update bid statuses
-            if (event.getResults() != null) {
+            // 2. Save individual results and update bid statuses (batch)
+            if (event.getResults() != null && !event.getResults().isEmpty()) {
+                // Batch load all bids for this auction into a map
+                Map<UUID, List<AuctionBidEntity>> bidsByUser = auctionBidRepository
+                    .findByAuctionId(event.getAuctionId()).stream()
+                    .collect(Collectors.groupingBy(AuctionBidEntity::getUserId));
+
+                List<AuctionResultEntity> resultEntities = new ArrayList<>();
+                List<AuctionBidEntity> updatedBids = new ArrayList<>();
+
                 for (AuctionClearedEvent.AuctionBidResult result : event.getResults()) {
-                    // Save result entity
-                    AuctionResultEntity resultEntity = AuctionResultEntity.builder()
+                    resultEntities.add(AuctionResultEntity.builder()
                         .auctionId(event.getAuctionId())
                         .userId(result.getUserId())
                         .side(result.getSide())
@@ -75,13 +85,11 @@ public class AuctionResultListener {
                         .clearedAmount(result.getClearedAmount())
                         .settlementAmount(result.getSettlementAmount())
                         .createdAt(LocalDateTime.now())
-                        .build();
-                    auctionResultRepository.save(resultEntity);
+                        .build());
 
-                    // Update bid status
-                    List<AuctionBidEntity> bids = auctionBidRepository
-                        .findByAuctionIdAndUserId(event.getAuctionId(), result.getUserId());
-                    for (AuctionBidEntity bid : bids) {
+                    // Update bid statuses
+                    List<AuctionBidEntity> userBids = bidsByUser.getOrDefault(result.getUserId(), List.of());
+                    for (AuctionBidEntity bid : userBids) {
                         if (result.getClearedAmount() > 0 && result.getClearedAmount() >= result.getBidAmount()) {
                             bid.setStatus("CLEARED");
                         } else if (result.getClearedAmount() > 0) {
@@ -89,9 +97,12 @@ public class AuctionResultListener {
                         } else {
                             bid.setStatus("NOT_CLEARED");
                         }
-                        auctionBidRepository.save(bid);
+                        updatedBids.add(bid);
                     }
                 }
+
+                auctionResultRepository.saveAll(resultEntities);
+                auctionBidRepository.saveAll(updatedBids);
             }
 
             // 3. Push to WebSocket
