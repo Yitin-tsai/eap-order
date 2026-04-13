@@ -12,5 +12,5 @@ public interface AuctionBidRepository extends JpaRepository<AuctionBidEntity, Lo
 
     List<AuctionBidEntity> findByAuctionIdAndUserId(String auctionId, UUID userId);
 
-    boolean existsByAuctionIdAndUserIdAndSide(String auctionId, UUID userId, String side);
+    boolean existsByAuctionIdAndUserId(String auctionId, UUID userId);
 }

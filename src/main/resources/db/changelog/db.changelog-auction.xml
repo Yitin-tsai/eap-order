@@ -131,4 +131,17 @@
         </createIndex>
     </changeSet>
 
+    <changeSet id="auction-005" author="eap">
+        <comment>RISK-5: Change auction_bids UNIQUE constraint from (auction_id, user_id, side) to (auction_id, user_id) to align with Lua participants Set global dedup (no self-hedging allowed)</comment>
+        <dropUniqueConstraint
+            tableName="auction_bids"
+            schemaName="order_service"
+            constraintName="uk_auction_bids_auction_user_side"/>
+        <addUniqueConstraint
+            tableName="auction_bids"
+            schemaName="order_service"
+            columnNames="auction_id, user_id"
+            constraintName="uk_auction_bids_auction_user"/>
+    </changeSet>
+
 </databaseChangeLog>

@@ -16,8 +16,8 @@ import java.util.UUID;
 @Entity
 @Table(name = "auction_bids", schema = "order_service",
        uniqueConstraints = @UniqueConstraint(
-           name = "uk_auction_bids_auction_user_side",
-           columnNames = {"auction_id", "user_id", "side"}))
+           name = "uk_auction_bids_auction_user",
+           columnNames = {"auction_id", "user_id"}))
 public class AuctionBidEntity {
 
     @Id
