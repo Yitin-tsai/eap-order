@@ -70,6 +70,7 @@ class PlaceAuctionBidServiceTest {
     @Test
     @DisplayName("BUY bid: successful flow should validate, persist, and publish event (no Feign to matchEngine)")
     void submitBid_buyBid_successFlow() {
+        when(auctionBidRepository.existsByAuctionIdAndUserId(anyString(), any(UUID.class))).thenReturn(false);
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
@@ -83,6 +84,7 @@ class PlaceAuctionBidServiceTest {
     @DisplayName("BUY totalLocked = sum(price * amount) for each step")
     void submitBid_buyBid_totalLockedCalculation() {
         // step1: 100*10 = 1000, step2: 90*20 = 1800 → total = 2800
+        when(auctionBidRepository.existsByAuctionIdAndUserId(anyString(), any(UUID.class))).thenReturn(false);
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
@@ -99,6 +101,7 @@ class PlaceAuctionBidServiceTest {
     @DisplayName("SELL totalLocked = sum(amount) for each step")
     void submitBid_sellBid_totalLockedCalculation() {
         // step1: 15, step2: 25 → total = 40
+        when(auctionBidRepository.existsByAuctionIdAndUserId(anyString(), any(UUID.class))).thenReturn(false);
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(validSellRequest);
@@ -109,6 +112,90 @@ class PlaceAuctionBidServiceTest {
         ArgumentCaptor<AuctionBidEntity> entityCaptor = ArgumentCaptor.forClass(AuctionBidEntity.class);
         verify(auctionBidRepository).save(entityCaptor.capture());
         assertThat(entityCaptor.getValue().getTotalLocked()).isEqualTo(40);
+    }
+
+    // ─── Duplicate bid prevention (RISK-5) ─────────────────────────────────
+
+    @Test
+    @DisplayName("RISK-5: duplicate bid from same user in same auction should be rejected regardless of side")
+    void submitBid_duplicateBid_sameUser_sameAuction_returnsFailure() {
+        when(auctionBidRepository.existsByAuctionIdAndUserId(AUCTION_ID, UUID.fromString(USER_ID)))
+            .thenReturn(true);
+
+        AuctionBidResponse result = placeAuctionBidService.submitBid(validBuyRequest);
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getMessage()).contains("already submitted a bid");
+        verifyNoMoreInteractions(rabbitTemplate);
+        verify(auctionBidRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("RISK-5: user who submitted BUY cannot submit SELL for the same auction")
+    void submitBid_duplicateBid_buyThenSell_returnsFailure() {
+        // User already has a BUY bid → now tries to submit SELL
+        when(auctionBidRepository.existsByAuctionIdAndUserId(AUCTION_ID, UUID.fromString(USER_ID)))
+            .thenReturn(true);
+
+        AuctionBidResponse result = placeAuctionBidService.submitBid(validSellRequest);
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getMessage()).contains("already submitted a bid");
+        verifyNoMoreInteractions(rabbitTemplate);
+        verify(auctionBidRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("RISK-5: different user in same auction is allowed to submit bid")
+    void submitBid_differentUser_sameAuction_isAllowed() {
+        String otherUserId = "660e8400-e29b-41d4-a716-446655440001";
+        AuctionBidRequest otherUserRequest = AuctionBidRequest.builder()
+            .userId(otherUserId)
+            .auctionId(AUCTION_ID)
+            .side("BUY")
+            .steps(List.of(new AuctionBidRequest.BidStep(100, 5)))
+            .build();
+
+        when(auctionBidRepository.existsByAuctionIdAndUserId(AUCTION_ID, UUID.fromString(otherUserId)))
+            .thenReturn(false);
+        when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
+
+        AuctionBidResponse result = placeAuctionBidService.submitBid(otherUserRequest);
+
+        assertThat(result.isSuccess()).isTrue();
+        verify(auctionBidRepository).save(any(AuctionBidEntity.class));
+    }
+
+    @Test
+    @DisplayName("RISK-5: same user in different auction is allowed to submit bid")
+    void submitBid_sameUser_differentAuction_isAllowed() {
+        String otherAuctionId = "AUCTION-2026-002";
+        AuctionBidRequest otherAuctionRequest = AuctionBidRequest.builder()
+            .userId(USER_ID)
+            .auctionId(otherAuctionId)
+            .side("BUY")
+            .steps(List.of(new AuctionBidRequest.BidStep(100, 5)))
+            .build();
+
+        when(auctionBidRepository.existsByAuctionIdAndUserId(otherAuctionId, UUID.fromString(USER_ID)))
+            .thenReturn(false);
+        when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
+
+        AuctionBidResponse result = placeAuctionBidService.submitBid(otherAuctionRequest);
+
+        assertThat(result.isSuccess()).isTrue();
+        verify(auctionBidRepository).save(any(AuctionBidEntity.class));
+    }
+
+    @Test
+    @DisplayName("RISK-5: duplicate check uses correct auctionId and userId")
+    void submitBid_duplicateCheck_usesCorrectParameters() {
+        when(auctionBidRepository.existsByAuctionIdAndUserId(anyString(), any(UUID.class))).thenReturn(false);
+        when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
+
+        placeAuctionBidService.submitBid(validBuyRequest);
+
+        verify(auctionBidRepository).existsByAuctionIdAndUserId(AUCTION_ID, UUID.fromString(USER_ID));
     }
 
     @Test
@@ -164,6 +251,7 @@ class PlaceAuctionBidServiceTest {
     @Test
     @DisplayName("Persisted entity should have correct fields")
     void submitBid_persistedEntity_hasCorrectFields() {
+        when(auctionBidRepository.existsByAuctionIdAndUserId(anyString(), any(UUID.class))).thenReturn(false);
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         placeAuctionBidService.submitBid(validBuyRequest);
@@ -190,6 +278,7 @@ class PlaceAuctionBidServiceTest {
             .steps(List.of(new AuctionBidRequest.BidStep(100, 10)))
             .build();
 
+        when(auctionBidRepository.existsByAuctionIdAndUserId(anyString(), any(UUID.class))).thenReturn(false);
         when(auctionBidRepository.save(any())).thenReturn(new AuctionBidEntity());
 
         AuctionBidResponse result = placeAuctionBidService.submitBid(lowerCaseRequest);

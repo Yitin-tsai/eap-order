@@ -49,6 +49,14 @@ public class PlaceAuctionBidService {
             return AuctionBidResponse.failure(request.getValidationError());
         }
 
+        // 1b. Duplicate bid check — one bid per user per auction (regardless of side)
+        if (auctionBidRepository.existsByAuctionIdAndUserId(
+                request.getAuctionId(), UUID.fromString(request.getUserId()))) {
+            log.warn("Duplicate bid rejected: auctionId={}, userId={}",
+                request.getAuctionId(), request.getUserId());
+            return AuctionBidResponse.failure("User has already submitted a bid for this auction");
+        }
+
         // 2. Calculate totalLocked
         int totalLocked;
         if (request.isBuy()) {
