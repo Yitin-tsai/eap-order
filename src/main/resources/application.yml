@@ -26,6 +26,8 @@ spring:
       message-converter: jackson2JsonMessageConverter
     listener:
       simple:
+        prefetch: 10
+        default-requeue-rejected: false
         retry:
           enabled: true
           max-attempts: 3
