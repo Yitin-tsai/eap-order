@@ -6,6 +6,7 @@ import com.eap.common.dto.AuctionResultDto;
 import com.eap.common.dto.AuctionStatusDto;
 import com.eap.eap_order.application.AuctionStatusService;
 import com.eap.eap_order.application.PlaceAuctionBidService;
+import com.eap.eap_order.configuration.ratelimit.RateLimit;
 import com.eap.eap_order.controller.dto.req.PlaceAuctionBidReq;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -37,6 +38,7 @@ public class AuctionController {
     @Operation(operationId = "post-auction-bid", summary = "Submit auction bid", description = "Submit a sealed bid for the current auction")
     @ApiResponse(responseCode = "200", description = "Bid submitted")
     @ApiResponse(responseCode = "400", description = "Validation error")
+    @RateLimit(key = "#request.userId", limit = 5, window = 1)
     @PostMapping
     public ResponseEntity<AuctionBidResponse> submitBid(
             @Parameter(description = "Auction bid request") @Valid @RequestBody PlaceAuctionBidReq request) {

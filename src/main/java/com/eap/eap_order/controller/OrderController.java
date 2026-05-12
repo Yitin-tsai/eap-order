@@ -6,6 +6,7 @@ import com.eap.eap_order.application.PlaceBuyOrderService;
 import com.eap.eap_order.application.PlaceSellOrderService;
 import com.eap.eap_order.application.OutBound.EapMatchEngine;
 import com.eap.eap_order.controller.dto.req.CancelOrderReq;
+import com.eap.eap_order.configuration.ratelimit.RateLimit;
 import com.eap.eap_order.controller.dto.req.PlaceBuyOrderReq;
 import com.eap.eap_order.controller.dto.req.PlaceSellOrderReq;
 
@@ -47,6 +48,7 @@ public class OrderController {
     @Operation(operationId = "post-bid-add", summary = "掛買單", description = "掛單功能 - 買入訂單")
     @ApiResponse(responseCode = "200", description = "掛單成功")
     @ApiResponse(responseCode = "400", description = "請求錯誤")
+    @RateLimit(key = "#request.bidder", limit = 5, window = 1)
     @PostMapping("/buy")
     public ResponseEntity<Map<String, Object>> postBidAdd(
             @Parameter(description = "驗證用戶登入") @RequestHeader(value = "ID_TOKEN", required = false) String idToken,
@@ -67,6 +69,7 @@ public class OrderController {
     @Operation(operationId = "post-bid-sell", summary = "掛賣單", description = "掛單功能 - 賣出訂單")
     @ApiResponse(responseCode = "200", description = "掛單成功")
     @ApiResponse(responseCode = "400", description = "請求錯誤")
+    @RateLimit(key = "#request.seller", limit = 5, window = 1)
     @PostMapping("/sell")
     public ResponseEntity<Void> postBidSell(
             @Parameter(description = "驗證用戶登入") @RequestHeader(value = "ID_TOKEN", required = false) String idToken,
