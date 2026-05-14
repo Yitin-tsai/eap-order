@@ -23,6 +23,9 @@ public class PlaceBuyOrderService {
     @Autowired
     private RabbitTemplate rabbitTemplate;
 
+    @Autowired
+    private AuditService auditService;
+
     public UUID execute(PlaceBuyOrderReq request) {
 
         OrderSubmittedEvent event =
@@ -39,6 +42,8 @@ public class PlaceBuyOrderService {
         // 直接發送事件，讓wallet-service異步處理
         rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_SUBMITTED_KEY, event);
         log.info("Buy order create event published: {}", event);
+
+        auditService.record("ORDER_SUBMITTED", event.getOrderId().toString(), event.getUserId(), event);
 
         return event.getOrderId();
     }

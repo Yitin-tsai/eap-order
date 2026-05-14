@@ -42,6 +42,9 @@ public class AuctionResultListener {
     @Autowired
     private SimpMessagingTemplate messagingTemplate;
 
+    @Autowired
+    private AuditService auditService;
+
     @RabbitListener(queues = ORDER_AUCTION_CLEARED_QUEUE)
     @Transactional
     public void handleAuctionCleared(AuctionClearedEvent event) {
@@ -105,7 +108,10 @@ public class AuctionResultListener {
                 auctionBidRepository.saveAll(updatedBids);
             }
 
-            // 3. Push to WebSocket
+            // 3. Audit trail
+            auditService.record("AUCTION_CLEARED", event.getAuctionId(), null, event);
+
+            // 4. Push to WebSocket
             AuctionResultDto resultDto = buildResultDto(event, session);
             messagingTemplate.convertAndSend("/topic/auction/result", resultDto);
             log.info("Auction cleared event processed: auctionId={}, MCP={}, MCV={}",
@@ -149,6 +155,8 @@ public class AuctionResultListener {
                 .build();
             messagingTemplate.convertAndSend("/topic/auction/status", statusDto);
             log.info("Auction session created and WebSocket notified: auctionId={}", event.getAuctionId());
+
+            auditService.record("AUCTION_CREATED", event.getAuctionId(), null, event);
 
         } catch (Exception e) {
             log.error("Failed to process AuctionCreatedEvent: auctionId={}, error={}",

@@ -43,6 +43,9 @@ public class PlaceAuctionBidService {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private AuditService auditService;
+
     public AuctionBidResponse submitBid(AuctionBidRequest request) {
         // 1. Validate
         if (!request.isValid()) {
@@ -106,6 +109,9 @@ public class PlaceAuctionBidService {
         rabbitTemplate.convertAndSend(AUCTION_EXCHANGE, AUCTION_BID_SUBMITTED_KEY, event);
         log.info("AuctionBidSubmittedEvent published: auctionId={}, userId={}, totalLocked={}",
             request.getAuctionId(), request.getUserId(), totalLocked);
+
+        auditService.record("AUCTION_BID_SUBMITTED", request.getAuctionId(),
+                UUID.fromString(request.getUserId()), event);
 
         return AuctionBidResponse.success(
             request.getAuctionId(), request.getUserId(), request.getSide().toUpperCase(), totalLocked);

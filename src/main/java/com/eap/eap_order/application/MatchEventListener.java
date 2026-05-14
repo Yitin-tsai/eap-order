@@ -26,6 +26,9 @@ public class MatchEventListener {
     @Autowired
     private MarketDataService marketDataService;
 
+    @Autowired
+    private AuditService auditService;
+
     /**
      * Handles order matched events for this module
      * - Performs idempotency check using matchId
@@ -60,6 +63,10 @@ public class MatchEventListener {
 
         // 保存成交記錄
         MatchOrderEntity savedOrder = matchOrderRepository.save(matchOrder);
+
+        auditService.record("ORDER_MATCHED",
+                event.getMatchId() != null ? event.getMatchId().toString() : "unknown",
+                event.getBuyerId(), event);
 
         // 推送實時成交數據到 WebSocket
         marketDataService.pushRealtimeTrade(savedOrder);

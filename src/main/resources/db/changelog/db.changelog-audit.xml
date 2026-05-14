@@ -1,0 +1,48 @@
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <changeSet id="audit-001" author="eap">
+        <comment>Create audit_events table for event sourcing with hash chain</comment>
+        <createTable tableName="audit_events" schemaName="order_service">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="event_type" type="VARCHAR(50)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="correlation_id" type="VARCHAR(50)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="user_id" type="UUID"/>
+            <column name="payload" type="JSONB">
+                <constraints nullable="false"/>
+            </column>
+            <column name="prev_hash" type="VARCHAR(64)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="hash" type="VARCHAR(64)">
+                <constraints nullable="false" unique="true" uniqueConstraintName="uk_audit_events_hash"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="audit-002" author="eap">
+        <comment>Create indexes for audit_events</comment>
+        <createIndex indexName="idx_audit_correlation_id" tableName="audit_events" schemaName="order_service">
+            <column name="correlation_id"/>
+        </createIndex>
+        <createIndex indexName="idx_audit_event_type" tableName="audit_events" schemaName="order_service">
+            <column name="event_type"/>
+        </createIndex>
+        <createIndex indexName="idx_audit_created_at" tableName="audit_events" schemaName="order_service">
+            <column name="created_at" descending="true"/>
+        </createIndex>
+    </changeSet>
+
+</databaseChangeLog>

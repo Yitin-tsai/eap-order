@@ -193,5 +193,6 @@
     </changeSet>
 
     <include file="db/changelog/db.changelog-auction.xml"/>
+    <include file="db/changelog/db.changelog-audit.xml"/>
 
 </databaseChangeLog>

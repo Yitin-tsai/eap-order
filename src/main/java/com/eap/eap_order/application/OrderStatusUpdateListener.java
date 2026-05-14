@@ -25,6 +25,9 @@ public class OrderStatusUpdateListener {
     @Autowired
     private OrderRepository orderRepository;
 
+    @Autowired
+    private AuditService auditService;
+
     /**
      * 監聽OrderConfirmedEvent - 表示wallet檢查通過，訂單已進入撮合
      */
@@ -36,6 +39,8 @@ public class OrderStatusUpdateListener {
             "WALLET_CHECK_PASSED",
             "餘額檢查通過，已進入撮合佇列"
         );
+
+        auditService.record("ORDER_CONFIRMED", event.getOrderId().toString(), event.getUserId(), event);
 
         // 非同步備份到 orders 表（ADR-003）
         try {
@@ -73,5 +78,7 @@ public class OrderStatusUpdateListener {
             status,
             failedEvent.getReason()
         );
+
+        auditService.record("ORDER_FAILED", failedEvent.getOrderId().toString(), failedEvent.getUserId(), failedEvent);
     }
 }

@@ -42,6 +42,9 @@ class AuctionResultListenerTest {
     @Mock
     private SimpMessagingTemplate messagingTemplate;
 
+    @Mock
+    private AuditService auditService;
+
     @InjectMocks
     private AuctionResultListener auctionResultListener;
 

@@ -35,6 +35,9 @@ class PlaceAuctionBidServiceTest {
     @Spy
     private ObjectMapper objectMapper = new ObjectMapper();
 
+    @Mock
+    private AuditService auditService;
+
     @InjectMocks
     private PlaceAuctionBidService placeAuctionBidService;
 
