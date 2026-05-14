@@ -142,7 +142,7 @@ public class OrderController {
        OrderCancelEvent cancelEvent = OrderCancelEvent.builder().orderId(request.getOrderId()).build();
        eapMatchEngine.cancelOrder(cancelEvent);
 
-       auditService.record("ORDER_CANCELLED", request.getOrderId().toString(), null, cancelEvent);
+       auditService.record("ORDER_CANCELLED", request.getOrderId().toString(), request.getUserId(), cancelEvent);
 
        return ResponseEntity.ok().build();
     }

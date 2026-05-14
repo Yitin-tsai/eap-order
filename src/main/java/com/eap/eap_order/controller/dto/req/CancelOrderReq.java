@@ -8,5 +8,6 @@ import lombok.Data;
 public class CancelOrderReq {
 
     private UUID orderId;
+    private UUID userId;
 
 }

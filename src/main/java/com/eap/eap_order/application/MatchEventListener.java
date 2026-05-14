@@ -64,9 +64,15 @@ public class MatchEventListener {
         // 保存成交記錄
         MatchOrderEntity savedOrder = matchOrderRepository.save(matchOrder);
 
-        auditService.record("ORDER_MATCHED",
-                event.getMatchId() != null ? event.getMatchId().toString() : "unknown",
-                event.getBuyerId(), event);
+        // Audit: one event per orderId so replay can trace each order's full lifecycle
+        if (event.getBuyerOrderId() != null) {
+            auditService.record("ORDER_MATCHED", event.getBuyerOrderId().toString(),
+                    event.getBuyerId(), event);
+        }
+        if (event.getSellerOrderId() != null) {
+            auditService.record("ORDER_MATCHED", event.getSellerOrderId().toString(),
+                    event.getSellerId(), event);
+        }
 
         // 推送實時成交數據到 WebSocket
         marketDataService.pushRealtimeTrade(savedOrder);

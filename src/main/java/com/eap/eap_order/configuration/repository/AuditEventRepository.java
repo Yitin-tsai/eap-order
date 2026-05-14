@@ -11,6 +11,7 @@ import org.springframework.stereotype.Repository;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 @Repository
 public interface AuditEventRepository extends JpaRepository<AuditEventEntity, Long> {
@@ -23,4 +24,6 @@ public interface AuditEventRepository extends JpaRepository<AuditEventEntity, Lo
     List<AuditEventEntity> findByCorrelationIdOrderByIdAsc(String correlationId);
 
     List<AuditEventEntity> findByIdBetweenOrderByIdAsc(Long fromId, Long toId);
+
+    List<AuditEventEntity> findByUserIdOrderByIdAsc(UUID userId);
 }
