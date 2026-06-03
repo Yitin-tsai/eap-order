@@ -2,6 +2,7 @@ package com.eap.eap_order.controller;
 
 import com.eap.common.event.OrderCancelEvent;
 import com.eap.eap_order.application.OrderQueryService;
+import com.eap.eap_order.application.OrderSubmissionResult;
 import com.eap.eap_order.application.PlaceBuyOrderService;
 import com.eap.eap_order.application.PlaceSellOrderService;
 import com.eap.eap_order.application.OutBound.EapMatchEngine;
@@ -59,10 +60,12 @@ public class OrderController {
             @Parameter(description = "掛買單請求") @Valid @RequestBody PlaceBuyOrderReq request) {
 
         log.info("掛買單請求: {}", request);
-        UUID orderId = placeBuyOrderService.execute(request);
+        OrderSubmissionResult result = placeBuyOrderService.execute(request);
 
         Map<String, Object> response = new HashMap<>();
-        response.put("orderId", orderId);
+        response.put("orderId", result.orderId());
+        response.put("marketId", result.marketId());
+        response.put("marketSequence", result.marketSequence());
         response.put("status", "PENDING_WALLET_CHECK");
         response.put("message", "訂單已提交，正在檢查餘額...");
 
@@ -74,15 +77,23 @@ public class OrderController {
     @ApiResponse(responseCode = "400", description = "請求錯誤")
     @RateLimit(key = "#request.seller", limit = 5, window = 1)
     @PostMapping("/sell")
-    public ResponseEntity<Void> postBidSell(
+    public ResponseEntity<Map<String, Object>> postBidSell(
             @Parameter(description = "驗證用戶登入") @RequestHeader(value = "ID_TOKEN", required = false) String idToken,
             @Parameter(description = "交易編號") @RequestHeader(value = "txnSEq", required = false) String txnSeq,
             @Parameter(description = "掛賣單請求") @Valid @RequestBody PlaceSellOrderReq request) {
 
         log.info("掛賣單請求: {}", request);
 
-        placeSellOrderService.placeSellOrder(request);
-        return ResponseEntity.ok().build();
+        OrderSubmissionResult result = placeSellOrderService.placeSellOrder(request);
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("orderId", result.orderId());
+        response.put("marketId", result.marketId());
+        response.put("marketSequence", result.marketSequence());
+        response.put("status", "PENDING_WALLET_CHECK");
+        response.put("message", "訂單已提交，正在檢查餘額...");
+
+        return ResponseEntity.ok(response);
     }
 
 

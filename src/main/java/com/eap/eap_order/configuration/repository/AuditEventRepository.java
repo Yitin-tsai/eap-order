@@ -21,6 +21,11 @@ public interface AuditEventRepository extends JpaRepository<AuditEventEntity, Lo
     @Query("SELECT a FROM AuditEventEntity a ORDER BY a.id DESC LIMIT 1")
     Optional<AuditEventEntity> findLatestForUpdate();
 
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
+    @Query("SELECT a FROM AuditEventEntity a WHERE a.correlationId = :correlationId ORDER BY a.id DESC LIMIT 1")
+    Optional<AuditEventEntity> findLatestByCorrelationIdForUpdate(String correlationId);
+
     List<AuditEventEntity> findByCorrelationIdOrderByIdAsc(String correlationId);
 
     List<AuditEventEntity> findByIdBetweenOrderByIdAsc(Long fromId, Long toId);

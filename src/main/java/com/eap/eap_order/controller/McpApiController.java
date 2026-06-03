@@ -4,6 +4,7 @@ import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.dto.*;
 import com.eap.eap_order.application.AuctionStatusService;
 import com.eap.eap_order.application.OrderQueryService;
+import com.eap.eap_order.application.OrderSubmissionResult;
 import com.eap.eap_order.application.PlaceAuctionBidService;
 import com.eap.eap_order.application.PlaceBuyOrderService;
 import com.eap.eap_order.application.PlaceSellOrderService;
@@ -77,27 +78,29 @@ public class McpApiController {
         }
 
         try {
-            UUID orderId;
+            OrderSubmissionResult result;
             if (request.isBuy()) {
                 PlaceBuyOrderReq buyReq = PlaceBuyOrderReq.builder()
                     .bidPrice(request.getPriceAsInt())
                     .amount(request.getQtyAsInt())
                     .bidder(UUID.fromString(request.getUserId()))
                     .build();
-                orderId = placeBuyOrderService.execute(buyReq);
+                result = placeBuyOrderService.execute(buyReq);
             } else if (request.isSell()) {
                 PlaceSellOrderReq sellReq = new PlaceSellOrderReq();
                 sellReq.setSellPrice(request.getPriceAsInt());
                 sellReq.setAmount(request.getQtyAsInt());
                 sellReq.setSeller(UUID.fromString(request.getUserId()));
-                orderId = placeSellOrderService.placeSellOrder(sellReq);
+                result = placeSellOrderService.placeSellOrder(sellReq);
             } else {
                 return ResponseEntity.badRequest().body(
                     PlaceOrderResponse.failure("Invalid side: " + request.getSide()));
             }
 
             PlaceOrderResponse response = PlaceOrderResponse.success(
-                orderId.toString(), 
+                result.orderId().toString(),
+                result.marketId(),
+                result.marketSequence(),
                 request.getSide(), 
                 request.getType(), 
                 request.getPrice(), 

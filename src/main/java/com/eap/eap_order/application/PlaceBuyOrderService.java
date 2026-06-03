@@ -26,12 +26,20 @@ public class PlaceBuyOrderService {
     @Autowired
     private AuditService auditService;
 
-    public UUID execute(PlaceBuyOrderReq request) {
+    @Autowired
+    private MarketSequenceService marketSequenceService;
+
+    public OrderSubmissionResult execute(PlaceBuyOrderReq request) {
+        String marketId = MarketSequenceService.DEFAULT_MARKET_ID;
+        Long marketSequence = marketSequenceService.nextSequence(marketId);
+        UUID orderId = UUID.randomUUID();
 
         OrderSubmittedEvent event =
             OrderSubmittedEvent.builder()
-                .orderId(UUID.randomUUID())
+                .orderId(orderId)
                 .userId(request.getBidder())
+                .marketId(marketId)
+                .marketSequence(marketSequence)
                 .price(request.getBidPrice())
                 .amount(request.getAmount())
                 .orderType(OrderType.BUY.name())
@@ -45,6 +53,6 @@ public class PlaceBuyOrderService {
 
         auditService.record("ORDER_SUBMITTED", event.getOrderId().toString(), event.getUserId(), event);
 
-        return event.getOrderId();
+        return new OrderSubmissionResult(orderId, marketId, marketSequence);
     }
 }

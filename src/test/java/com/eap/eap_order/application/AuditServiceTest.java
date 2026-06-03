@@ -39,7 +39,7 @@ class AuditServiceTest {
     @Test
     @DisplayName("First audit event should use genesis hash as prevHash")
     void record_firstEvent_usesGenesisHash() {
-        when(auditEventRepository.findLatestForUpdate()).thenReturn(Optional.empty());
+        when(auditEventRepository.findLatestByCorrelationIdForUpdate("order-123")).thenReturn(Optional.empty());
         when(auditEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         UUID userId = UUID.randomUUID();
@@ -61,7 +61,7 @@ class AuditServiceTest {
     void record_subsequentEvent_chainsToPreviousHash() {
         AuditEventEntity prev = new AuditEventEntity();
         prev.setHash("abcd1234" + "0".repeat(56));
-        when(auditEventRepository.findLatestForUpdate()).thenReturn(Optional.of(prev));
+        when(auditEventRepository.findLatestByCorrelationIdForUpdate("order-123")).thenReturn(Optional.of(prev));
         when(auditEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         auditService.record("ORDER_CONFIRMED", "order-123", UUID.randomUUID(), Map.of("status", "ok"));
@@ -77,7 +77,7 @@ class AuditServiceTest {
     @Test
     @DisplayName("Hash should be deterministic for same inputs")
     void record_sameInputs_producesSameHash() {
-        when(auditEventRepository.findLatestForUpdate()).thenReturn(Optional.empty());
+        when(auditEventRepository.findLatestByCorrelationIdForUpdate("order-1")).thenReturn(Optional.empty());
         when(auditEventRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         auditService.record("ORDER_SUBMITTED", "order-1", UUID.randomUUID(), Map.of("a", 1));
@@ -168,6 +168,45 @@ class AuditServiceTest {
         when(auditEventRepository.findByIdBetweenOrderByIdAsc(1L, 2L)).thenReturn(List.of(e1, e2));
 
         assertThat(auditService.verifyChain(1L, 2L)).isFalse();
+    }
+
+    @Test
+    @DisplayName("verifyChain should allow independent per-order chains in same range")
+    void verifyChain_independentOrderChains_returnsTrue() {
+        AuditEventEntity orderA = new AuditEventEntity();
+        orderA.setId(1L);
+        orderA.setEventType("ORDER_SUBMITTED");
+        orderA.setCorrelationId("order-a");
+        orderA.setPayload("{\"price\":100}");
+        orderA.setPrevHash(GENESIS_HASH);
+        orderA.setCreatedAt(java.time.LocalDateTime.of(2026, 1, 1, 0, 0));
+        orderA.setHash(computeHash(orderA.getEventType(), orderA.getCorrelationId(),
+                orderA.getPayload(), orderA.getPrevHash(), orderA.getCreatedAt()));
+
+        AuditEventEntity orderB = new AuditEventEntity();
+        orderB.setId(2L);
+        orderB.setEventType("ORDER_SUBMITTED");
+        orderB.setCorrelationId("order-b");
+        orderB.setPayload("{\"price\":200}");
+        orderB.setPrevHash(GENESIS_HASH);
+        orderB.setCreatedAt(java.time.LocalDateTime.of(2026, 1, 1, 0, 1));
+        orderB.setHash(computeHash(orderB.getEventType(), orderB.getCorrelationId(),
+                orderB.getPayload(), orderB.getPrevHash(), orderB.getCreatedAt()));
+
+        AuditEventEntity orderAConfirmed = new AuditEventEntity();
+        orderAConfirmed.setId(3L);
+        orderAConfirmed.setEventType("ORDER_CONFIRMED");
+        orderAConfirmed.setCorrelationId("order-a");
+        orderAConfirmed.setPayload("{\"status\":\"ok\"}");
+        orderAConfirmed.setPrevHash(orderA.getHash());
+        orderAConfirmed.setCreatedAt(java.time.LocalDateTime.of(2026, 1, 1, 0, 2));
+        orderAConfirmed.setHash(computeHash(orderAConfirmed.getEventType(), orderAConfirmed.getCorrelationId(),
+                orderAConfirmed.getPayload(), orderAConfirmed.getPrevHash(), orderAConfirmed.getCreatedAt()));
+
+        when(auditEventRepository.findByIdBetweenOrderByIdAsc(1L, 3L))
+                .thenReturn(List.of(orderA, orderB, orderAConfirmed));
+
+        assertThat(auditService.verifyChain(1L, 3L)).isTrue();
     }
 
     @Test

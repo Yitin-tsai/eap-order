@@ -29,7 +29,7 @@ public class AuditService {
 
     @Transactional
     public void record(String eventType, String correlationId, UUID userId, Object payload) {
-        String prevHash = auditEventRepository.findLatestForUpdate()
+        String prevHash = auditEventRepository.findLatestByCorrelationIdForUpdate(correlationId)
                 .map(AuditEventEntity::getHash)
                 .orElse(GENESIS_HASH);
 
@@ -61,8 +61,8 @@ public class AuditService {
             return true;
         }
 
-        for (int i = 0; i < events.size(); i++) {
-            AuditEventEntity event = events.get(i);
+        java.util.Map<String, AuditEventEntity> previousByCorrelationId = new java.util.HashMap<>();
+        for (AuditEventEntity event : events) {
 
             String expectedHash = computeHash(
                     event.getEventType(),
@@ -78,14 +78,19 @@ public class AuditService {
                 return false;
             }
 
-            if (i > 0) {
-                AuditEventEntity prev = events.get(i - 1);
+            AuditEventEntity prev = previousByCorrelationId.get(event.getCorrelationId());
+            if (prev != null) {
                 if (!event.getPrevHash().equals(prev.getHash())) {
                     log.error("Hash chain link broken between id={} and id={}",
                             prev.getId(), event.getId());
                     return false;
                 }
+            } else if (!GENESIS_HASH.equals(event.getPrevHash())) {
+                log.error("Hash chain genesis link broken at id={}, prevHash={}",
+                        event.getId(), event.getPrevHash());
+                return false;
             }
+            previousByCorrelationId.put(event.getCorrelationId(), event);
         }
         return true;
     }

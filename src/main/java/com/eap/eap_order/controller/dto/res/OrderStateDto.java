@@ -17,6 +17,8 @@ public class OrderStateDto {
 
     private UUID orderId;
     private UUID userId;
+    private String marketId;
+    private Long marketSequence;
     private String status;
     private Integer price;
     private Integer amount;

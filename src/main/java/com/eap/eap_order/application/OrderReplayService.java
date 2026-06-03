@@ -87,6 +87,8 @@ public class OrderReplayService {
             switch (event.getEventType()) {
                 case "ORDER_SUBMITTED" -> {
                     state.setCreatedAt(event.getCreatedAt());
+                    if (payload.has("marketId")) state.setMarketId(payload.get("marketId").asText());
+                    if (payload.has("marketSequence")) state.setMarketSequence(payload.get("marketSequence").asLong());
                     if (payload.has("price")) state.setPrice(payload.get("price").asInt());
                     if (payload.has("amount")) state.setAmount(payload.get("amount").asInt());
                     if (payload.has("orderType")) state.setOrderType(payload.get("orderType").asText());

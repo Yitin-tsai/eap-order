@@ -39,7 +39,7 @@ class OrderReplayServiceTest {
     void replay_fullLifecycle_matched() {
         List<AuditEventEntity> events = List.of(
                 buildEvent(1L, "ORDER_SUBMITTED", ORDER_ID, USER_ID,
-                        "{\"price\":100,\"amount\":5,\"orderType\":\"BUY\"}",
+                        "{\"marketId\":\"ENERGY-SPOT\",\"marketSequence\":10,\"price\":100,\"amount\":5,\"orderType\":\"BUY\"}",
                         LocalDateTime.of(2026, 1, 1, 10, 0)),
                 buildEvent(2L, "ORDER_CONFIRMED", ORDER_ID, USER_ID,
                         "{\"orderId\":\"" + ORDER_ID + "\"}",
@@ -54,6 +54,8 @@ class OrderReplayServiceTest {
 
         assertThat(state).isNotNull();
         assertThat(state.getStatus()).isEqualTo("MATCHED");
+        assertThat(state.getMarketId()).isEqualTo("ENERGY-SPOT");
+        assertThat(state.getMarketSequence()).isEqualTo(10L);
         assertThat(state.getPrice()).isEqualTo(100);
         assertThat(state.getAmount()).isEqualTo(5);
         assertThat(state.getOrderType()).isEqualTo("BUY");
