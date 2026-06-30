@@ -39,6 +39,11 @@ public class RabbitMQConfig {
     return new TopicExchange(ORDER_EXCHANGE);
   }
 
+  @Bean
+  public TopicExchange tradeExchange() {
+    return new TopicExchange(TRADE_EXCHANGE);
+  }
+
   // --- Dead Letter Exchange / Queue (ADR-001) ---
 
   @Bean
@@ -73,6 +78,13 @@ public class RabbitMQConfig {
   }
 
   @Bean
+  public Queue orderTradeExecutedQueue() {
+    return QueueBuilder.durable(ORDER_TRADE_EXECUTED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
   public Queue orderOrderFailedQueue() {
     return QueueBuilder.durable(ORDER_ORDER_FAILED_QUEUE)
         .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
@@ -89,6 +101,13 @@ public class RabbitMQConfig {
   public Binding orderOrderMatchedBinding(@Qualifier("orderOrderMatchedQueue") Queue orderOrderMatchedQueue, 
       TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderMatchedQueue).to(orderExchange).with(ORDER_MATCHED_KEY);
+  }
+
+  @Bean
+  public Binding orderTradeExecutedBinding(
+      @Qualifier("orderTradeExecutedQueue") Queue orderTradeExecutedQueue,
+      @Qualifier("tradeExchange") TopicExchange tradeExchange) {
+    return BindingBuilder.bind(orderTradeExecutedQueue).to(tradeExchange).with(TRADE_EXECUTED_KEY);
   }
 
   @Bean

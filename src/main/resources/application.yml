@@ -93,3 +93,5 @@ eap:
         concurrency: 4
       order-matched:
         concurrency: 4
+      trade-executed:
+        concurrency: 4

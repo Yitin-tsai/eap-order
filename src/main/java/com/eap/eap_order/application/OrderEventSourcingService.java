@@ -4,6 +4,7 @@ import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderFailedEvent;
 import com.eap.common.event.OrderMatchedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
+import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAggregate;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
@@ -79,6 +80,18 @@ public class OrderEventSourcingService {
                 ? LocalDateTime.now()
                 : source.getMatchedAt();
         appendFromConsumer(orderId, expectedVersion, eventId(orderId, "MATCHED:" + source.getMatchId()),
+                "OrderMatchedV1", event, aggregate.userId(), occurredAt, null);
+    }
+
+    public void match(UUID orderId, TradeExecutedEvent source) {
+        OrderAggregate aggregate = streamReader.load(orderId);
+        long expectedVersion = aggregate.version();
+        LocalDateTime occurredAt = source.getOccurredAt() == null
+                ? LocalDateTime.now()
+                : source.getOccurredAt();
+        OrderMatchedV1 event = aggregate.match(
+                source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
+        appendFromConsumer(orderId, expectedVersion, eventId(orderId, "MATCHED:" + source.getLegacyMatchId()),
                 "OrderMatchedV1", event, aggregate.userId(), occurredAt, null);
     }
 

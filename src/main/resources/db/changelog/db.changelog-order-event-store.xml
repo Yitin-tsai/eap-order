@@ -128,4 +128,38 @@
         </addColumn>
     </changeSet>
 
+    <changeSet id="order-es-005" author="eap">
+        <comment>Track TradeExecuted application to local Order state</comment>
+        <createTable tableName="order_execution_links" schemaName="order_service">
+            <column name="id" type="BIGSERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="trade_id" type="VARCHAR(80)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="order_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="side" type="VARCHAR(4)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="price" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="quantity" type="INTEGER">
+                <constraints nullable="false"/>
+            </column>
+            <column name="applied_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addUniqueConstraint tableName="order_execution_links" schemaName="order_service"
+                             columnNames="trade_id, order_id"
+                             constraintName="uk_order_execution_trade_order"/>
+        <createIndex tableName="order_execution_links" schemaName="order_service"
+                     indexName="idx_order_execution_order">
+            <column name="order_id"/>
+        </createIndex>
+    </changeSet>
+
 </databaseChangeLog>
