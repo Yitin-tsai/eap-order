@@ -1,0 +1,38 @@
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 35
+      minimum-idle: 10
+
+eap:
+  order:
+    datasource:
+      consumer:
+        maximum-pool-size: 12
+        minimum-idle: 3
+      projection:
+        maximum-pool-size: 3
+        minimum-idle: 1
+    listeners:
+      asset-reservation-confirmed:
+        concurrency: 16
+      asset-reservation-failed:
+        concurrency: 4
+      order-matched:
+        concurrency: 16
+  order-event-outbox:
+    batch-size: 500
+    poll-interval-ms: 100
+  order-projection:
+    enabled: true
+    batch-size: 500
+    poll-interval-ms: 5000
+
+logging:
+  level:
+    '[com.eap.eap_order]': WARN
+    '[com.eap.eap_order.application.PlaceBuyOrderService]': WARN
+    '[com.eap.eap_order.application.PlaceSellOrderService]': WARN
+    '[com.eap.eap_order.controller.OrderController]': WARN
+    '[org.springframework.web]': WARN
+    '[org.hibernate]': WARN

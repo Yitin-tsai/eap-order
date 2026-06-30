@@ -194,5 +194,6 @@
 
     <include file="db/changelog/db.changelog-auction.xml"/>
     <include file="db/changelog/db.changelog-audit.xml"/>
+    <include file="db/changelog/db.changelog-order-event-store.xml"/>
 
 </databaseChangeLog>

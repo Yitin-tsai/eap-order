@@ -4,34 +4,33 @@ package com.eap.eap_order.application;
 import com.eap.eap_order.controller.dto.req.PlaceSellOrderReq;
 import com.eap.eap_order.domain.entity.Order.OrderType;
 import com.eap.common.event.OrderSubmittedEvent;
+import com.eap.eap_order.configuration.backpressure.WalletQueueBackpressureGuard;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
 
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-
-import static com.eap.common.constants.RabbitMQConstants.*;
 
 @Service
 @Slf4j
 public class PlaceSellOrderService {
 
     @Autowired
-    private RabbitTemplate rabbitTemplate;
-
-    @Autowired
-    private AuditService auditService;
+    private OrderEventSourcingService orderEventSourcingService;
 
     @Autowired
     private MarketSequenceService marketSequenceService;
 
+    @Autowired
+    private WalletQueueBackpressureGuard backpressureGuard;
+
     public OrderSubmissionResult placeSellOrder(PlaceSellOrderReq request) {
+        backpressureGuard.checkCanAcceptOrder();
         String marketId = MarketSequenceService.DEFAULT_MARKET_ID;
         Long marketSequence = marketSequenceService.nextSequence(marketId);
-        UUID orderId = UUID.randomUUID();
+        UUID orderId = request.getOrderId() != null ? request.getOrderId() : UUID.randomUUID();
 
         OrderSubmittedEvent event =
                 OrderSubmittedEvent.builder()
@@ -46,11 +45,9 @@ public class PlaceSellOrderService {
                         .build();
         log.info("Creating sell order: {}", event);
 
-        // 直接發送事件，讓wallet-service異步處理
-        rabbitTemplate.convertAndSend(ORDER_EXCHANGE, ORDER_SUBMITTED_KEY, event);
-        log.info("Sell order create event published: {}", event);
-
-        auditService.record("ORDER_SUBMITTED", event.getOrderId().toString(), event.getUserId(), event);
+        // Event Store + integration outbox are committed atomically.
+        orderEventSourcingService.request(event);
+        log.info("Sell order accepted into Event Store: {}", event);
 
         return new OrderSubmissionResult(orderId, marketId, marketSequence);
     }

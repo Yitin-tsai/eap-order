@@ -27,6 +27,35 @@ public class AuditService {
 
     private static final String GENESIS_HASH = "0".repeat(64);
 
+    /**
+     * Writes the first event of a correlation chain without querying for a predecessor.
+     * The database partial unique index makes retries with the same correlationId idempotent.
+     *
+     * @return true when this call created the chain, false when the initial event already existed
+     */
+    @Transactional
+    public boolean recordInitial(String eventType, String correlationId, UUID userId, Object payload) {
+        String payloadJson = serializePayload(payload);
+        LocalDateTime now = LocalDateTime.now();
+        String hash = computeHash(eventType, correlationId, payloadJson, GENESIS_HASH, now);
+
+        int inserted = auditEventRepository.insertInitialIfAbsent(
+                eventType,
+                correlationId,
+                userId,
+                payloadJson,
+                hash,
+                now
+        );
+        if (inserted == 0) {
+            log.debug("Initial audit already exists: correlationId={}", correlationId);
+            return false;
+        }
+        log.debug("Initial audit recorded: type={}, correlationId={}, hash={}",
+                eventType, correlationId, hash.substring(0, 8));
+        return true;
+    }
+
     @Transactional
     public void record(String eventType, String correlationId, UUID userId, Object payload) {
         String prevHash = auditEventRepository.findLatestByCorrelationIdForUpdate(correlationId)

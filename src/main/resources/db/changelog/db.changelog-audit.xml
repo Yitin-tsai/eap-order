@@ -45,4 +45,13 @@
         </createIndex>
     </changeSet>
 
+    <changeSet id="audit-003" author="eap">
+        <comment>Allow only one GENESIS audit event per correlation chain</comment>
+        <sql>
+            CREATE UNIQUE INDEX uk_audit_events_single_genesis
+            ON order_service.audit_events(correlation_id)
+            WHERE prev_hash = repeat('0', 64);
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

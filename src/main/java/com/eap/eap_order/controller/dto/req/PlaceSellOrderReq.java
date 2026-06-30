@@ -8,6 +8,7 @@ import lombok.Data;
 @Data
 public class PlaceSellOrderReq {
 
+    private UUID orderId;
     @NotNull
     private Integer sellPrice;
 

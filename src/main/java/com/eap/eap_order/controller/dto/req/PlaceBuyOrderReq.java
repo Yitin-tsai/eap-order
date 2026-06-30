@@ -10,6 +10,7 @@ import lombok.Data;
 @Builder
 public class PlaceBuyOrderReq {
 
+  private UUID orderId;
   @NotNull private Integer bidPrice;
   @NotNull private Integer amount;
   @NotNull private UUID bidder;

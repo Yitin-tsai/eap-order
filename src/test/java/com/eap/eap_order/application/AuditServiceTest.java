@@ -37,6 +37,47 @@ class AuditServiceTest {
     private static final String GENESIS_HASH = "0".repeat(64);
 
     @Test
+    @DisplayName("Initial audit should insert GENESIS directly without predecessor lookup")
+    void recordInitial_newChain_insertsWithoutLookup() {
+        when(auditEventRepository.insertInitialIfAbsent(
+                anyString(), anyString(), any(), anyString(), anyString(), any()))
+                .thenReturn(1);
+
+        boolean inserted = auditService.recordInitial(
+                "ORDER_SUBMISSION_REQUESTED",
+                "order-initial",
+                UUID.randomUUID(),
+                Map.of("price", 100));
+
+        assertThat(inserted).isTrue();
+        verify(auditEventRepository, never()).findLatestByCorrelationIdForUpdate(anyString());
+        verify(auditEventRepository).insertInitialIfAbsent(
+                eq("ORDER_SUBMISSION_REQUESTED"),
+                eq("order-initial"),
+                any(),
+                anyString(),
+                argThat(hash -> hash.length() == 64),
+                any());
+    }
+
+    @Test
+    @DisplayName("Initial audit retry should be idempotent")
+    void recordInitial_existingChain_returnsFalse() {
+        when(auditEventRepository.insertInitialIfAbsent(
+                anyString(), anyString(), any(), anyString(), anyString(), any()))
+                .thenReturn(0);
+
+        boolean inserted = auditService.recordInitial(
+                "ORDER_SUBMISSION_REQUESTED",
+                "order-existing",
+                UUID.randomUUID(),
+                Map.of("price", 100));
+
+        assertThat(inserted).isFalse();
+        verify(auditEventRepository, never()).findLatestByCorrelationIdForUpdate(anyString());
+    }
+
+    @Test
     @DisplayName("First audit event should use genesis hash as prevHash")
     void record_firstEvent_usesGenesisHash() {
         when(auditEventRepository.findLatestByCorrelationIdForUpdate("order-123")).thenReturn(Optional.empty());

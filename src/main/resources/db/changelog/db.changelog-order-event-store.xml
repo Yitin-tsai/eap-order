@@ -1,0 +1,131 @@
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <changeSet id="order-es-001" author="eap">
+        <comment>Create Order event streams, append-only Event Store, and indexes</comment>
+        <sql>
+            CREATE TABLE order_service.order_stream_heads (
+                aggregate_id UUID PRIMARY KEY,
+                current_version BIGINT NOT NULL DEFAULT 0,
+                last_event_id UUID,
+                last_hash VARCHAR(64) NOT NULL DEFAULT repeat('0', 64),
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_stream_version_non_negative CHECK (current_version &gt;= 0)
+            );
+
+            CREATE TABLE order_service.order_event_store (
+                global_position BIGSERIAL PRIMARY KEY,
+                event_id UUID NOT NULL,
+                aggregate_id UUID NOT NULL,
+                aggregate_type VARCHAR(50) NOT NULL,
+                aggregate_version BIGINT NOT NULL,
+                event_type VARCHAR(100) NOT NULL,
+                payload JSONB NOT NULL,
+                payload_canonical TEXT NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                metadata_canonical TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                occurred_at TIMESTAMP NOT NULL,
+                prev_hash VARCHAR(64) NOT NULL,
+                hash VARCHAR(64) NOT NULL,
+                CONSTRAINT uk_order_event_id UNIQUE (event_id),
+                CONSTRAINT uk_order_aggregate_version UNIQUE (aggregate_id, aggregate_version),
+                CONSTRAINT fk_order_event_stream FOREIGN KEY (aggregate_id)
+                    REFERENCES order_service.order_stream_heads(aggregate_id),
+                CONSTRAINT ck_order_event_version_positive CHECK (aggregate_version &gt; 0),
+                CONSTRAINT ck_order_event_schema_version_positive CHECK (schema_version &gt; 0)
+            );
+
+            CREATE INDEX idx_order_event_stream
+                ON order_service.order_event_store(aggregate_id, aggregate_version);
+            CREATE INDEX idx_order_event_type_position
+                ON order_service.order_event_store(event_type, global_position);
+            CREATE INDEX idx_order_event_occurred_at
+                ON order_service.order_event_store(occurred_at);
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-002" author="eap">
+        <comment>Create reliable Order integration event outbox</comment>
+        <sql>
+            CREATE TABLE order_service.order_event_outbox (
+                id BIGSERIAL PRIMARY KEY,
+                event_id UUID NOT NULL,
+                aggregate_id UUID NOT NULL,
+                exchange_name VARCHAR(100) NOT NULL,
+                routing_key VARCHAR(100) NOT NULL,
+                payload JSONB NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                published_at TIMESTAMP,
+                CONSTRAINT uk_order_outbox_event_id UNIQUE (event_id),
+                CONSTRAINT fk_order_outbox_event FOREIGN KEY (event_id)
+                    REFERENCES order_service.order_event_store(event_id),
+                CONSTRAINT ck_order_outbox_status CHECK (status IN ('PENDING', 'SENT', 'FAILED')),
+                CONSTRAINT ck_order_outbox_attempt_non_negative CHECK (attempt_count &gt;= 0)
+            );
+
+            CREATE INDEX idx_order_outbox_pending_retry
+                ON order_service.order_event_outbox(next_retry_at, created_at)
+                WHERE status = 'PENDING';
+            CREATE INDEX idx_order_outbox_failed
+                ON order_service.order_event_outbox(updated_at)
+                WHERE status = 'FAILED';
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-003" author="eap">
+        <comment>Create rebuildable current-order projection and projector checkpoints</comment>
+        <sql>
+            CREATE TABLE order_service.orders_current (
+                order_id UUID PRIMARY KEY,
+                user_id UUID NOT NULL,
+                market_id VARCHAR(50) NOT NULL,
+                market_sequence BIGINT NOT NULL,
+                side VARCHAR(4) NOT NULL,
+                price INTEGER NOT NULL,
+                original_amount INTEGER NOT NULL,
+                remaining_amount INTEGER NOT NULL,
+                matched_amount INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(30) NOT NULL,
+                aggregate_version BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                CONSTRAINT ck_orders_current_side CHECK (side IN ('BUY', 'SELL')),
+                CONSTRAINT ck_orders_current_amounts CHECK (
+                    original_amount &gt;= 0 AND remaining_amount &gt;= 0 AND matched_amount &gt;= 0
+                ),
+                CONSTRAINT ck_orders_current_version_positive CHECK (aggregate_version &gt; 0)
+            );
+
+            CREATE INDEX idx_orders_current_user_status
+                ON order_service.orders_current(user_id, status);
+            CREATE INDEX idx_orders_current_market_sequence
+                ON order_service.orders_current(market_id, market_sequence);
+
+            CREATE TABLE order_service.projection_checkpoints (
+                projection_name VARCHAR(100) PRIMARY KEY,
+                last_global_position BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_projection_position_non_negative CHECK (last_global_position &gt;= 0)
+            );
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-004" author="eap">
+        <comment>Store integration message type for generic Order outbox relay</comment>
+        <addColumn tableName="order_event_outbox" schemaName="order_service">
+            <column name="message_type" type="VARCHAR(200)" defaultValue="com.eap.common.event.OrderSubmittedEvent">
+                <constraints nullable="false"/>
+            </column>
+        </addColumn>
+    </changeSet>
+
+</databaseChangeLog>

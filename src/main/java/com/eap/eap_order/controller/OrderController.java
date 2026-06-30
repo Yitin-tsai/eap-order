@@ -13,7 +13,7 @@ import com.eap.eap_order.controller.dto.req.PlaceSellOrderReq;
 
 import com.eap.eap_order.controller.dto.res.ListUserOrderRes;
 
-import com.eap.eap_order.application.AuditService;
+import com.eap.eap_order.application.OrderEventSourcingService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
@@ -47,7 +47,7 @@ public class OrderController {
     @Autowired
     private EapMatchEngine eapMatchEngine;
     @Autowired
-    private AuditService auditService;
+    private OrderEventSourcingService orderEventSourcingService;
 
     @Operation(operationId = "post-bid-add", summary = "掛買單", description = "掛單功能 - 買入訂單")
     @ApiResponse(responseCode = "200", description = "掛單成功")
@@ -153,7 +153,7 @@ public class OrderController {
        OrderCancelEvent cancelEvent = OrderCancelEvent.builder().orderId(request.getOrderId()).build();
        eapMatchEngine.cancelOrder(cancelEvent);
 
-       auditService.record("ORDER_CANCELLED", request.getOrderId().toString(), request.getUserId(), cancelEvent);
+       orderEventSourcingService.cancel(request.getOrderId(), request.getUserId());
 
        return ResponseEntity.ok().build();
     }

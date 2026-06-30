@@ -22,8 +22,11 @@ spring:
     port: 5672
     username: admin
     password: admin123
+    publisher-confirm-type: correlated
+    publisher-returns: true
     template:
       message-converter: jackson2JsonMessageConverter
+      mandatory: true
     listener:
       simple:
         prefetch: 10
@@ -55,13 +58,38 @@ springdoc:
   swagger-ui:
     path: /swagger-ui.html
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  metrics:
+    tags:
+      application: eap-order
+
 logging:
   level:
     '[com.eap.eap_order]': DEBUG
     '[org.springframework.web]': DEBUG
 
 eap:
+  order-publisher:
+    confirm-timeout-ms: 5000
+  backpressure:
+    wallet-queue:
+      enabled: true
+      hard-threshold: 10000
+      cache-ttl-ms: 1000
+      hard-retry-after-seconds: 5
   wallet:
     base-url: http://localhost:8081/eap-wallet
   matchEngine:
     base-url: http://localhost:8082/match-engine
+  order:
+    listeners:
+      asset-reservation-confirmed:
+        concurrency: 8
+      asset-reservation-failed:
+        concurrency: 4
+      order-matched:
+        concurrency: 4
