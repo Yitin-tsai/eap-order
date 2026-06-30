@@ -4,6 +4,7 @@ import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderFailedEvent;
 import com.eap.common.event.OrderMatchedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
+import com.eap.common.event.OrderTradeAppliedEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAggregate;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
@@ -24,6 +25,8 @@ import java.util.UUID;
 
 import static com.eap.common.constants.RabbitMQConstants.ORDER_EXCHANGE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_SUBMITTED_KEY;
+import static com.eap.common.constants.RabbitMQConstants.TRADE_EXCHANGE;
+import static com.eap.common.constants.RabbitMQConstants.TRADE_ORDER_APPLIED_KEY;
 
 @Service
 public class OrderEventSourcingService {
@@ -83,7 +86,7 @@ public class OrderEventSourcingService {
                 "OrderMatchedV1", event, aggregate.userId(), occurredAt, null);
     }
 
-    public void match(UUID orderId, TradeExecutedEvent source) {
+    public void match(UUID orderId, TradeExecutedEvent source, String side) {
         OrderAggregate aggregate = streamReader.load(orderId);
         long expectedVersion = aggregate.version();
         LocalDateTime occurredAt = source.getOccurredAt() == null
@@ -91,8 +94,18 @@ public class OrderEventSourcingService {
                 : source.getOccurredAt();
         OrderMatchedV1 event = aggregate.match(
                 source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
+        OrderTradeAppliedEvent integrationEvent = OrderTradeAppliedEvent.builder()
+                .tradeId(source.getTradeId())
+                .orderId(orderId)
+                .side(side)
+                .legacyMatchId(source.getLegacyMatchId())
+                .dealPrice(source.getDealPrice())
+                .quantity(source.getQuantity())
+                .appliedAt(occurredAt)
+                .build();
         appendFromConsumer(orderId, expectedVersion, eventId(orderId, "MATCHED:" + source.getLegacyMatchId()),
-                "OrderMatchedV1", event, aggregate.userId(), occurredAt, null);
+                "OrderMatchedV1", event, aggregate.userId(), occurredAt,
+                new OrderIntegrationEvent(TRADE_EXCHANGE, TRADE_ORDER_APPLIED_KEY, integrationEvent));
     }
 
     public void cancel(UUID orderId, UUID userId) {

@@ -92,14 +92,14 @@ public class RabbitMQConfig {
   }
 
   @Bean
-  public Binding orderOrderConfirmedBinding(@Qualifier("orderOrderConfirmedQueue") Queue orderOrderConfirmedQueue, 
-      TopicExchange orderExchange) {
+  public Binding orderOrderConfirmedBinding(@Qualifier("orderOrderConfirmedQueue") Queue orderOrderConfirmedQueue,
+      @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderConfirmedQueue).to(orderExchange).with(ORDER_CONFIRMED_KEY);
   }
 
   @Bean
-  public Binding orderOrderMatchedBinding(@Qualifier("orderOrderMatchedQueue") Queue orderOrderMatchedQueue, 
-      TopicExchange orderExchange) {
+  public Binding orderOrderMatchedBinding(@Qualifier("orderOrderMatchedQueue") Queue orderOrderMatchedQueue,
+      @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderMatchedQueue).to(orderExchange).with(ORDER_MATCHED_KEY);
   }
 
@@ -112,7 +112,7 @@ public class RabbitMQConfig {
 
   @Bean
   public Binding orderOrderFailedBinding(@Qualifier("orderOrderFailedQueue") Queue orderOrderFailedQueue,
-      TopicExchange orderExchange) {
+      @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderFailedQueue).to(orderExchange).with(ORDER_FAILED_KEY);
   }
 

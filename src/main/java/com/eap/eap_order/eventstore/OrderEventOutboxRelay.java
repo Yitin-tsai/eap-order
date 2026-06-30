@@ -1,6 +1,7 @@
 package com.eap.eap_order.eventstore;
 
 import com.eap.common.event.OrderSubmittedEvent;
+import com.eap.common.event.OrderTradeAppliedEvent;
 import com.eap.eap_order.configuration.publishing.OrderPublishMetrics;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.amqp.AmqpException;
@@ -139,10 +140,13 @@ public class OrderEventOutboxRelay {
     }
 
     private Object deserialize(OutboxRow row) throws Exception {
-        if (!OrderSubmittedEvent.class.getName().equals(row.messageType())) {
-            throw new IllegalArgumentException("Unsupported Order outbox message type: " + row.messageType());
+        if (OrderSubmittedEvent.class.getName().equals(row.messageType())) {
+            return objectMapper.readValue(row.payload(), OrderSubmittedEvent.class);
         }
-        return objectMapper.readValue(row.payload(), OrderSubmittedEvent.class);
+        if (OrderTradeAppliedEvent.class.getName().equals(row.messageType())) {
+            return objectMapper.readValue(row.payload(), OrderTradeAppliedEvent.class);
+        }
+        throw new IllegalArgumentException("Unsupported Order outbox message type: " + row.messageType());
     }
 
     private void recordFailure(OutboxRow row, Exception failure) {

@@ -43,7 +43,7 @@ public class TradeExecutedListener {
             return;
         }
 
-        orderEventSourcingService.match(orderId, event);
+        orderEventSourcingService.match(orderId, event, side);
         orderExecutionLinkRepository.save(new OrderExecutionLinkEntity(
                 event.getTradeId(),
                 orderId,
