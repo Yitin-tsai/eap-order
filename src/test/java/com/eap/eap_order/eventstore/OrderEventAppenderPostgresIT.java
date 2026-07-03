@@ -336,6 +336,79 @@ class OrderEventAppenderPostgresIT {
         assertEquals(2L, currentVersion(aggregateId));
     }
 
+    @Test
+    void appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsent_shouldAppendBothOrdersAndOneOutbox() {
+        UUID buyerOrderId = aggregateId();
+        UUID sellerOrderId = aggregateId();
+        seedCaughtUpProjection(buyerOrderId, 2, "OPEN", 10);
+        seedCaughtUpProjection(sellerOrderId, 2, "OPEN", 10);
+
+        OrderIntegrationEvent sharedMarker = new OrderIntegrationEvent(
+                "trade.exchange",
+                "trade.order.applied",
+                Map.of("tradeId", "trade-pair", "buyerOrderId", buyerOrderId, "sellerOrderId", sellerOrderId));
+
+        OrderEventAppender.TradeExecutionAppendResult result =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsent(
+                        matchedCommandWithoutOutbox(buyerOrderId, "trade-pair"),
+                        4,
+                        tradeLink(buyerOrderId, "trade-pair", "BUY", 4),
+                        matchedCommandWithoutOutbox(sellerOrderId, "trade-pair"),
+                        4,
+                        tradeLink(sellerOrderId, "trade-pair", "SELL", 4),
+                        sharedMarker);
+
+        assertEquals(APPLIED, result.status());
+        assertEquals(1, count("order_event_store", buyerOrderId));
+        assertEquals(1, count("order_event_store", sellerOrderId));
+        assertEquals(1, count("order_execution_links", buyerOrderId));
+        assertEquals(1, count("order_execution_links", sellerOrderId));
+        assertEquals(1, count("order_event_outbox", buyerOrderId));
+        assertEquals(0, count("order_event_outbox", sellerOrderId));
+        assertEquals(3L, currentVersion(buyerOrderId));
+        assertEquals(3L, currentVersion(sellerOrderId));
+    }
+
+    @Test
+    void appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsent_duplicateShouldSkipBothOrders() {
+        UUID buyerOrderId = aggregateId();
+        UUID sellerOrderId = aggregateId();
+        seedCaughtUpProjection(buyerOrderId, 2, "OPEN", 10);
+        seedCaughtUpProjection(sellerOrderId, 2, "OPEN", 10);
+        OrderIntegrationEvent sharedMarker = new OrderIntegrationEvent(
+                "trade.exchange",
+                "trade.order.applied",
+                Map.of("tradeId", "trade-pair-duplicate"));
+
+        OrderEventAppender.TradeExecutionAppendResult first =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsent(
+                        matchedCommandWithoutOutbox(buyerOrderId, "trade-pair-duplicate"),
+                        4,
+                        tradeLink(buyerOrderId, "trade-pair-duplicate", "BUY", 4),
+                        matchedCommandWithoutOutbox(sellerOrderId, "trade-pair-duplicate"),
+                        4,
+                        tradeLink(sellerOrderId, "trade-pair-duplicate", "SELL", 4),
+                        sharedMarker);
+        OrderEventAppender.TradeExecutionAppendResult duplicate =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsent(
+                        matchedCommandWithoutOutbox(buyerOrderId, "trade-pair-duplicate"),
+                        4,
+                        tradeLink(buyerOrderId, "trade-pair-duplicate", "BUY", 4),
+                        matchedCommandWithoutOutbox(sellerOrderId, "trade-pair-duplicate"),
+                        4,
+                        tradeLink(sellerOrderId, "trade-pair-duplicate", "SELL", 4),
+                        sharedMarker);
+
+        assertEquals(APPLIED, first.status());
+        assertEquals(DUPLICATE, duplicate.status());
+        assertEquals(1, count("order_event_store", buyerOrderId));
+        assertEquals(1, count("order_event_store", sellerOrderId));
+        assertEquals(1, count("order_event_outbox", buyerOrderId));
+        assertEquals(0, count("order_event_outbox", sellerOrderId));
+        assertEquals(3L, currentVersion(buyerOrderId));
+        assertEquals(3L, currentVersion(sellerOrderId));
+    }
+
     private UUID aggregateId() {
         UUID id = UUID.randomUUID();
         aggregateIds.add(id);
@@ -373,8 +446,23 @@ class OrderEventAppenderPostgresIT {
         );
     }
 
+    private OrderEventAppendCommand matchedCommandWithoutOutbox(UUID aggregateId, String tradeId) {
+        return command(
+                aggregateId,
+                0,
+                UUID.nameUUIDFromBytes((aggregateId + ":MATCHED:" + tradeId).getBytes(StandardCharsets.UTF_8)),
+                "OrderMatchedV1",
+                Map.of("orderId", aggregateId, "matchId", 1001, "amount", 4, "dealPrice", 20),
+                null
+        );
+    }
+
     private OrderTradeExecutionLink tradeLink(UUID aggregateId, String tradeId, int quantity) {
-        return new OrderTradeExecutionLink(tradeId, aggregateId, "BUY", 20, quantity, LocalDateTime.now());
+        return tradeLink(aggregateId, tradeId, "BUY", quantity);
+    }
+
+    private OrderTradeExecutionLink tradeLink(UUID aggregateId, String tradeId, String side, int quantity) {
+        return new OrderTradeExecutionLink(tradeId, aggregateId, side, 20, quantity, LocalDateTime.now());
     }
 
     private void seedCaughtUpProjection(UUID aggregateId, long version, String status, int remainingAmount) {

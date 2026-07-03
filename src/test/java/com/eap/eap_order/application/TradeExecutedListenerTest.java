@@ -18,14 +18,13 @@ class TradeExecutedListenerTest {
     private OrderEventSourcingService orderEventSourcingService;
 
     @Test
-    void handleTradeExecuted_shouldDispatchBuyerAndSellerOrders() {
+    void handleTradeExecuted_shouldApplyTradeOnce() {
         TradeExecutedEvent event = event();
         TradeExecutedListener listener = new TradeExecutedListener(orderEventSourcingService);
 
         listener.handleTradeExecuted(event);
 
-        verify(orderEventSourcingService).match(event.getBuyerOrderId(), event, "BUY");
-        verify(orderEventSourcingService).match(event.getSellerOrderId(), event, "SELL");
+        verify(orderEventSourcingService).applyTrade(event);
     }
 
     private TradeExecutedEvent event() {

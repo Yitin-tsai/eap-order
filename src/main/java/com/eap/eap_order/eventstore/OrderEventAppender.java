@@ -65,11 +65,37 @@ public class OrderEventAppender {
                 appendMatchedFromCaughtUpProjectionIfTradeLinkAbsentInTransaction(command, matchedQuantity, link));
     }
 
+    public TradeExecutionAppendResult appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsent(
+            OrderEventAppendCommand buyerCommand,
+            int buyerMatchedQuantity,
+            OrderTradeExecutionLink buyerLink,
+            OrderEventAppendCommand sellerCommand,
+            int sellerMatchedQuantity,
+            OrderTradeExecutionLink sellerLink,
+            OrderIntegrationEvent integrationEvent) {
+        return consumerTransactionTemplate.execute(status ->
+                appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsentInTransaction(
+                        buyerCommand, buyerMatchedQuantity, buyerLink,
+                        sellerCommand, sellerMatchedQuantity, sellerLink,
+                        integrationEvent));
+    }
+
     public TradeExecutionAppendResult appendFromConsumerIfTradeLinkAbsent(
             OrderEventAppendCommand command,
             OrderTradeExecutionLink link) {
         return consumerTransactionTemplate.execute(status ->
                 appendFromConsumerIfTradeLinkAbsentInTransaction(command, link));
+    }
+
+    public TradeExecutionAppendResult appendTradeFromConsumerIfTradeLinksAbsent(
+            OrderEventAppendCommand buyerCommand,
+            OrderTradeExecutionLink buyerLink,
+            OrderEventAppendCommand sellerCommand,
+            OrderTradeExecutionLink sellerLink,
+            OrderIntegrationEvent integrationEvent) {
+        return consumerTransactionTemplate.execute(status ->
+                appendTradeFromConsumerIfTradeLinksAbsentInTransaction(
+                        buyerCommand, buyerLink, sellerCommand, sellerLink, integrationEvent));
     }
 
     private OrderEventAppendResult appendInTransaction(
@@ -114,6 +140,47 @@ public class OrderEventAppender {
         return TradeExecutionAppendResult.applied(result);
     }
 
+    private TradeExecutionAppendResult appendTradeMatchedFromCaughtUpProjectionIfTradeLinksAbsentInTransaction(
+            OrderEventAppendCommand buyerDraftCommand,
+            int buyerMatchedQuantity,
+            OrderTradeExecutionLink buyerLink,
+            OrderEventAppendCommand sellerDraftCommand,
+            int sellerMatchedQuantity,
+            OrderTradeExecutionLink sellerLink,
+            OrderIntegrationEvent integrationEvent) {
+        validateDistinctTradeOrders(buyerDraftCommand, sellerDraftCommand);
+        Map<UUID, LockedProjectionState> projections = lockCaughtUpProjectionsInStableOrder(
+                buyerDraftCommand.aggregateId(), sellerDraftCommand.aggregateId());
+        LockedProjectionState buyerProjection = projections.get(buyerDraftCommand.aggregateId());
+        LockedProjectionState sellerProjection = projections.get(sellerDraftCommand.aggregateId());
+        if (buyerProjection == null || sellerProjection == null
+                || !buyerProjection.canMatch(buyerMatchedQuantity)
+                || !sellerProjection.canMatch(sellerMatchedQuantity)) {
+            return TradeExecutionAppendResult.notFastPath();
+        }
+        if (!insertBothExecutionLinksOrDetectDuplicate(buyerLink, sellerLink)) {
+            return TradeExecutionAppendResult.duplicate();
+        }
+
+        OrderEventAppendCommand buyerCommand = withProjectionState(buyerDraftCommand, buyerProjection);
+        OrderEventAppendCommand sellerCommand = withProjectionState(sellerDraftCommand, sellerProjection);
+        OrderEventAppendResult buyerResult = appendInTransactionWithLockedHead(
+                buyerCommand,
+                consumerJdbc,
+                new StreamHead(buyerProjection.currentVersion(), buyerProjection.lastHash()));
+        appendInTransactionWithLockedHead(
+                sellerCommand,
+                consumerJdbc,
+                new StreamHead(sellerProjection.currentVersion(), sellerProjection.lastHash()));
+        insertSharedOutboxIfPresent(
+                consumerJdbc,
+                buyerCommand.eventId(),
+                buyerCommand.aggregateId(),
+                integrationEvent,
+                serialize(integrationEvent.payload()));
+        return TradeExecutionAppendResult.applied(buyerResult);
+    }
+
     private TradeExecutionAppendResult appendFromConsumerIfTradeLinkAbsentInTransaction(
             OrderEventAppendCommand command,
             OrderTradeExecutionLink link) {
@@ -121,6 +188,107 @@ public class OrderEventAppender {
             return TradeExecutionAppendResult.duplicate();
         }
         return TradeExecutionAppendResult.applied(appendInTransaction(command, consumerJdbc));
+    }
+
+    private TradeExecutionAppendResult appendTradeFromConsumerIfTradeLinksAbsentInTransaction(
+            OrderEventAppendCommand buyerCommand,
+            OrderTradeExecutionLink buyerLink,
+            OrderEventAppendCommand sellerCommand,
+            OrderTradeExecutionLink sellerLink,
+            OrderIntegrationEvent integrationEvent) {
+        validateDistinctTradeOrders(buyerCommand, sellerCommand);
+        Map<UUID, StreamHead> heads = lockHeadsInStableOrder(
+                buyerCommand.aggregateId(), sellerCommand.aggregateId());
+        if (!insertBothExecutionLinksOrDetectDuplicate(buyerLink, sellerLink)) {
+            return TradeExecutionAppendResult.duplicate();
+        }
+        OrderEventAppendResult buyerResult = appendInTransactionWithLockedHead(
+                buyerCommand,
+                consumerJdbc,
+                heads.get(buyerCommand.aggregateId()));
+        appendInTransactionWithLockedHead(
+                sellerCommand,
+                consumerJdbc,
+                heads.get(sellerCommand.aggregateId()));
+        insertSharedOutboxIfPresent(
+                consumerJdbc,
+                buyerCommand.eventId(),
+                buyerCommand.aggregateId(),
+                integrationEvent,
+                serialize(integrationEvent.payload()));
+        return TradeExecutionAppendResult.applied(buyerResult);
+    }
+
+    private void validateDistinctTradeOrders(
+            OrderEventAppendCommand buyerCommand,
+            OrderEventAppendCommand sellerCommand) {
+        if (buyerCommand.aggregateId().equals(sellerCommand.aggregateId())) {
+            throw new IllegalArgumentException("Buyer and seller order must be different: " + buyerCommand.aggregateId());
+        }
+    }
+
+    private Map<UUID, LockedProjectionState> lockCaughtUpProjectionsInStableOrder(UUID first, UUID second) {
+        Map<UUID, LockedProjectionState> projections = new HashMap<>();
+        for (UUID aggregateId : stableOrder(first, second)) {
+            LockedProjectionState projection = lockCaughtUpProjection(aggregateId);
+            if (projection != null) {
+                projections.put(aggregateId, projection);
+            }
+        }
+        return projections;
+    }
+
+    private Map<UUID, StreamHead> lockHeadsInStableOrder(UUID first, UUID second) {
+        Map<UUID, StreamHead> heads = new HashMap<>();
+        for (UUID aggregateId : stableOrder(first, second)) {
+            heads.put(aggregateId, lockHead(consumerJdbc, aggregateId));
+        }
+        return heads;
+    }
+
+    private List<UUID> stableOrder(UUID first, UUID second) {
+        return first.compareTo(second) <= 0 ? List.of(first, second) : List.of(second, first);
+    }
+
+    private boolean insertBothExecutionLinksOrDetectDuplicate(
+            OrderTradeExecutionLink buyerLink,
+            OrderTradeExecutionLink sellerLink) {
+        int buyerInserted = insertExecutionLinkIfAbsent(buyerLink);
+        int sellerInserted = insertExecutionLinkIfAbsent(sellerLink);
+        if (buyerInserted == 1 && sellerInserted == 1) {
+            return true;
+        }
+        if (buyerInserted == 0 && sellerInserted == 0 && countExecutionLinks(buyerLink.tradeId()) >= 2) {
+            return false;
+        }
+        throw new IllegalStateException("Partial Order trade application detected: tradeId=" + buyerLink.tradeId());
+    }
+
+    private int countExecutionLinks(String tradeId) {
+        Integer count = consumerJdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM order_service.order_execution_links
+                WHERE trade_id = :tradeId
+                """, Map.of("tradeId", tradeId), Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    private OrderEventAppendCommand withProjectionState(
+            OrderEventAppendCommand draftCommand,
+            LockedProjectionState projection) {
+        Map<String, Object> metadata = new HashMap<>(draftCommand.metadata());
+        metadata.put("correlationId", draftCommand.aggregateId().toString());
+        metadata.put("userId", projection.userId().toString());
+        return new OrderEventAppendCommand(
+                draftCommand.aggregateId(),
+                projection.currentVersion(),
+                draftCommand.eventId(),
+                draftCommand.eventType(),
+                draftCommand.payload(),
+                metadata,
+                draftCommand.schemaVersion(),
+                draftCommand.occurredAt(),
+                draftCommand.integrationEvent());
     }
 
     private LockedProjectionState lockCaughtUpProjection(UUID aggregateId) {
@@ -368,6 +536,31 @@ public class OrderEventAppender {
                 """, new MapSqlParameterSource()
                 .addValue("eventId", command.eventId())
                 .addValue("aggregateId", command.aggregateId())
+                .addValue("exchange", integration.exchange())
+                .addValue("routingKey", integration.routingKey())
+                .addValue("messageType", integration.payload().getClass().getName())
+                .addValue("payload", integrationPayload));
+    }
+
+    private void insertSharedOutboxIfPresent(
+            NamedParameterJdbcTemplate jdbc,
+            UUID eventId,
+            UUID aggregateId,
+            OrderIntegrationEvent integration,
+            String integrationPayload) {
+        if (integration == null) {
+            return;
+        }
+        jdbc.update("""
+                INSERT INTO order_service.order_event_outbox
+                    (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
+                     status, attempt_count, next_retry_at, created_at, updated_at)
+                VALUES
+                    (:eventId, :aggregateId, :exchange, :routingKey, :messageType, CAST(:payload AS jsonb),
+                     'PENDING', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, new MapSqlParameterSource()
+                .addValue("eventId", eventId)
+                .addValue("aggregateId", aggregateId)
                 .addValue("exchange", integration.exchange())
                 .addValue("routingKey", integration.routingKey())
                 .addValue("messageType", integration.payload().getClass().getName())

@@ -6,8 +6,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
-import java.util.UUID;
-
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
 
 @Component
@@ -24,14 +22,6 @@ public class TradeExecutedListener {
         log.debug("Received TradeExecutedEvent: tradeId={}, legacyMatchId={}",
                 event.getTradeId(), event.getLegacyMatchId());
 
-        applyForOrder(event, event.getBuyerOrderId(), "BUY");
-        applyForOrder(event, event.getSellerOrderId(), "SELL");
-    }
-
-    private void applyForOrder(TradeExecutedEvent event, UUID orderId, String side) {
-        if (orderId == null) {
-            return;
-        }
-        orderEventSourcingService.match(orderId, event, side);
+        orderEventSourcingService.applyTrade(event);
     }
 }
