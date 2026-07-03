@@ -1,5 +1,10 @@
 package com.eap.eap_order.eventstore;
 
+import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -112,8 +117,8 @@ public class OrderEventAppender {
             OrderEventAppendCommand draftCommand,
             int matchedQuantity,
             OrderTradeExecutionLink link) {
-        LockedProjectionState projection = lockCaughtUpProjection(draftCommand.aggregateId());
-        if (projection == null || !projection.canMatch(matchedQuantity)) {
+        StreamHead head = lockHead(consumerJdbc, draftCommand.aggregateId());
+        if (!head.canMatch(matchedQuantity)) {
             return TradeExecutionAppendResult.notFastPath();
         }
         if (insertExecutionLinkIfAbsent(link) == 0) {
@@ -122,10 +127,10 @@ public class OrderEventAppender {
 
         Map<String, Object> metadata = new HashMap<>(draftCommand.metadata());
         metadata.put("correlationId", draftCommand.aggregateId().toString());
-        metadata.put("userId", projection.userId().toString());
+        metadata.put("userId", head.userId().toString());
         OrderEventAppendCommand command = new OrderEventAppendCommand(
                 draftCommand.aggregateId(),
-                projection.currentVersion(),
+                head.currentVersion(),
                 draftCommand.eventId(),
                 draftCommand.eventType(),
                 draftCommand.payload(),
@@ -136,7 +141,7 @@ public class OrderEventAppender {
         OrderEventAppendResult result = appendInTransactionWithLockedHead(
                 command,
                 consumerJdbc,
-                new StreamHead(projection.currentVersion(), projection.lastHash()));
+                head);
         return TradeExecutionAppendResult.applied(result);
     }
 
@@ -149,29 +154,29 @@ public class OrderEventAppender {
             OrderTradeExecutionLink sellerLink,
             OrderIntegrationEvent integrationEvent) {
         validateDistinctTradeOrders(buyerDraftCommand, sellerDraftCommand);
-        Map<UUID, LockedProjectionState> projections = lockCaughtUpProjectionsInStableOrder(
+        Map<UUID, StreamHead> heads = lockHeadsInStableOrder(
                 buyerDraftCommand.aggregateId(), sellerDraftCommand.aggregateId());
-        LockedProjectionState buyerProjection = projections.get(buyerDraftCommand.aggregateId());
-        LockedProjectionState sellerProjection = projections.get(sellerDraftCommand.aggregateId());
-        if (buyerProjection == null || sellerProjection == null
-                || !buyerProjection.canMatch(buyerMatchedQuantity)
-                || !sellerProjection.canMatch(sellerMatchedQuantity)) {
+        StreamHead buyerHead = heads.get(buyerDraftCommand.aggregateId());
+        StreamHead sellerHead = heads.get(sellerDraftCommand.aggregateId());
+        if (buyerHead == null || sellerHead == null
+                || !buyerHead.canMatch(buyerMatchedQuantity)
+                || !sellerHead.canMatch(sellerMatchedQuantity)) {
             return TradeExecutionAppendResult.notFastPath();
         }
         if (!insertBothExecutionLinksOrDetectDuplicate(buyerLink, sellerLink)) {
             return TradeExecutionAppendResult.duplicate();
         }
 
-        OrderEventAppendCommand buyerCommand = withProjectionState(buyerDraftCommand, buyerProjection);
-        OrderEventAppendCommand sellerCommand = withProjectionState(sellerDraftCommand, sellerProjection);
+        OrderEventAppendCommand buyerCommand = withHeadState(buyerDraftCommand, buyerHead);
+        OrderEventAppendCommand sellerCommand = withHeadState(sellerDraftCommand, sellerHead);
         OrderEventAppendResult buyerResult = appendInTransactionWithLockedHead(
                 buyerCommand,
                 consumerJdbc,
-                new StreamHead(buyerProjection.currentVersion(), buyerProjection.lastHash()));
+                buyerHead);
         appendInTransactionWithLockedHead(
                 sellerCommand,
                 consumerJdbc,
-                new StreamHead(sellerProjection.currentVersion(), sellerProjection.lastHash()));
+                sellerHead);
         insertSharedOutboxIfPresent(
                 consumerJdbc,
                 buyerCommand.eventId(),
@@ -227,22 +232,25 @@ public class OrderEventAppender {
         }
     }
 
-    private Map<UUID, LockedProjectionState> lockCaughtUpProjectionsInStableOrder(UUID first, UUID second) {
-        Map<UUID, LockedProjectionState> projections = new HashMap<>();
-        for (UUID aggregateId : stableOrder(first, second)) {
-            LockedProjectionState projection = lockCaughtUpProjection(aggregateId);
-            if (projection != null) {
-                projections.put(aggregateId, projection);
-            }
-        }
-        return projections;
-    }
-
     private Map<UUID, StreamHead> lockHeadsInStableOrder(UUID first, UUID second) {
         Map<UUID, StreamHead> heads = new HashMap<>();
-        for (UUID aggregateId : stableOrder(first, second)) {
-            heads.put(aggregateId, lockHead(consumerJdbc, aggregateId));
-        }
+        List<UUID> aggregateIds = stableOrder(first, second);
+        consumerJdbc.query("""
+                SELECT aggregate_id, current_version, last_hash, user_id, remaining_amount, status
+                FROM order_service.order_stream_heads
+                WHERE aggregate_id IN (:aggregateIds)
+                ORDER BY aggregate_id
+                FOR UPDATE
+                """, Map.of("aggregateIds", aggregateIds), rs -> {
+            heads.put(
+                    rs.getObject("aggregate_id", UUID.class),
+                    new StreamHead(
+                            rs.getLong("current_version"),
+                            rs.getString("last_hash"),
+                            rs.getObject("user_id", UUID.class),
+                            (Integer) rs.getObject("remaining_amount"),
+                            rs.getString("status")));
+        });
         return heads;
     }
 
@@ -253,15 +261,48 @@ public class OrderEventAppender {
     private boolean insertBothExecutionLinksOrDetectDuplicate(
             OrderTradeExecutionLink buyerLink,
             OrderTradeExecutionLink sellerLink) {
-        int buyerInserted = insertExecutionLinkIfAbsent(buyerLink);
-        int sellerInserted = insertExecutionLinkIfAbsent(sellerLink);
-        if (buyerInserted == 1 && sellerInserted == 1) {
+        int inserted = insertBothExecutionLinksIfAbsent(buyerLink, sellerLink);
+        if (inserted == 2) {
             return true;
         }
-        if (buyerInserted == 0 && sellerInserted == 0 && countExecutionLinks(buyerLink.tradeId()) >= 2) {
+        if (inserted == 0 && countExecutionLinks(buyerLink.tradeId()) >= 2) {
             return false;
         }
         throw new IllegalStateException("Partial Order trade application detected: tradeId=" + buyerLink.tradeId());
+    }
+
+    private int insertBothExecutionLinksIfAbsent(
+            OrderTradeExecutionLink buyerLink,
+            OrderTradeExecutionLink sellerLink) {
+        Integer inserted = consumerJdbc.queryForObject("""
+                WITH input(trade_id, order_id, side, price, quantity, applied_at) AS (
+                    VALUES
+                        (:buyerTradeId, :buyerOrderId, :buyerSide, :buyerPrice, :buyerQuantity, :buyerAppliedAt),
+                        (:sellerTradeId, :sellerOrderId, :sellerSide, :sellerPrice, :sellerQuantity, :sellerAppliedAt)
+                ),
+                inserted AS (
+                    INSERT INTO order_service.order_execution_links
+                        (trade_id, order_id, side, price, quantity, applied_at)
+                    SELECT trade_id, order_id, side, price, quantity, applied_at
+                    FROM input
+                    ON CONFLICT (trade_id, order_id) DO NOTHING
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM inserted
+                """, new MapSqlParameterSource()
+                .addValue("buyerTradeId", buyerLink.tradeId())
+                .addValue("buyerOrderId", buyerLink.orderId())
+                .addValue("buyerSide", buyerLink.side())
+                .addValue("buyerPrice", buyerLink.price())
+                .addValue("buyerQuantity", buyerLink.quantity())
+                .addValue("buyerAppliedAt", buyerLink.appliedAt())
+                .addValue("sellerTradeId", sellerLink.tradeId())
+                .addValue("sellerOrderId", sellerLink.orderId())
+                .addValue("sellerSide", sellerLink.side())
+                .addValue("sellerPrice", sellerLink.price())
+                .addValue("sellerQuantity", sellerLink.quantity())
+                .addValue("sellerAppliedAt", sellerLink.appliedAt()), Integer.class);
+        return inserted == null ? 0 : inserted;
     }
 
     private int countExecutionLinks(String tradeId) {
@@ -273,15 +314,15 @@ public class OrderEventAppender {
         return count == null ? 0 : count;
     }
 
-    private OrderEventAppendCommand withProjectionState(
+    private OrderEventAppendCommand withHeadState(
             OrderEventAppendCommand draftCommand,
-            LockedProjectionState projection) {
+            StreamHead head) {
         Map<String, Object> metadata = new HashMap<>(draftCommand.metadata());
         metadata.put("correlationId", draftCommand.aggregateId().toString());
-        metadata.put("userId", projection.userId().toString());
+        metadata.put("userId", head.userId().toString());
         return new OrderEventAppendCommand(
                 draftCommand.aggregateId(),
-                projection.currentVersion(),
+                head.currentVersion(),
                 draftCommand.eventId(),
                 draftCommand.eventType(),
                 draftCommand.payload(),
@@ -289,26 +330,6 @@ public class OrderEventAppender {
                 draftCommand.schemaVersion(),
                 draftCommand.occurredAt(),
                 draftCommand.integrationEvent());
-    }
-
-    private LockedProjectionState lockCaughtUpProjection(UUID aggregateId) {
-        List<LockedProjectionState> rows = consumerJdbc.query("""
-                SELECT h.current_version, h.last_hash,
-                       oc.user_id, oc.remaining_amount, oc.status
-                FROM order_service.order_stream_heads h
-                JOIN order_service.orders_current oc
-                  ON oc.order_id = h.aggregate_id
-                 AND oc.aggregate_version = h.current_version
-                WHERE h.aggregate_id = :aggregateId
-                FOR UPDATE OF h
-                """, Map.of("aggregateId", aggregateId),
-                (rs, rowNum) -> new LockedProjectionState(
-                        rs.getLong("current_version"),
-                        rs.getString("last_hash"),
-                        rs.getObject("user_id", UUID.class),
-                        rs.getInt("remaining_amount"),
-                        rs.getString("status")));
-        return rows.isEmpty() ? null : rows.get(0);
     }
 
     private int insertExecutionLinkIfAbsent(OrderTradeExecutionLink link) {
@@ -369,7 +390,7 @@ public class OrderEventAppender {
             }
             throw e;
         }
-        updateHead(jdbc, command.aggregateId(), head.currentVersion(), nextVersion, command.eventId(), hash);
+        updateHead(jdbc, command, head, nextVersion, hash);
         insertOutboxIfPresent(jdbc, command, payloadCanonical);
 
         return new OrderEventAppendResult(
@@ -418,12 +439,17 @@ public class OrderEventAppender {
 
     private StreamHead lockHead(NamedParameterJdbcTemplate jdbc, UUID aggregateId) {
         List<StreamHead> rows = jdbc.query("""
-                SELECT current_version, last_hash
+                SELECT current_version, last_hash, user_id, remaining_amount, status
                 FROM order_service.order_stream_heads
                 WHERE aggregate_id = :aggregateId
                 FOR UPDATE
                 """, Map.of("aggregateId", aggregateId),
-                (rs, rowNum) -> new StreamHead(rs.getLong("current_version"), rs.getString("last_hash")));
+                (rs, rowNum) -> new StreamHead(
+                        rs.getLong("current_version"),
+                        rs.getString("last_hash"),
+                        rs.getObject("user_id", UUID.class),
+                        (Integer) rs.getObject("remaining_amount"),
+                        rs.getString("status")));
         if (rows.size() != 1) {
             throw new IllegalStateException("Order stream head not found after creation: " + aggregateId);
         }
@@ -491,28 +517,75 @@ public class OrderEventAppender {
 
     private void updateHead(
             NamedParameterJdbcTemplate jdbc,
-            UUID aggregateId,
-            long expectedVersion,
+            OrderEventAppendCommand command,
+            StreamHead head,
             long newVersion,
-            UUID eventId,
             String hash) {
+        CommandState nextState = nextCommandState(head, command);
         int updated = jdbc.update("""
                 UPDATE order_service.order_stream_heads
                 SET current_version = :newVersion,
                     last_event_id = :eventId,
                     last_hash = :hash,
+                    user_id = :userId,
+                    remaining_amount = :remainingAmount,
+                    status = :orderStatus,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE aggregate_id = :aggregateId
                   AND current_version = :expectedVersion
                 """, new MapSqlParameterSource()
                 .addValue("newVersion", newVersion)
-                .addValue("eventId", eventId)
+                .addValue("eventId", command.eventId())
                 .addValue("hash", hash)
-                .addValue("aggregateId", aggregateId)
-                .addValue("expectedVersion", expectedVersion));
+                .addValue("userId", nextState.userId())
+                .addValue("remainingAmount", nextState.remainingAmount())
+                .addValue("orderStatus", nextState.status())
+                .addValue("aggregateId", command.aggregateId())
+                .addValue("expectedVersion", head.currentVersion()));
         if (updated != 1) {
-            throw new OrderEventVersionConflictException(aggregateId, expectedVersion, newVersion);
+            throw new OrderEventVersionConflictException(command.aggregateId(), head.currentVersion(), newVersion);
         }
+    }
+
+    private CommandState nextCommandState(StreamHead head, OrderEventAppendCommand command) {
+        Object payload = command.payload();
+        if (payload instanceof OrderSubmissionRequestedV1 requested) {
+            return new CommandState(requested.userId(), requested.amount(), "PENDING_ASSET_CHECK");
+        }
+        if (payload instanceof OrderAssetReservationConfirmedV1 confirmed) {
+            return new CommandState(confirmed.userId(), head.remainingAmount(), "OPEN");
+        }
+        if (payload instanceof OrderAssetReservationFailedV1 failed) {
+            return new CommandState(failed.userId(), head.remainingAmount(), "REJECTED");
+        }
+        if (payload instanceof OrderMatchedV1 matched) {
+            int remaining = requireRemainingAmount(head) - matched.amount();
+            if (remaining < 0) {
+                throw new IllegalStateException("Order matched amount exceeds remaining amount: orderId="
+                        + matched.orderId());
+            }
+            return new CommandState(head.userId(), remaining, remaining == 0 ? "MATCHED" : "PARTIALLY_MATCHED");
+        }
+        if (payload instanceof OrderCancelledV1 cancelled) {
+            return new CommandState(cancelled.userId(), head.remainingAmount(), "CANCELLED");
+        }
+        if ("OrderMatchedV1".equals(command.eventType()) && payload instanceof Map<?, ?> map) {
+            int amount = ((Number) map.get("amount")).intValue();
+            int remaining = requireRemainingAmount(head) - amount;
+            if (remaining < 0) {
+                throw new IllegalStateException("Order matched amount exceeds remaining amount: orderId="
+                        + command.aggregateId());
+            }
+            return new CommandState(head.userId(), remaining, remaining == 0 ? "MATCHED" : "PARTIALLY_MATCHED");
+        }
+        return new CommandState(head.userId(), head.remainingAmount(), head.status());
+    }
+
+    private int requireRemainingAmount(StreamHead head) {
+        if (head.remainingAmount() == null) {
+            throw new IllegalStateException("Order stream head has no remaining amount for match command");
+        }
+        return head.remainingAmount();
     }
 
     private void insertOutboxIfPresent(
@@ -599,21 +672,23 @@ public class OrderEventAppender {
         }
     }
 
-    private record StreamHead(long currentVersion, String lastHash) {
-    }
-
-    private record LockedProjectionState(
+    private record StreamHead(
             long currentVersion,
             String lastHash,
             UUID userId,
-            int remainingAmount,
+            Integer remainingAmount,
             String status) {
 
         private boolean canMatch(int quantity) {
             return ("OPEN".equals(status) || "PARTIALLY_MATCHED".equals(status))
                     && quantity > 0
+                    && userId != null
+                    && remainingAmount != null
                     && remainingAmount >= quantity;
         }
+    }
+
+    private record CommandState(UUID userId, Integer remainingAmount, String status) {
     }
 
     public record TradeExecutionAppendResult(

@@ -168,4 +168,18 @@
                         columnName="market_id" newDataType="VARCHAR(100)"/>
     </changeSet>
 
+    <changeSet id="order-es-007" author="eap">
+        <comment>Add command-side order state to stream heads for hot-path validation</comment>
+        <addColumn tableName="order_stream_heads" schemaName="order_service">
+            <column name="user_id" type="UUID"/>
+            <column name="remaining_amount" type="INTEGER"/>
+            <column name="status" type="VARCHAR(30)"/>
+        </addColumn>
+        <sql>
+            ALTER TABLE order_service.order_stream_heads
+            ADD CONSTRAINT ck_order_stream_remaining_non_negative
+            CHECK (remaining_amount IS NULL OR remaining_amount &gt;= 0);
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

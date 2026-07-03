@@ -255,10 +255,11 @@ class OrderEventAppenderPostgresIT {
     }
 
     @Test
-    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_staleProjectionShouldNotInsertLinkOrEvent() {
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_staleProjectionShouldStillApplyFromCommandState() {
         UUID aggregateId = aggregateId();
-        seedStreamHead(aggregateId, 2);
-        seedOrderProjection(aggregateId, 1, "OPEN", 10);
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
+        seedOrderProjection(aggregateId, 1, userId, "OPEN", 10);
 
         OrderEventAppender.TradeExecutionAppendResult result =
                 appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
@@ -266,11 +267,11 @@ class OrderEventAppenderPostgresIT {
                         4,
                         tradeLink(aggregateId, "trade-stale", 4));
 
-        assertEquals(NOT_FAST_PATH, result.status());
-        assertEquals(0, count("order_execution_links", aggregateId));
-        assertEquals(0, count("order_event_store", aggregateId));
-        assertEquals(0, count("order_event_outbox", aggregateId));
-        assertEquals(2L, currentVersion(aggregateId));
+        assertEquals(APPLIED, result.status());
+        assertEquals(1, count("order_execution_links", aggregateId));
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertEquals(1, count("order_event_outbox", aggregateId));
+        assertEquals(3L, currentVersion(aggregateId));
     }
 
     @Test
@@ -466,26 +467,27 @@ class OrderEventAppenderPostgresIT {
     }
 
     private void seedCaughtUpProjection(UUID aggregateId, long version, String status, int remainingAmount) {
-        seedStreamHead(aggregateId, version);
-        seedOrderProjection(aggregateId, version, status, remainingAmount);
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, version, userId, status, remainingAmount);
+        seedOrderProjection(aggregateId, version, userId, status, remainingAmount);
     }
 
-    private void seedStreamHead(UUID aggregateId, long version) {
+    private void seedStreamHead(UUID aggregateId, long version, UUID userId, String status, int remainingAmount) {
         jdbc.update("""
                 INSERT INTO order_service.order_stream_heads
-                    (aggregate_id, current_version, last_hash, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """, aggregateId, version, "a".repeat(64));
+                    (aggregate_id, current_version, last_hash, user_id, remaining_amount, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, aggregateId, version, "a".repeat(64), userId, remainingAmount, status);
     }
 
-    private void seedOrderProjection(UUID aggregateId, long version, String status, int remainingAmount) {
+    private void seedOrderProjection(UUID aggregateId, long version, UUID userId, String status, int remainingAmount) {
         jdbc.update("""
                 INSERT INTO order_service.orders_current
                     (order_id, user_id, market_id, market_sequence, side, price,
                      original_amount, remaining_amount, matched_amount, status,
                      aggregate_version, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """, aggregateId, UUID.randomUUID(), "TEST-MARKET", 1L, "BUY", 20,
+                """, aggregateId, userId, "TEST-MARKET", 1L, "BUY", 20,
                 10, remainingAmount, 10 - remainingAmount, status, version);
     }
 
