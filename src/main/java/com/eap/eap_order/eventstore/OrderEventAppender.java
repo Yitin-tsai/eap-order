@@ -169,13 +169,10 @@ public class OrderEventAppender {
 
         OrderEventAppendCommand buyerCommand = withHeadState(buyerDraftCommand, buyerHead);
         OrderEventAppendCommand sellerCommand = withHeadState(sellerDraftCommand, sellerHead);
-        OrderEventAppendResult buyerResult = appendInTransactionWithLockedHead(
+        OrderEventAppendResult buyerResult = appendMatchedTradeEventsWithLockedHeads(
                 buyerCommand,
-                consumerJdbc,
-                buyerHead);
-        appendInTransactionWithLockedHead(
+                buyerHead,
                 sellerCommand,
-                consumerJdbc,
                 sellerHead);
         insertSharedOutboxIfPresent(
                 consumerJdbc,
@@ -478,6 +475,163 @@ public class OrderEventAppender {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
+    private OrderEventAppendResult appendMatchedTradeEventsWithLockedHeads(
+            OrderEventAppendCommand buyerCommand,
+            StreamHead buyerHead,
+            OrderEventAppendCommand sellerCommand,
+            StreamHead sellerHead) {
+        PreparedAppend buyer = prepareAppend(buyerCommand, buyerHead);
+        PreparedAppend seller = prepareAppend(sellerCommand, sellerHead);
+        Map<UUID, InsertedEvent> insertedEvents = insertTradeEvents(buyer, seller);
+        updateTradeHeads(buyer, seller);
+        InsertedEvent buyerInserted = insertedEvents.get(buyer.command().aggregateId());
+        if (buyerInserted == null) {
+            throw new IllegalStateException("Buyer OrderMatched event was not inserted: orderId="
+                    + buyer.command().aggregateId());
+        }
+        return new OrderEventAppendResult(
+                buyer.command().aggregateId(),
+                buyer.command().eventId(),
+                buyer.nextVersion(),
+                buyerInserted.globalPosition(),
+                buyer.hash(),
+                false);
+    }
+
+    private PreparedAppend prepareAppend(OrderEventAppendCommand command, StreamHead head) {
+        String payloadCanonical = serialize(command.payload());
+        String metadataCanonical = serialize(command.metadata());
+        if (head.currentVersion() != command.expectedVersion()) {
+            throw new OrderEventVersionConflictException(
+                    command.aggregateId(), command.expectedVersion(), head.currentVersion());
+        }
+        long nextVersion = head.currentVersion() + 1;
+        String hash = computeHash(
+                command,
+                nextVersion,
+                payloadCanonical,
+                metadataCanonical,
+                head.lastHash());
+        CommandState nextState = nextCommandState(head, command);
+        return new PreparedAppend(
+                command,
+                head,
+                nextVersion,
+                payloadCanonical,
+                metadataCanonical,
+                hash,
+                nextState);
+    }
+
+    private Map<UUID, InsertedEvent> insertTradeEvents(PreparedAppend buyer, PreparedAppend seller) {
+        Map<UUID, InsertedEvent> inserted = new HashMap<>();
+        consumerJdbc.query("""
+                WITH input(event_id, aggregate_id, aggregate_type, aggregate_version,
+                           event_type, payload, payload_canonical, metadata, metadata_canonical,
+                           schema_version, occurred_at, prev_hash, hash) AS (
+                    VALUES
+                        (:buyerEventId, :buyerAggregateId, :aggregateType, :buyerAggregateVersion,
+                         :buyerEventType, CAST(:buyerPayload AS jsonb), :buyerPayloadCanonical,
+                         CAST(:buyerMetadata AS jsonb), :buyerMetadataCanonical,
+                         :buyerSchemaVersion, :buyerOccurredAt, :buyerPrevHash, :buyerHash),
+                        (:sellerEventId, :sellerAggregateId, :aggregateType, :sellerAggregateVersion,
+                         :sellerEventType, CAST(:sellerPayload AS jsonb), :sellerPayloadCanonical,
+                         CAST(:sellerMetadata AS jsonb), :sellerMetadataCanonical,
+                         :sellerSchemaVersion, :sellerOccurredAt, :sellerPrevHash, :sellerHash)
+                )
+                INSERT INTO order_service.order_event_store
+                    (event_id, aggregate_id, aggregate_type, aggregate_version,
+                     event_type, payload, payload_canonical, metadata, metadata_canonical,
+                     schema_version, occurred_at, prev_hash, hash)
+                SELECT event_id, aggregate_id, aggregate_type, aggregate_version,
+                       event_type, payload, payload_canonical, metadata, metadata_canonical,
+                       schema_version, occurred_at, prev_hash, hash
+                FROM input
+                RETURNING aggregate_id, aggregate_version, global_position, hash
+                """, tradeAppendParams(buyer, seller), rs -> {
+            inserted.put(
+                    rs.getObject("aggregate_id", UUID.class),
+                    new InsertedEvent(
+                            rs.getLong("aggregate_version"),
+                            rs.getLong("global_position"),
+                            rs.getString("hash")));
+        });
+        if (inserted.size() != 2) {
+            throw new IllegalStateException("Expected two OrderMatched events to be inserted, actual="
+                    + inserted.size());
+        }
+        return inserted;
+    }
+
+    private void updateTradeHeads(PreparedAppend buyer, PreparedAppend seller) {
+        Integer updated = consumerJdbc.queryForObject("""
+                WITH input(aggregate_id, expected_version, new_version, event_id, hash,
+                           user_id, remaining_amount, order_status) AS (
+                    VALUES
+                        (:buyerAggregateId, :buyerExpectedVersion, :buyerAggregateVersion,
+                         :buyerEventId, :buyerHash, :buyerUserId, :buyerRemainingAmount, :buyerStatus),
+                        (:sellerAggregateId, :sellerExpectedVersion, :sellerAggregateVersion,
+                         :sellerEventId, :sellerHash, :sellerUserId, :sellerRemainingAmount, :sellerStatus)
+                ),
+                updated AS (
+                    UPDATE order_service.order_stream_heads head
+                    SET current_version = input.new_version,
+                        last_event_id = input.event_id,
+                        last_hash = input.hash,
+                        user_id = input.user_id,
+                        remaining_amount = input.remaining_amount,
+                        status = input.order_status,
+                        updated_at = CURRENT_TIMESTAMP
+                    FROM input
+                    WHERE head.aggregate_id = input.aggregate_id
+                      AND head.current_version = input.expected_version
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM updated
+                """, tradeAppendParams(buyer, seller), Integer.class);
+        if (updated == null || updated != 2) {
+            throw new OrderEventVersionConflictException(
+                    buyer.command().aggregateId(), buyer.head().currentVersion(), buyer.nextVersion());
+        }
+    }
+
+    private MapSqlParameterSource tradeAppendParams(PreparedAppend buyer, PreparedAppend seller) {
+        return new MapSqlParameterSource()
+                .addValue("aggregateType", AGGREGATE_TYPE)
+                .addValue("buyerEventId", buyer.command().eventId())
+                .addValue("buyerAggregateId", buyer.command().aggregateId())
+                .addValue("buyerExpectedVersion", buyer.head().currentVersion())
+                .addValue("buyerAggregateVersion", buyer.nextVersion())
+                .addValue("buyerEventType", buyer.command().eventType())
+                .addValue("buyerPayload", buyer.payloadCanonical())
+                .addValue("buyerPayloadCanonical", buyer.payloadCanonical())
+                .addValue("buyerMetadata", buyer.metadataCanonical())
+                .addValue("buyerMetadataCanonical", buyer.metadataCanonical())
+                .addValue("buyerSchemaVersion", buyer.command().schemaVersion())
+                .addValue("buyerOccurredAt", buyer.command().occurredAt())
+                .addValue("buyerPrevHash", buyer.head().lastHash())
+                .addValue("buyerHash", buyer.hash())
+                .addValue("buyerUserId", buyer.nextState().userId())
+                .addValue("buyerRemainingAmount", buyer.nextState().remainingAmount())
+                .addValue("buyerStatus", buyer.nextState().status())
+                .addValue("sellerEventId", seller.command().eventId())
+                .addValue("sellerAggregateId", seller.command().aggregateId())
+                .addValue("sellerExpectedVersion", seller.head().currentVersion())
+                .addValue("sellerAggregateVersion", seller.nextVersion())
+                .addValue("sellerEventType", seller.command().eventType())
+                .addValue("sellerPayload", seller.payloadCanonical())
+                .addValue("sellerPayloadCanonical", seller.payloadCanonical())
+                .addValue("sellerMetadata", seller.metadataCanonical())
+                .addValue("sellerMetadataCanonical", seller.metadataCanonical())
+                .addValue("sellerSchemaVersion", seller.command().schemaVersion())
+                .addValue("sellerOccurredAt", seller.command().occurredAt())
+                .addValue("sellerPrevHash", seller.head().lastHash())
+                .addValue("sellerHash", seller.hash())
+                .addValue("sellerUserId", seller.nextState().userId())
+                .addValue("sellerRemainingAmount", seller.nextState().remainingAmount())
+                .addValue("sellerStatus", seller.nextState().status());
+    }
+
     private long insertEvent(
             NamedParameterJdbcTemplate jdbc,
             OrderEventAppendCommand command,
@@ -689,6 +843,19 @@ public class OrderEventAppender {
     }
 
     private record CommandState(UUID userId, Integer remainingAmount, String status) {
+    }
+
+    private record PreparedAppend(
+            OrderEventAppendCommand command,
+            StreamHead head,
+            long nextVersion,
+            String payloadCanonical,
+            String metadataCanonical,
+            String hash,
+            CommandState nextState) {
+    }
+
+    private record InsertedEvent(long aggregateVersion, long globalPosition, String hash) {
     }
 
     public record TradeExecutionAppendResult(

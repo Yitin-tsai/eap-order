@@ -190,7 +190,9 @@ public class MatchedE2eLoadGenerator {
         long started = System.nanoTime();
         PublishResult buyPublish = publishBuyToMatchEngine(config, rabbitTemplate, pairs);
         WaitResult waitResult = waitForDownstream(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, started);
-        double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        double elapsedSeconds = waitResult.completedTradesReachedSeconds() > 0
+                ? waitResult.completedTradesReachedSeconds()
+                : (System.nanoTime() - started) / 1_000_000_000.0;
 
         long remainingSellOrders = zsetSize(redisTemplate, "orderbook:" + config.marketId() + ":sell");
         long remainingBuyOrders = zsetSize(redisTemplate, "orderbook:" + config.marketId() + ":buy");
@@ -362,6 +364,8 @@ public class MatchedE2eLoadGenerator {
         long maxWalletTradeExecutedQueueReady = 0;
         long maxOrderTradeAppliedQueueReady = 0;
         long maxWalletTradeSettledQueueReady = 0;
+        int consecutiveDrainedSamples = 0;
+        double queueDrainedSeconds = -1;
         do {
             latest = queueSnapshot(rabbitAdmin);
             double elapsedSeconds = (System.nanoTime() - startedNanos) / 1_000_000_000.0;
@@ -370,35 +374,26 @@ public class MatchedE2eLoadGenerator {
             maxWalletTradeExecutedQueueReady = Math.max(maxWalletTradeExecutedQueueReady, latest.walletTradeExecutedQueueReady());
             maxOrderTradeAppliedQueueReady = Math.max(maxOrderTradeAppliedQueueReady, latest.orderTradeAppliedQueueReady());
             maxWalletTradeSettledQueueReady = Math.max(maxWalletTradeSettledQueueReady, latest.walletTradeSettledQueueReady());
-            if (latest.matchEngineQueueReady() == 0
-                    && latest.orderMatchedQueueReady() == 0
-                    && latest.walletMatchedQueueReady() == 0
-                    && latest.orderTradeExecutedQueueReady() == 0
-                    && latest.walletTradeExecutedQueueReady() == 0
-                    && latest.orderTradeAppliedQueueReady() == 0
-                    && latest.walletTradeSettledQueueReady() == 0) {
+            if (queuesDrained(latest)) {
+                consecutiveDrainedSamples++;
+            } else {
+                consecutiveDrainedSamples = 0;
+            }
+            if (consecutiveDrainedSamples >= 3) {
+                queueDrainedSeconds = elapsedSeconds;
+                tradeExecutionsReachedSeconds = queueDrainedSeconds;
+                orderMatchedReachedSeconds = queueDrainedSeconds;
+                walletSettlementsReachedSeconds = queueDrainedSeconds;
+                completedTradesReachedSeconds = queueDrainedSeconds;
+                break;
+            }
+            TimeUnit.MILLISECONDS.sleep(100);
+        } while (System.nanoTime() < deadline);
+
+        if (queueDrainedSeconds >= 0) {
+            do {
                 WaitResult verified = snapshot(orderJdbc, walletJdbc, matchJdbc, rabbitAdmin);
-                if (verified.orderMatchedEvents() == config.events() * 2L
-                        && verified.tradeExecutions() == config.events()
-                        && verified.completedTrades() == config.events()
-                        && verified.walletTradeSettlements() == config.events()
-                        && verified.orderCurrentMatchedRows() == config.events() * 2L
-                        && verified.lockedCurrency() == 0
-                        && verified.lockedAmount() == 0
-                        && verified.buyerAvailableAmount() == config.events() * (long) AMOUNT
-                        && verified.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT) {
-                    if (tradeExecutionsReachedSeconds < 0) {
-                        tradeExecutionsReachedSeconds = elapsedSeconds;
-                    }
-                    if (orderMatchedReachedSeconds < 0) {
-                        orderMatchedReachedSeconds = elapsedSeconds;
-                    }
-                    if (walletSettlementsReachedSeconds < 0) {
-                        walletSettlementsReachedSeconds = elapsedSeconds;
-                    }
-                    if (completedTradesReachedSeconds < 0) {
-                        completedTradesReachedSeconds = elapsedSeconds;
-                    }
+                if (invariantsSatisfied(config, verified)) {
                     return verified.withDiagnostics(
                             tradeExecutionsReachedSeconds,
                             orderMatchedReachedSeconds,
@@ -410,9 +405,10 @@ public class MatchedE2eLoadGenerator {
                             maxOrderTradeAppliedQueueReady,
                             maxWalletTradeSettledQueueReady);
                 }
-            }
-            TimeUnit.MILLISECONDS.sleep(100);
-        } while (System.nanoTime() < deadline);
+                TimeUnit.MILLISECONDS.sleep(250);
+            } while (System.nanoTime() < deadline);
+        }
+
         WaitResult finalSnapshot = snapshot(orderJdbc, walletJdbc, matchJdbc, rabbitAdmin);
         return finalSnapshot.withDiagnostics(
                 tradeExecutionsReachedSeconds,
@@ -424,6 +420,28 @@ public class MatchedE2eLoadGenerator {
                 maxWalletTradeExecutedQueueReady,
                 maxOrderTradeAppliedQueueReady,
                 maxWalletTradeSettledQueueReady);
+    }
+
+    private static boolean queuesDrained(WaitResult latest) {
+        return latest.matchEngineQueueReady() == 0
+                && latest.orderMatchedQueueReady() == 0
+                && latest.walletMatchedQueueReady() == 0
+                && latest.orderTradeExecutedQueueReady() == 0
+                && latest.walletTradeExecutedQueueReady() == 0
+                && latest.orderTradeAppliedQueueReady() == 0
+                && latest.walletTradeSettledQueueReady() == 0;
+    }
+
+    private static boolean invariantsSatisfied(Config config, WaitResult verified) {
+        return verified.orderMatchedEvents() == config.events() * 2L
+                && verified.tradeExecutions() == config.events()
+                && verified.completedTrades() == config.events()
+                && verified.walletTradeSettlements() == config.events()
+                && verified.orderCurrentMatchedRows() == config.events() * 2L
+                && verified.lockedCurrency() == 0
+                && verified.lockedAmount() == 0
+                && verified.buyerAvailableAmount() == config.events() * (long) AMOUNT
+                && verified.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT;
     }
 
     private static WaitResult queueSnapshot(RabbitAdmin rabbitAdmin) {
