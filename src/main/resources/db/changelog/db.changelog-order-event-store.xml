@@ -162,4 +162,10 @@
         </createIndex>
     </changeSet>
 
+    <changeSet id="order-es-006" author="eap">
+        <comment>Allow longer market identifiers in rebuildable Order projection</comment>
+        <modifyDataType tableName="orders_current" schemaName="order_service"
+                        columnName="market_id" newDataType="VARCHAR(100)"/>
+    </changeSet>
+
 </databaseChangeLog>

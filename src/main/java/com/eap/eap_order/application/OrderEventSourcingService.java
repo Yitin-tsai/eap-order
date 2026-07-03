@@ -14,8 +14,12 @@ import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.eap.eap_order.eventstore.OrderEventAppendCommand;
 import com.eap.eap_order.eventstore.OrderEventAppender;
+import com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendResult;
+import com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus;
 import com.eap.eap_order.eventstore.OrderEventStreamReader;
 import com.eap.eap_order.eventstore.OrderIntegrationEvent;
+import com.eap.eap_order.eventstore.OrderTradeExecutionLink;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
@@ -33,10 +37,16 @@ public class OrderEventSourcingService {
 
     private final OrderEventAppender appender;
     private final OrderEventStreamReader streamReader;
+    private final boolean fastMatchFromProjectionEnabled;
 
-    public OrderEventSourcingService(OrderEventAppender appender, OrderEventStreamReader streamReader) {
+    public OrderEventSourcingService(
+            OrderEventAppender appender,
+            OrderEventStreamReader streamReader,
+            @Value("${eap.order.event-sourcing.fast-match-from-projection.enabled:false}")
+            boolean fastMatchFromProjectionEnabled) {
         this.appender = appender;
         this.streamReader = streamReader;
+        this.fastMatchFromProjectionEnabled = fastMatchFromProjectionEnabled;
     }
 
     public void request(OrderSubmittedEvent integrationEvent) {
@@ -87,13 +97,64 @@ public class OrderEventSourcingService {
     }
 
     public void match(UUID orderId, TradeExecutedEvent source, String side) {
-        OrderAggregate aggregate = streamReader.load(orderId);
-        long expectedVersion = aggregate.version();
         LocalDateTime occurredAt = source.getOccurredAt() == null
                 ? LocalDateTime.now()
                 : source.getOccurredAt();
+        OrderMatchedV1 fastPathEvent = new OrderMatchedV1(
+                orderId, source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
+        OrderIntegrationEvent integrationEvent = tradeAppliedIntegration(orderId, source, side, occurredAt);
+        OrderTradeExecutionLink link = tradeExecutionLink(orderId, source, side, occurredAt);
+        if (fastMatchFromProjectionEnabled
+                && matchFromCaughtUpProjection(orderId, fastPathEvent, integrationEvent, link, source.getQuantity())) {
+            return;
+        }
+
+        OrderAggregate aggregate = streamReader.load(orderId);
+        long expectedVersion = aggregate.version();
         OrderMatchedV1 event = aggregate.match(
                 source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
+        TradeExecutionAppendResult fallbackResult = appendFromConsumerIfTradeLinkAbsent(
+                orderId,
+                expectedVersion,
+                eventId(orderId, "MATCHED:" + source.getLegacyMatchId()),
+                "OrderMatchedV1",
+                event,
+                aggregate.userId(),
+                occurredAt,
+                integrationEvent,
+                link);
+        if (fallbackResult.status() == TradeExecutionAppendStatus.DUPLICATE) {
+            return;
+        }
+    }
+
+    private boolean matchFromCaughtUpProjection(
+            UUID orderId,
+            OrderMatchedV1 event,
+            OrderIntegrationEvent integrationEvent,
+            OrderTradeExecutionLink link,
+            int quantity) {
+        OrderEventAppendCommand command = new OrderEventAppendCommand(
+                orderId,
+                0,
+                eventId(orderId, "MATCHED:" + event.matchId()),
+                "OrderMatchedV1",
+                event,
+                Map.of("correlationId", orderId.toString()),
+                1,
+                event.matchedAt(),
+                integrationEvent);
+        TradeExecutionAppendResult result =
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(command, quantity, link);
+        return result.status() == TradeExecutionAppendStatus.APPLIED
+                || result.status() == TradeExecutionAppendStatus.DUPLICATE;
+    }
+
+    private OrderIntegrationEvent tradeAppliedIntegration(
+            UUID orderId,
+            TradeExecutedEvent source,
+            String side,
+            LocalDateTime occurredAt) {
         OrderTradeAppliedEvent integrationEvent = OrderTradeAppliedEvent.builder()
                 .tradeId(source.getTradeId())
                 .orderId(orderId)
@@ -103,9 +164,21 @@ public class OrderEventSourcingService {
                 .quantity(source.getQuantity())
                 .appliedAt(occurredAt)
                 .build();
-        appendFromConsumer(orderId, expectedVersion, eventId(orderId, "MATCHED:" + source.getLegacyMatchId()),
-                "OrderMatchedV1", event, aggregate.userId(), occurredAt,
-                new OrderIntegrationEvent(TRADE_EXCHANGE, TRADE_ORDER_APPLIED_KEY, integrationEvent));
+        return new OrderIntegrationEvent(TRADE_EXCHANGE, TRADE_ORDER_APPLIED_KEY, integrationEvent);
+    }
+
+    private OrderTradeExecutionLink tradeExecutionLink(
+            UUID orderId,
+            TradeExecutedEvent source,
+            String side,
+            LocalDateTime appliedAt) {
+        return new OrderTradeExecutionLink(
+                source.getTradeId(),
+                orderId,
+                side,
+                source.getDealPrice(),
+                source.getQuantity(),
+                appliedAt);
     }
 
     public void cancel(UUID orderId, UUID userId) {
@@ -147,8 +220,25 @@ public class OrderEventSourcingService {
                 1, occurredAt, integrationEvent));
     }
 
+    private TradeExecutionAppendResult appendFromConsumerIfTradeLinkAbsent(
+            UUID aggregateId,
+            long expectedVersion,
+            UUID eventId,
+            String eventType,
+            Object payload,
+            UUID userId,
+            LocalDateTime occurredAt,
+            OrderIntegrationEvent integrationEvent,
+            OrderTradeExecutionLink link) {
+        return appender.appendFromConsumerIfTradeLinkAbsent(new OrderEventAppendCommand(
+                aggregateId, expectedVersion, eventId, eventType, payload,
+                Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
+                1, occurredAt, integrationEvent), link);
+    }
+
     private UUID eventId(UUID orderId, String discriminator) {
         return UUID.nameUUIDFromBytes(
                 (orderId + ":" + discriminator).getBytes(StandardCharsets.UTF_8));
     }
+
 }

@@ -8,6 +8,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,6 +21,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus.APPLIED;
+import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus.DUPLICATE;
+import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus.NOT_FAST_PATH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -56,6 +60,8 @@ class OrderEventAppenderPostgresIT {
         for (UUID aggregateId : aggregateIds) {
             jdbc.update("DELETE FROM order_service.order_event_outbox WHERE aggregate_id = ?", aggregateId);
             jdbc.update("DELETE FROM order_service.order_event_store WHERE aggregate_id = ?", aggregateId);
+            jdbc.update("DELETE FROM order_service.order_execution_links WHERE order_id = ?", aggregateId);
+            jdbc.update("DELETE FROM order_service.orders_current WHERE order_id = ?", aggregateId);
             jdbc.update("DELETE FROM order_service.order_stream_heads WHERE aggregate_id = ?", aggregateId);
         }
     }
@@ -204,6 +210,85 @@ class OrderEventAppenderPostgresIT {
                 """, Long.class, aggregateId));
     }
 
+    @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_shouldInsertLinkEventHeadAndOutbox() {
+        UUID aggregateId = aggregateId();
+        seedCaughtUpProjection(aggregateId, 2, "OPEN", 10);
+
+        OrderEventAppender.TradeExecutionAppendResult result =
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                        matchedCommand(aggregateId, "trade-1", "order.trade.applied"),
+                        4,
+                        tradeLink(aggregateId, "trade-1", 4));
+
+        assertEquals(APPLIED, result.status());
+        assertEquals(3, result.appendResult().aggregateVersion());
+        assertEquals(1, count("order_execution_links", aggregateId));
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertEquals(1, count("order_event_outbox", aggregateId));
+        assertEquals(3L, currentVersion(aggregateId));
+    }
+
+    @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_duplicateLinkShouldSkipAppend() {
+        UUID aggregateId = aggregateId();
+        seedCaughtUpProjection(aggregateId, 2, "OPEN", 10);
+
+        OrderEventAppender.TradeExecutionAppendResult first =
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                        matchedCommand(aggregateId, "trade-duplicate", "order.trade.applied"),
+                        4,
+                        tradeLink(aggregateId, "trade-duplicate", 4));
+        OrderEventAppender.TradeExecutionAppendResult duplicate =
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                        matchedCommand(aggregateId, "trade-duplicate", "order.trade.applied"),
+                        4,
+                        tradeLink(aggregateId, "trade-duplicate", 4));
+
+        assertEquals(APPLIED, first.status());
+        assertEquals(DUPLICATE, duplicate.status());
+        assertEquals(1, count("order_execution_links", aggregateId));
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertEquals(1, count("order_event_outbox", aggregateId));
+        assertEquals(3L, currentVersion(aggregateId));
+    }
+
+    @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_staleProjectionShouldNotInsertLinkOrEvent() {
+        UUID aggregateId = aggregateId();
+        seedStreamHead(aggregateId, 2);
+        seedOrderProjection(aggregateId, 1, "OPEN", 10);
+
+        OrderEventAppender.TradeExecutionAppendResult result =
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                        matchedCommand(aggregateId, "trade-stale", "order.trade.applied"),
+                        4,
+                        tradeLink(aggregateId, "trade-stale", 4));
+
+        assertEquals(NOT_FAST_PATH, result.status());
+        assertEquals(0, count("order_execution_links", aggregateId));
+        assertEquals(0, count("order_event_store", aggregateId));
+        assertEquals(0, count("order_event_outbox", aggregateId));
+        assertEquals(2L, currentVersion(aggregateId));
+    }
+
+    @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_outboxFailureShouldRollbackTradeLink() {
+        UUID aggregateId = aggregateId();
+        seedCaughtUpProjection(aggregateId, 2, "OPEN", 10);
+
+        assertThrows(DataIntegrityViolationException.class, () ->
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                        matchedCommand(aggregateId, "trade-rollback", "x".repeat(101)),
+                        4,
+                        tradeLink(aggregateId, "trade-rollback", 4)));
+
+        assertEquals(0, count("order_execution_links", aggregateId));
+        assertEquals(0, count("order_event_store", aggregateId));
+        assertEquals(0, count("order_event_outbox", aggregateId));
+        assertEquals(2L, currentVersion(aggregateId));
+    }
+
     private UUID aggregateId() {
         UUID id = UUID.randomUUID();
         aggregateIds.add(id);
@@ -230,11 +315,59 @@ class OrderEventAppenderPostgresIT {
         );
     }
 
+    private OrderEventAppendCommand matchedCommand(UUID aggregateId, String tradeId, String exchange) {
+        return command(
+                aggregateId,
+                0,
+                UUID.nameUUIDFromBytes((aggregateId + ":MATCHED:" + tradeId).getBytes(StandardCharsets.UTF_8)),
+                "OrderMatchedV1",
+                Map.of("orderId", aggregateId, "matchId", 1001, "amount", 4, "dealPrice", 20),
+                new OrderIntegrationEvent(exchange, "trade.order.applied", Map.of("tradeId", tradeId, "orderId", aggregateId))
+        );
+    }
+
+    private OrderTradeExecutionLink tradeLink(UUID aggregateId, String tradeId, int quantity) {
+        return new OrderTradeExecutionLink(tradeId, aggregateId, "BUY", 20, quantity, LocalDateTime.now());
+    }
+
+    private void seedCaughtUpProjection(UUID aggregateId, long version, String status, int remainingAmount) {
+        seedStreamHead(aggregateId, version);
+        seedOrderProjection(aggregateId, version, status, remainingAmount);
+    }
+
+    private void seedStreamHead(UUID aggregateId, long version) {
+        jdbc.update("""
+                INSERT INTO order_service.order_stream_heads
+                    (aggregate_id, current_version, last_hash, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """, aggregateId, version, "a".repeat(64));
+    }
+
+    private void seedOrderProjection(UUID aggregateId, long version, String status, int remainingAmount) {
+        jdbc.update("""
+                INSERT INTO order_service.orders_current
+                    (order_id, user_id, market_id, market_sequence, side, price,
+                     original_amount, remaining_amount, matched_amount, status,
+                     aggregate_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, aggregateId, UUID.randomUUID(), "TEST-MARKET", 1L, "BUY", 20,
+                10, remainingAmount, 10 - remainingAmount, status, version);
+    }
+
     private int count(String table, UUID aggregateId) {
+        String idColumn = "order_execution_links".equals(table) ? "order_id" : "aggregate_id";
         return jdbc.queryForObject(
-                "SELECT count(*) FROM order_service." + table + " WHERE aggregate_id = ?",
+                "SELECT count(*) FROM order_service." + table + " WHERE " + idColumn + " = ?",
                 Integer.class,
                 aggregateId
         );
+    }
+
+    private long currentVersion(UUID aggregateId) {
+        return jdbc.queryForObject("""
+                SELECT current_version
+                FROM order_service.order_stream_heads
+                WHERE aggregate_id = ?
+                """, Long.class, aggregateId);
     }
 }

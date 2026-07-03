@@ -26,25 +26,39 @@ public class OrdersCurrentProjector {
     private final TransactionTemplate transactionTemplate;
     private final int batchSize;
     private final boolean enabled;
+    private final int repairBatchSize;
+    private final boolean repairEnabled;
 
     public OrdersCurrentProjector(
             @Qualifier("orderProjectionJdbcTemplate") JdbcTemplate jdbc,
             ObjectMapper objectMapper,
             @Qualifier("orderProjectionTransactionManager") PlatformTransactionManager transactionManager,
             @Value("${eap.order-projection.batch-size:500}") int batchSize,
-            @Value("${eap.order-projection.enabled:true}") boolean enabled) {
+            @Value("${eap.order-projection.enabled:true}") boolean enabled,
+            @Value("${eap.order-projection.repair.batch-size:100}") int repairBatchSize,
+            @Value("${eap.order-projection.repair.enabled:true}") boolean repairEnabled) {
         this.jdbc = jdbc;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.batchSize = batchSize;
         this.enabled = enabled;
+        this.repairBatchSize = repairBatchSize;
+        this.repairEnabled = repairEnabled;
     }
 
     @Scheduled(fixedDelayString = "${eap.order-projection.poll-interval-ms:100}")
     public void project() {
+        projectUntilCaughtUp();
+    }
+
+    public void projectUntilCaughtUp() {
         if (!enabled) {
             return;
         }
+        projectUntilCaughtUpIgnoringEnabled();
+    }
+
+    public void projectUntilCaughtUpIgnoringEnabled() {
         boolean fullBatch;
         do {
             Boolean result = transactionTemplate.execute(status -> projectBatch());
@@ -91,10 +105,15 @@ public class OrdersCurrentProjector {
                     WHERE projection_name = ?
                     """, lastPosition, PROJECTION_NAME);
         }
-        if (events.isEmpty()) {
-            repairStaleProjections();
-        }
         return events.size() == batchSize;
+    }
+
+    @Scheduled(fixedDelayString = "${eap.order-projection.repair.poll-interval-ms:60000}")
+    public void repair() {
+        if (!enabled || !repairEnabled) {
+            return;
+        }
+        transactionTemplate.executeWithoutResult(status -> repairStaleProjections());
     }
 
     private void apply(ProjectionEvent event) {
@@ -279,10 +298,10 @@ public class OrdersCurrentProjector {
                 LEFT JOIN order_service.orders_current oc ON oc.order_id = h.aggregate_id
                 WHERE oc.order_id IS NULL OR oc.aggregate_version < h.current_version
                 ORDER BY h.updated_at
-                LIMIT 100
+                LIMIT ?
                 """, (rs, rowNum) -> new ProjectionRepairTarget(
                 rs.getObject("aggregate_id", UUID.class),
-                rs.getLong("current_version")));
+                rs.getLong("current_version")), repairBatchSize);
         for (ProjectionRepairTarget target : targets) {
             rebuildProjectionThrough(new ProjectionEvent(
                     0,

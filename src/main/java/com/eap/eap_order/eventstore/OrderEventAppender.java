@@ -17,6 +17,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.HexFormat;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -56,16 +57,114 @@ public class OrderEventAppender {
         return consumerTransactionTemplate.execute(status -> appendInTransaction(command, consumerJdbc));
     }
 
+    public TradeExecutionAppendResult appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+            OrderEventAppendCommand command,
+            int matchedQuantity,
+            OrderTradeExecutionLink link) {
+        return consumerTransactionTemplate.execute(status ->
+                appendMatchedFromCaughtUpProjectionIfTradeLinkAbsentInTransaction(command, matchedQuantity, link));
+    }
+
+    public TradeExecutionAppendResult appendFromConsumerIfTradeLinkAbsent(
+            OrderEventAppendCommand command,
+            OrderTradeExecutionLink link) {
+        return consumerTransactionTemplate.execute(status ->
+                appendFromConsumerIfTradeLinkAbsentInTransaction(command, link));
+    }
+
     private OrderEventAppendResult appendInTransaction(
             OrderEventAppendCommand command,
             NamedParameterJdbcTemplate jdbc) {
-        String payloadCanonical = serialize(command.payload());
-        String metadataCanonical = serialize(command.metadata());
-
         if (command.expectedVersion() == 0) {
             createHeadIfAbsent(jdbc, command.aggregateId());
         }
         StreamHead head = lockHead(jdbc, command.aggregateId());
+        return appendInTransactionWithLockedHead(command, jdbc, head);
+    }
+
+    private TradeExecutionAppendResult appendMatchedFromCaughtUpProjectionIfTradeLinkAbsentInTransaction(
+            OrderEventAppendCommand draftCommand,
+            int matchedQuantity,
+            OrderTradeExecutionLink link) {
+        LockedProjectionState projection = lockCaughtUpProjection(draftCommand.aggregateId());
+        if (projection == null || !projection.canMatch(matchedQuantity)) {
+            return TradeExecutionAppendResult.notFastPath();
+        }
+        if (insertExecutionLinkIfAbsent(link) == 0) {
+            return TradeExecutionAppendResult.duplicate();
+        }
+
+        Map<String, Object> metadata = new HashMap<>(draftCommand.metadata());
+        metadata.put("correlationId", draftCommand.aggregateId().toString());
+        metadata.put("userId", projection.userId().toString());
+        OrderEventAppendCommand command = new OrderEventAppendCommand(
+                draftCommand.aggregateId(),
+                projection.currentVersion(),
+                draftCommand.eventId(),
+                draftCommand.eventType(),
+                draftCommand.payload(),
+                metadata,
+                draftCommand.schemaVersion(),
+                draftCommand.occurredAt(),
+                draftCommand.integrationEvent());
+        OrderEventAppendResult result = appendInTransactionWithLockedHead(
+                command,
+                consumerJdbc,
+                new StreamHead(projection.currentVersion(), projection.lastHash()));
+        return TradeExecutionAppendResult.applied(result);
+    }
+
+    private TradeExecutionAppendResult appendFromConsumerIfTradeLinkAbsentInTransaction(
+            OrderEventAppendCommand command,
+            OrderTradeExecutionLink link) {
+        if (insertExecutionLinkIfAbsent(link) == 0) {
+            return TradeExecutionAppendResult.duplicate();
+        }
+        return TradeExecutionAppendResult.applied(appendInTransaction(command, consumerJdbc));
+    }
+
+    private LockedProjectionState lockCaughtUpProjection(UUID aggregateId) {
+        List<LockedProjectionState> rows = consumerJdbc.query("""
+                SELECT h.current_version, h.last_hash,
+                       oc.user_id, oc.remaining_amount, oc.status
+                FROM order_service.order_stream_heads h
+                JOIN order_service.orders_current oc
+                  ON oc.order_id = h.aggregate_id
+                 AND oc.aggregate_version = h.current_version
+                WHERE h.aggregate_id = :aggregateId
+                FOR UPDATE OF h
+                """, Map.of("aggregateId", aggregateId),
+                (rs, rowNum) -> new LockedProjectionState(
+                        rs.getLong("current_version"),
+                        rs.getString("last_hash"),
+                        rs.getObject("user_id", UUID.class),
+                        rs.getInt("remaining_amount"),
+                        rs.getString("status")));
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private int insertExecutionLinkIfAbsent(OrderTradeExecutionLink link) {
+        return consumerJdbc.update("""
+                INSERT INTO order_service.order_execution_links
+                    (trade_id, order_id, side, price, quantity, applied_at)
+                VALUES
+                    (:tradeId, :orderId, :side, :price, :quantity, :appliedAt)
+                ON CONFLICT (trade_id, order_id) DO NOTHING
+                """, new MapSqlParameterSource()
+                .addValue("tradeId", link.tradeId())
+                .addValue("orderId", link.orderId())
+                .addValue("side", link.side())
+                .addValue("price", link.price())
+                .addValue("quantity", link.quantity())
+                .addValue("appliedAt", link.appliedAt()));
+    }
+
+    private OrderEventAppendResult appendInTransactionWithLockedHead(
+            OrderEventAppendCommand command,
+            NamedParameterJdbcTemplate jdbc,
+            StreamHead head) {
+        String payloadCanonical = serialize(command.payload());
+        String metadataCanonical = serialize(command.metadata());
 
         if (head.currentVersion() != command.expectedVersion()) {
             ExistingEvent existing = findByEventId(jdbc, command.eventId());
@@ -308,6 +407,43 @@ public class OrderEventAppender {
     }
 
     private record StreamHead(long currentVersion, String lastHash) {
+    }
+
+    private record LockedProjectionState(
+            long currentVersion,
+            String lastHash,
+            UUID userId,
+            int remainingAmount,
+            String status) {
+
+        private boolean canMatch(int quantity) {
+            return ("OPEN".equals(status) || "PARTIALLY_MATCHED".equals(status))
+                    && quantity > 0
+                    && remainingAmount >= quantity;
+        }
+    }
+
+    public record TradeExecutionAppendResult(
+            TradeExecutionAppendStatus status,
+            OrderEventAppendResult appendResult) {
+
+        private static TradeExecutionAppendResult applied(OrderEventAppendResult appendResult) {
+            return new TradeExecutionAppendResult(TradeExecutionAppendStatus.APPLIED, appendResult);
+        }
+
+        private static TradeExecutionAppendResult duplicate() {
+            return new TradeExecutionAppendResult(TradeExecutionAppendStatus.DUPLICATE, null);
+        }
+
+        private static TradeExecutionAppendResult notFastPath() {
+            return new TradeExecutionAppendResult(TradeExecutionAppendStatus.NOT_FAST_PATH, null);
+        }
+    }
+
+    public enum TradeExecutionAppendStatus {
+        APPLIED,
+        DUPLICATE,
+        NOT_FAST_PATH
     }
 
     private record ExistingEvent(
