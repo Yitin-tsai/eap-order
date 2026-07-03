@@ -26,6 +26,7 @@ import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppe
 import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus.NOT_FAST_PATH;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -273,6 +274,52 @@ class OrderEventAppenderPostgresIT {
     }
 
     @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_cancelledOrFilledProjectionShouldNotInsertLinkOrEvent() {
+        for (String status : List.of("CANCELLED", "FILLED")) {
+            UUID aggregateId = aggregateId();
+            seedCaughtUpProjection(aggregateId, 2, status, 10);
+
+            OrderEventAppender.TradeExecutionAppendResult result =
+                    appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                            matchedCommand(aggregateId, "trade-invalid-status-" + status, "order.trade.applied"),
+                            4,
+                            tradeLink(aggregateId, "trade-invalid-status-" + status, 4));
+
+            assertNotFastPathWithoutWrites(result, aggregateId, 2);
+        }
+    }
+
+    @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_insufficientRemainingAmountShouldNotInsertLinkOrEvent() {
+        UUID aggregateId = aggregateId();
+        seedCaughtUpProjection(aggregateId, 2, "OPEN", 3);
+
+        OrderEventAppender.TradeExecutionAppendResult result =
+                appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                        matchedCommand(aggregateId, "trade-insufficient-remaining", "order.trade.applied"),
+                        4,
+                        tradeLink(aggregateId, "trade-insufficient-remaining", 4));
+
+        assertNotFastPathWithoutWrites(result, aggregateId, 2);
+    }
+
+    @Test
+    void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_nonPositiveMatchedQuantityShouldNotInsertLinkOrEvent() {
+        for (int matchedQuantity : List.of(0, -1)) {
+            UUID aggregateId = aggregateId();
+            seedCaughtUpProjection(aggregateId, 2, "OPEN", 10);
+
+            OrderEventAppender.TradeExecutionAppendResult result =
+                    appender.appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent(
+                            matchedCommand(aggregateId, "trade-non-positive-" + matchedQuantity, "order.trade.applied"),
+                            matchedQuantity,
+                            tradeLink(aggregateId, "trade-non-positive-" + matchedQuantity, matchedQuantity));
+
+            assertNotFastPathWithoutWrites(result, aggregateId, 2);
+        }
+    }
+
+    @Test
     void appendMatchedFromCaughtUpProjectionIfTradeLinkAbsent_outboxFailureShouldRollbackTradeLink() {
         UUID aggregateId = aggregateId();
         seedCaughtUpProjection(aggregateId, 2, "OPEN", 10);
@@ -352,6 +399,18 @@ class OrderEventAppenderPostgresIT {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, aggregateId, UUID.randomUUID(), "TEST-MARKET", 1L, "BUY", 20,
                 10, remainingAmount, 10 - remainingAmount, status, version);
+    }
+
+    private void assertNotFastPathWithoutWrites(
+            OrderEventAppender.TradeExecutionAppendResult result,
+            UUID aggregateId,
+            long expectedVersion) {
+        assertEquals(NOT_FAST_PATH, result.status());
+        assertNull(result.appendResult());
+        assertEquals(0, count("order_execution_links", aggregateId));
+        assertEquals(0, count("order_event_store", aggregateId));
+        assertEquals(0, count("order_event_outbox", aggregateId));
+        assertEquals(expectedVersion, currentVersion(aggregateId));
     }
 
     private int count(String table, UUID aggregateId) {
