@@ -188,7 +188,7 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("publishing %d incoming BUY confirmations directly to %s%n",
                 config.events(), MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
         long started = System.nanoTime();
-        PublishResult buyPublish = publishToMatchEngine(config, rabbitTemplate, pairs, false);
+        PublishResult buyPublish = publishBuyToMatchEngine(config, rabbitTemplate, pairs);
         WaitResult waitResult = waitForDownstream(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, started);
         double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
 
@@ -237,6 +237,22 @@ public class MatchedE2eLoadGenerator {
             RabbitTemplate rabbitTemplate,
             List<Pair> pairs,
             boolean sell) throws InterruptedException {
+        return publishToMatchEngine(config, rabbitTemplate, pairs, sell, 0);
+    }
+
+    private static PublishResult publishBuyToMatchEngine(
+            Config config,
+            RabbitTemplate rabbitTemplate,
+            List<Pair> pairs) throws InterruptedException {
+        return publishToMatchEngine(config, rabbitTemplate, pairs, false, config.targetTps());
+    }
+
+    private static PublishResult publishToMatchEngine(
+            Config config,
+            RabbitTemplate rabbitTemplate,
+            List<Pair> pairs,
+            boolean sell,
+            int targetTps) throws InterruptedException {
         AtomicInteger published = new AtomicInteger();
         AtomicInteger failures = new AtomicInteger();
         CountDownLatch done = new CountDownLatch(pairs.size());
@@ -244,7 +260,13 @@ public class MatchedE2eLoadGenerator {
         Semaphore inFlight = new Semaphore(config.publishers() * 2);
 
         long started = System.nanoTime();
+        long intervalNanos = targetTps > 0 ? Math.max(1L, 1_000_000_000L / targetTps) : 0L;
+        long scheduledIndex = 0;
         for (Pair pair : pairs) {
+            if (intervalNanos > 0) {
+                sleepUntil(started + intervalNanos * scheduledIndex);
+                scheduledIndex++;
+            }
             inFlight.acquire();
             executor.execute(() -> {
                 try {
@@ -267,7 +289,17 @@ public class MatchedE2eLoadGenerator {
         executor.shutdown();
         executor.awaitTermination(30, TimeUnit.SECONDS);
         double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
-        return new PublishResult(published.get(), failures.get(), elapsedSeconds);
+        return new PublishResult(published.get(), failures.get(), elapsedSeconds, targetTps);
+    }
+
+    private static void sleepUntil(long targetNanos) throws InterruptedException {
+        while (true) {
+            long remainingNanos = targetNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
+                return;
+            }
+            TimeUnit.NANOSECONDS.sleep(Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(1)));
+        }
     }
 
     private static void waitForRedisSellBook(
@@ -670,12 +702,17 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"matches\": %d,%n", config.events());
         System.out.printf("  \"publishers\": %d,%n", config.publishers());
+        System.out.printf("  \"targetTps\": %d,%n", config.targetTps());
+        System.out.printf("  \"durationSeconds\": %d,%n", config.durationSeconds());
+        System.out.printf("  \"expectedBuyPublishSeconds\": %.2f,%n", config.expectedBuyPublishSeconds());
         System.out.printf("  \"sellPublished\": %d,%n", sellPublish.published());
         System.out.printf("  \"sellPublishFailures\": %d,%n", sellPublish.failures());
         System.out.printf("  \"sellPublishSeconds\": %.2f,%n", sellPublish.elapsedSeconds());
         System.out.printf("  \"buyPublished\": %d,%n", buyPublish.published());
         System.out.printf("  \"buyPublishFailures\": %d,%n", buyPublish.failures());
         System.out.printf("  \"buyPublishSeconds\": %.2f,%n", buyPublish.elapsedSeconds());
+        System.out.printf("  \"actualBuyPublishTps\": %.2f,%n", buyPublish.published() / Math.max(buyPublish.elapsedSeconds(), 0.001));
+        System.out.printf("  \"drainSecondsAfterBuyPublish\": %.2f,%n", Math.max(0.0, elapsedSeconds - buyPublish.elapsedSeconds()));
         System.out.printf("  \"elapsedSeconds\": %.2f,%n", elapsedSeconds);
         System.out.printf("  \"matchedE2eTps\": %.2f,%n", config.events() / Math.max(elapsedSeconds, 0.001));
         System.out.printf("  \"tradeExecutionsReachedSeconds\": %.2f,%n", waitResult.tradeExecutionsReachedSeconds());
@@ -733,7 +770,7 @@ public class MatchedE2eLoadGenerator {
         }
     }
 
-    private record PublishResult(int published, int failures, double elapsedSeconds) {
+    private record PublishResult(int published, int failures, double elapsedSeconds, int targetTps) {
     }
 
     private record WaitResult(
@@ -809,6 +846,8 @@ public class MatchedE2eLoadGenerator {
             int events,
             int publishers,
             int timeoutSeconds,
+            int targetTps,
+            int durationSeconds,
             boolean truncate,
             String redisHost,
             int redisPort,
@@ -824,14 +863,25 @@ public class MatchedE2eLoadGenerator {
             return "project".equals(phase);
         }
 
+        private double expectedBuyPublishSeconds() {
+            return targetTps > 0 ? events / (double) targetTps : 0.0;
+        }
+
         private static Config from(String[] args) {
             String marketId = stringArg(args, "--market-id", "MATCHED_E2E_LOAD");
+            int targetTps = intArg(args, "--target-tps", 0);
+            int durationSeconds = intArg(args, "--duration-seconds", 0);
+            int defaultEvents = targetTps > 0 && durationSeconds > 0
+                    ? targetTps * durationSeconds
+                    : 1_000;
             return new Config(
                     stringArg(args, "--phase", "run"),
                     marketId,
-                    intArg(args, "--events", 1_000),
+                    intArg(args, "--events", defaultEvents),
                     intArg(args, "--publishers", 16),
                     intArg(args, "--timeout-seconds", 60),
+                    targetTps,
+                    durationSeconds,
                     booleanArg(args, "--truncate", true),
                     stringArg(args, "--redis-host", "localhost"),
                     intArg(args, "--redis-port", 6379),
