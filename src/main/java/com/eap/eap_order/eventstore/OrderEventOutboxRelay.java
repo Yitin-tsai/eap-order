@@ -56,7 +56,7 @@ public class OrderEventOutboxRelay {
         do {
             List<OutboxRow> rows = jdbc.query("""
                     SELECT id, event_id, exchange_name, routing_key, message_type,
-                           payload::text, attempt_count
+                           payload, attempt_count
                     FROM order_service.order_event_outbox
                     WHERE status = 'PENDING'
                       AND next_retry_at <= CURRENT_TIMESTAMP

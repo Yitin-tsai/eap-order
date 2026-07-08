@@ -10,6 +10,7 @@ spring:
 eap:
   order:
     event-sourcing:
+      trade-idempotency-source: trade-application
       fast-match-from-projection:
         enabled: true
     datasource:
@@ -28,12 +29,15 @@ eap:
         concurrency: 16
       trade-executed:
         concurrency: 12
+        batch-size: 50
+        receive-timeout-ms: 25
   order-event-outbox:
     batch-size: 500
     poll-interval-ms: 100
   order-projection:
     enabled: true
     batch-size: 500
+    max-batches-per-tick: 1
     poll-interval-ms: 5000
     repair:
       enabled: false

@@ -236,7 +236,9 @@ public class OrderMatchedDbLoadGenerator {
         jdbcTemplate.execute("""
                 TRUNCATE TABLE
                     order_service.match_history,
+                    order_service.order_trade_applications,
                     order_service.order_event_outbox,
+                    order_service.order_matching_state,
                     order_service.orders_current,
                     order_service.projection_checkpoints,
                     order_service.order_event_store,

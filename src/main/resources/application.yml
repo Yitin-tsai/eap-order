@@ -95,3 +95,5 @@ eap:
         concurrency: 4
       trade-executed:
         concurrency: 4
+        batch-size: 1
+        receive-timeout-ms: 50

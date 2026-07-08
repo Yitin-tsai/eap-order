@@ -14,17 +14,25 @@ import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.eap.eap_order.eventstore.OrderEventAppendCommand;
 import com.eap.eap_order.eventstore.OrderEventAppender;
+import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchAppendCommand;
+import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchAppendResult;
+import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchAppendStatus;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendResult;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus;
 import com.eap.eap_order.eventstore.OrderEventStreamReader;
 import com.eap.eap_order.eventstore.OrderIntegrationEvent;
+import com.eap.eap_order.eventstore.OrderTradeApplication;
 import com.eap.eap_order.eventstore.OrderTradeExecutionLink;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import static com.eap.common.constants.RabbitMQConstants.ORDER_EXCHANGE;
@@ -37,16 +45,23 @@ public class OrderEventSourcingService {
 
     private final OrderEventAppender appender;
     private final OrderEventStreamReader streamReader;
+    private final OrderTradeBatchMetrics batchMetrics;
     private final boolean fastMatchFromProjectionEnabled;
+    private final String tradeIdempotencySource;
 
     public OrderEventSourcingService(
             OrderEventAppender appender,
             OrderEventStreamReader streamReader,
+            OrderTradeBatchMetrics batchMetrics,
             @Value("${eap.order.event-sourcing.fast-match-from-projection.enabled:false}")
-            boolean fastMatchFromProjectionEnabled) {
+            boolean fastMatchFromProjectionEnabled,
+            @Value("${eap.order.event-sourcing.trade-idempotency-source:links}")
+            String tradeIdempotencySource) {
         this.appender = appender;
         this.streamReader = streamReader;
+        this.batchMetrics = batchMetrics;
         this.fastMatchFromProjectionEnabled = fastMatchFromProjectionEnabled;
+        this.tradeIdempotencySource = tradeIdempotencySource;
     }
 
     public void request(OrderSubmittedEvent integrationEvent) {
@@ -97,8 +112,70 @@ public class OrderEventSourcingService {
     }
 
     public void applyTrade(TradeExecutedEvent source) {
+        applyPreparedTrade(preparedTrade(source));
+    }
+
+    public void applyTrades(List<TradeExecutedEvent> sources) {
+        if (sources == null || sources.isEmpty()) {
+            return;
+        }
+        batchMetrics.received(sources.size());
+        if (sources.size() == 1) {
+            applyTrade(sources.get(0));
+            batchMetrics.fallback("singleton_batch", 1);
+            return;
+        }
+        List<PreparedTrade> preparedTrades = new ArrayList<>(sources.size());
+        for (TradeExecutedEvent source : sources) {
+            preparedTrades.add(preparedTrade(source));
+        }
+        if (!tradeApplicationIdempotencyEnabled()) {
+            applyTradesIndividually(preparedTrades);
+            batchMetrics.fallback("non_trade_application_mode", preparedTrades.size());
+            return;
+        }
+        if (hasOverlappingOrders(preparedTrades)) {
+            applyTradesIndividually(preparedTrades);
+            batchMetrics.fallback("overlapping_order", preparedTrades.size());
+            batchMetrics.overlapFallback(preparedTrades.size());
+            return;
+        }
+        TradeApplicationBatchAppendResult result = appender
+                .appendTradeMatchedBatchFromCaughtUpProjectionIfTradeApplicationsAbsent(
+                        preparedTrades.stream()
+                                .map(PreparedTrade::toBatchAppendCommand)
+                                .toList());
+        if (result.status() == TradeApplicationBatchAppendStatus.APPLIED) {
+            batchMetrics.batchApplied(result.appliedCount());
+            return;
+        }
+        applyTradesIndividually(preparedTrades);
+        batchMetrics.fallback(result.notBatchableReason().metricName(), preparedTrades.size());
+    }
+
+    private void applyTradesIndividually(List<PreparedTrade> preparedTrades) {
+        for (PreparedTrade preparedTrade : preparedTrades) {
+            applyPreparedTrade(preparedTrade);
+        }
+    }
+
+    private boolean hasOverlappingOrders(List<PreparedTrade> preparedTrades) {
+        Set<UUID> orderIds = new HashSet<>(preparedTrades.size() * 2);
+        for (PreparedTrade preparedTrade : preparedTrades) {
+            if (!orderIds.add(preparedTrade.source().getBuyerOrderId())
+                    || !orderIds.add(preparedTrade.source().getSellerOrderId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private PreparedTrade preparedTrade(TradeExecutedEvent source) {
         if (source.getBuyerOrderId() == null || source.getSellerOrderId() == null) {
             throw new IllegalArgumentException("TradeExecutedEvent must contain both buyerOrderId and sellerOrderId");
+        }
+        if (source.getTradeId() == null || source.getTradeId().isBlank()) {
+            throw new IllegalArgumentException("TradeExecutedEvent must contain tradeId");
         }
         LocalDateTime occurredAt = source.getOccurredAt() == null
                 ? LocalDateTime.now()
@@ -110,9 +187,48 @@ public class OrderEventSourcingService {
         OrderIntegrationEvent integrationEvent = tradeAppliedIntegration(source, occurredAt);
         OrderTradeExecutionLink buyerLink = tradeExecutionLink(source.getBuyerOrderId(), source, "BUY", occurredAt);
         OrderTradeExecutionLink sellerLink = tradeExecutionLink(source.getSellerOrderId(), source, "SELL", occurredAt);
+        OrderTradeApplication tradeApplication = tradeApplication(source, occurredAt);
+        return new PreparedTrade(
+                source,
+                buyerFastPathEvent,
+                sellerFastPathEvent,
+                integrationEvent,
+                buyerLink,
+                sellerLink,
+                tradeApplication);
+    }
+
+    private void applyPreparedTrade(PreparedTrade preparedTrade) {
+        TradeExecutedEvent source = preparedTrade.source();
+        if (eventStoreTradeIdempotencyEnabled()) {
+            OrderEventAppendCommand buyerCommand = tradeMatchedCommand(
+                    source.getBuyerOrderId(), source.getTradeId(), preparedTrade.buyerFastPathEvent(),
+                    preparedTrade.buyerFastPathEvent().matchedAt());
+            OrderEventAppendCommand sellerCommand = tradeMatchedCommand(
+                    source.getSellerOrderId(), source.getTradeId(), preparedTrade.sellerFastPathEvent(),
+                    preparedTrade.sellerFastPathEvent().matchedAt());
+            TradeExecutionAppendResult result =
+                    appender.appendTradeMatchedFromCaughtUpProjectionWithEventStoreIdempotency(
+                            buyerCommand, source.getQuantity(),
+                            sellerCommand, source.getQuantity(),
+                            preparedTrade.integrationEvent());
+            if (result.status() == TradeExecutionAppendStatus.APPLIED
+                    || result.status() == TradeExecutionAppendStatus.DUPLICATE) {
+                return;
+            }
+            throw new IllegalStateException("TradeExecutedEvent could not be applied from command state: tradeId="
+                    + source.getTradeId());
+        }
+        if (tradeApplicationIdempotencyEnabled()
+                && applyTradeFromCaughtUpProjection(source, preparedTrade.buyerFastPathEvent(),
+                preparedTrade.sellerFastPathEvent(), preparedTrade.integrationEvent(),
+                preparedTrade.tradeApplication(), source.getQuantity())) {
+            return;
+        }
         if (fastMatchFromProjectionEnabled
-                && applyTradeFromCaughtUpProjection(source, buyerFastPathEvent, sellerFastPathEvent,
-                integrationEvent, buyerLink, sellerLink, source.getQuantity())) {
+                && applyTradeFromCaughtUpProjection(source, preparedTrade.buyerFastPathEvent(),
+                preparedTrade.sellerFastPathEvent(), preparedTrade.integrationEvent(),
+                preparedTrade.buyerLink(), preparedTrade.sellerLink(), source.getQuantity())) {
             return;
         }
 
@@ -121,27 +237,91 @@ public class OrderEventSourcingService {
         long buyerExpectedVersion = buyerAggregate.version();
         long sellerExpectedVersion = sellerAggregate.version();
         OrderMatchedV1 buyerEvent = buyerAggregate.match(
-                source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
+                source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(),
+                preparedTrade.buyerFastPathEvent().matchedAt());
         OrderMatchedV1 sellerEvent = sellerAggregate.match(
-                source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
+                source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(),
+                preparedTrade.sellerFastPathEvent().matchedAt());
         TradeExecutionAppendResult fallbackResult = appendTradeFromConsumerIfTradeLinksAbsent(
                 source.getBuyerOrderId(),
                 buyerExpectedVersion,
-                eventId(source.getBuyerOrderId(), "MATCHED:" + source.getLegacyMatchId()),
+                tradeMatchedEventId(source.getBuyerOrderId(), source.getTradeId()),
                 buyerEvent,
                 buyerAggregate.userId(),
                 source.getSellerOrderId(),
                 sellerExpectedVersion,
-                eventId(source.getSellerOrderId(), "MATCHED:" + source.getLegacyMatchId()),
+                tradeMatchedEventId(source.getSellerOrderId(), source.getTradeId()),
                 sellerEvent,
                 sellerAggregate.userId(),
-                occurredAt,
-                integrationEvent,
-                buyerLink,
-                sellerLink);
+                preparedTrade.buyerFastPathEvent().matchedAt(),
+                preparedTrade.integrationEvent(),
+                preparedTrade.buyerLink(),
+                preparedTrade.sellerLink());
         if (fallbackResult.status() == TradeExecutionAppendStatus.DUPLICATE) {
             return;
         }
+    }
+
+    private boolean eventStoreTradeIdempotencyEnabled() {
+        return "event-store".equalsIgnoreCase(tradeIdempotencySource);
+    }
+
+    private boolean tradeApplicationIdempotencyEnabled() {
+        return "trade-application".equalsIgnoreCase(tradeIdempotencySource);
+    }
+
+    private OrderEventAppendCommand tradeMatchedCommand(
+            UUID orderId,
+            String tradeId,
+            OrderMatchedV1 event,
+            LocalDateTime occurredAt) {
+        return new OrderEventAppendCommand(
+                orderId,
+                0,
+                tradeMatchedEventId(orderId, tradeId),
+                "OrderMatchedV1",
+                event,
+                Map.of("correlationId", orderId.toString()),
+                1,
+                occurredAt,
+                null);
+    }
+
+    private boolean applyTradeFromCaughtUpProjection(
+            TradeExecutedEvent source,
+            OrderMatchedV1 buyerEvent,
+            OrderMatchedV1 sellerEvent,
+            OrderIntegrationEvent integrationEvent,
+            OrderTradeApplication tradeApplication,
+            int quantity) {
+        OrderEventAppendCommand buyerCommand = new OrderEventAppendCommand(
+                source.getBuyerOrderId(),
+                0,
+                tradeMatchedEventId(source.getBuyerOrderId(), source.getTradeId()),
+                "OrderMatchedV1",
+                buyerEvent,
+                Map.of("correlationId", source.getBuyerOrderId().toString()),
+                1,
+                buyerEvent.matchedAt(),
+                null);
+        OrderEventAppendCommand sellerCommand = new OrderEventAppendCommand(
+                source.getSellerOrderId(),
+                0,
+                tradeMatchedEventId(source.getSellerOrderId(), source.getTradeId()),
+                "OrderMatchedV1",
+                sellerEvent,
+                Map.of("correlationId", source.getSellerOrderId().toString()),
+                1,
+                sellerEvent.matchedAt(),
+                null);
+        TradeExecutionAppendResult result =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
+                        buyerCommand, quantity,
+                        sellerCommand, quantity,
+                        tradeApplication,
+                        integrationEvent);
+        return result.status() == TradeExecutionAppendStatus.APPLIED
+                || result.status() == TradeExecutionAppendStatus.DUPLICATE;
     }
 
     private boolean applyTradeFromCaughtUpProjection(
@@ -155,7 +335,7 @@ public class OrderEventSourcingService {
         OrderEventAppendCommand buyerCommand = new OrderEventAppendCommand(
                 source.getBuyerOrderId(),
                 0,
-                eventId(source.getBuyerOrderId(), "MATCHED:" + buyerEvent.matchId()),
+                tradeMatchedEventId(source.getBuyerOrderId(), source.getTradeId()),
                 "OrderMatchedV1",
                 buyerEvent,
                 Map.of("correlationId", source.getBuyerOrderId().toString()),
@@ -165,7 +345,7 @@ public class OrderEventSourcingService {
         OrderEventAppendCommand sellerCommand = new OrderEventAppendCommand(
                 source.getSellerOrderId(),
                 0,
-                eventId(source.getSellerOrderId(), "MATCHED:" + sellerEvent.matchId()),
+                tradeMatchedEventId(source.getSellerOrderId(), source.getTradeId()),
                 "OrderMatchedV1",
                 sellerEvent,
                 Map.of("correlationId", source.getSellerOrderId().toString()),
@@ -212,13 +392,73 @@ public class OrderEventSourcingService {
                 appliedAt);
     }
 
+    private OrderTradeApplication tradeApplication(
+            TradeExecutedEvent source,
+            LocalDateTime appliedAt) {
+        return new OrderTradeApplication(
+                source.getTradeId(),
+                source.getBuyerOrderId(),
+                source.getSellerOrderId(),
+                source.getDealPrice(),
+                source.getQuantity(),
+                appliedAt);
+    }
+
+    private record PreparedTrade(
+            TradeExecutedEvent source,
+            OrderMatchedV1 buyerFastPathEvent,
+            OrderMatchedV1 sellerFastPathEvent,
+            OrderIntegrationEvent integrationEvent,
+            OrderTradeExecutionLink buyerLink,
+            OrderTradeExecutionLink sellerLink,
+            OrderTradeApplication tradeApplication) {
+
+        private TradeApplicationBatchAppendCommand toBatchAppendCommand() {
+            return new TradeApplicationBatchAppendCommand(
+                    new OrderEventAppendCommand(
+                            source.getBuyerOrderId(),
+                            0,
+                            tradeMatchedEventId(source.getBuyerOrderId(), source.getTradeId()),
+                            "OrderMatchedV1",
+                            buyerFastPathEvent,
+                            Map.of("correlationId", source.getBuyerOrderId().toString()),
+                            1,
+                            buyerFastPathEvent.matchedAt(),
+                            null),
+                    source.getQuantity(),
+                    new OrderEventAppendCommand(
+                            source.getSellerOrderId(),
+                            0,
+                            tradeMatchedEventId(source.getSellerOrderId(), source.getTradeId()),
+                            "OrderMatchedV1",
+                            sellerFastPathEvent,
+                            Map.of("correlationId", source.getSellerOrderId().toString()),
+                            1,
+                            sellerFastPathEvent.matchedAt(),
+                            null),
+                    source.getQuantity(),
+                    tradeApplication,
+                    integrationEvent);
+        }
+    }
+
     public void cancel(UUID orderId, UUID userId) {
-        OrderAggregate aggregate = streamReader.load(orderId);
-        long expectedVersion = aggregate.version();
         LocalDateTime occurredAt = LocalDateTime.now();
-        OrderCancelledV1 event = aggregate.cancel(userId, occurredAt);
-        append(orderId, expectedVersion, eventId(orderId, "CANCELLED"),
-                "OrderCancelledV1", event, userId, occurredAt, null);
+        OrderCancelledV1 event = new OrderCancelledV1(orderId, userId, occurredAt);
+        appender.appendCancellationIfCurrentStateAllows(new OrderEventAppendCommand(
+                orderId,
+                0,
+                eventId(orderId, "CANCELLED"),
+                "OrderCancelledV1",
+                event,
+                Map.of("correlationId", orderId.toString(), "userId", userId.toString()),
+                1,
+                occurredAt,
+                null));
+    }
+
+    public void assertCancellationAllowed(UUID orderId, UUID userId) {
+        appender.assertCancellationAllowed(orderId, userId);
     }
 
     private void append(
@@ -278,9 +518,13 @@ public class OrderEventSourcingService {
                 buyerCommand, buyerLink, sellerCommand, sellerLink, integrationEvent);
     }
 
-    private UUID eventId(UUID orderId, String discriminator) {
+    private static UUID eventId(UUID orderId, String discriminator) {
         return UUID.nameUUIDFromBytes(
                 (orderId + ":" + discriminator).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static UUID tradeMatchedEventId(UUID orderId, String tradeId) {
+        return eventId(orderId, "TRADE_EXECUTED:" + tradeId);
     }
 
 }

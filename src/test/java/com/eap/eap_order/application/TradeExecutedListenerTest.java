@@ -7,6 +7,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.Mockito.verify;
@@ -22,9 +23,9 @@ class TradeExecutedListenerTest {
         TradeExecutedEvent event = event();
         TradeExecutedListener listener = new TradeExecutedListener(orderEventSourcingService);
 
-        listener.handleTradeExecuted(event);
+        listener.handleTradeExecuted(List.of(event));
 
-        verify(orderEventSourcingService).applyTrade(event);
+        verify(orderEventSourcingService).applyTrades(List.of(event));
     }
 
     private TradeExecutedEvent event() {

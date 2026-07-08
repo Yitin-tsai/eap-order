@@ -26,6 +26,7 @@ public class OrdersCurrentProjector {
     private final TransactionTemplate transactionTemplate;
     private final int batchSize;
     private final boolean enabled;
+    private final int maxBatchesPerTick;
     private final int repairBatchSize;
     private final boolean repairEnabled;
 
@@ -35,6 +36,7 @@ public class OrdersCurrentProjector {
             @Qualifier("orderProjectionTransactionManager") PlatformTransactionManager transactionManager,
             @Value("${eap.order-projection.batch-size:500}") int batchSize,
             @Value("${eap.order-projection.enabled:true}") boolean enabled,
+            @Value("${eap.order-projection.max-batches-per-tick:1}") int maxBatchesPerTick,
             @Value("${eap.order-projection.repair.batch-size:100}") int repairBatchSize,
             @Value("${eap.order-projection.repair.enabled:true}") boolean repairEnabled) {
         this.jdbc = jdbc;
@@ -42,13 +44,17 @@ public class OrdersCurrentProjector {
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.batchSize = batchSize;
         this.enabled = enabled;
+        this.maxBatchesPerTick = Math.max(1, maxBatchesPerTick);
         this.repairBatchSize = repairBatchSize;
         this.repairEnabled = repairEnabled;
     }
 
     @Scheduled(fixedDelayString = "${eap.order-projection.poll-interval-ms:100}")
     public void project() {
-        projectUntilCaughtUp();
+        if (!enabled) {
+            return;
+        }
+        projectBatches(maxBatchesPerTick);
     }
 
     public void projectUntilCaughtUp() {
@@ -59,11 +65,17 @@ public class OrdersCurrentProjector {
     }
 
     public void projectUntilCaughtUpIgnoringEnabled() {
+        projectBatches(Integer.MAX_VALUE);
+    }
+
+    private void projectBatches(int maxBatches) {
         boolean fullBatch;
+        int batches = 0;
         do {
             Boolean result = transactionTemplate.execute(status -> projectBatch());
             fullBatch = Boolean.TRUE.equals(result);
-        } while (fullBatch);
+            batches++;
+        } while (fullBatch && batches < maxBatches);
     }
 
     private boolean projectBatch() {

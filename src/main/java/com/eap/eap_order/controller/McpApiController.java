@@ -3,6 +3,7 @@ package com.eap.eap_order.controller;
 import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.dto.*;
 import com.eap.eap_order.application.AuctionStatusService;
+import com.eap.eap_order.application.OrderEventSourcingService;
 import com.eap.eap_order.application.OrderQueryService;
 import com.eap.eap_order.application.OrderSubmissionResult;
 import com.eap.eap_order.application.PlaceAuctionBidService;
@@ -55,6 +56,9 @@ public class McpApiController {
 
     @Autowired
     private EapMatchEngine eapMatchEngine;
+
+    @Autowired
+    private OrderEventSourcingService orderEventSourcingService;
 
     @Autowired
     private PlaceAuctionBidService placeAuctionBidService;
@@ -121,18 +125,21 @@ public class McpApiController {
     @ApiResponse(responseCode = "200", description = "取消成功")
     @DeleteMapping("/orders/{orderId}")
     public ResponseEntity<CancelOrderResponse> cancelOrder(
-            @Parameter(description = "訂單ID") @PathVariable String orderId) {
+            @Parameter(description = "訂單ID") @PathVariable String orderId,
+            @Parameter(description = "用戶ID") @RequestParam String userId) {
         
-        log.info("收到 MCP 取消訂單請求: {}", orderId);
+        log.info("收到 MCP 取消訂單請求: orderId={}, userId={}", orderId, userId);
         
         try {
-            
+            UUID orderUuid = UUID.fromString(orderId);
+            UUID userUuid = UUID.fromString(userId);
+            orderEventSourcingService.assertCancellationAllowed(orderUuid, userUuid);
+
             OrderCancelEvent cancelEvent = OrderCancelEvent.builder()
-                .orderId(UUID.fromString(orderId))
+                .orderId(orderUuid)
                 .build();
-            
-            
             eapMatchEngine.cancelOrder(cancelEvent);
+            orderEventSourcingService.cancel(orderUuid, userUuid);
             
             return ResponseEntity.ok(CancelOrderResponse.success(orderId));
             

@@ -150,9 +150,15 @@ public class OrderController {
 
         log.info("取消訂單請求: {}", request);
 
+       try {
+           orderEventSourcingService.assertCancellationAllowed(request.getOrderId(), request.getUserId());
+       } catch (IllegalArgumentException | IllegalStateException e) {
+           log.warn("取消訂單被拒絕: {}", e.getMessage());
+           return ResponseEntity.badRequest().build();
+       }
+
        OrderCancelEvent cancelEvent = OrderCancelEvent.builder().orderId(request.getOrderId()).build();
        eapMatchEngine.cancelOrder(cancelEvent);
-
        orderEventSourcingService.cancel(request.getOrderId(), request.getUserId());
 
        return ResponseEntity.ok().build();
