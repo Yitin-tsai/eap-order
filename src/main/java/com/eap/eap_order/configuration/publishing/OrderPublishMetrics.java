@@ -13,6 +13,11 @@ public class OrderPublishMetrics {
     private final Counter confirmed;
     private final Counter failed;
     private final Timer confirmDuration;
+    private final Timer outboxSelectDuration;
+    private final Timer outboxPublishEnqueueDuration;
+    private final Timer outboxConfirmDuration;
+    private final Timer outboxMarkSentDuration;
+    private final Timer outboxBatchDuration;
 
     public OrderPublishMetrics(MeterRegistry registry) {
         this.confirmed = Counter.builder("eap_order_submitted_publish_confirmed_total")
@@ -25,6 +30,26 @@ public class OrderPublishMetrics {
                 .description("Time spent publishing OrderSubmittedEvent and waiting for RabbitMQ confirmation")
                 .publishPercentileHistogram()
                 .register(registry);
+        this.outboxSelectDuration = stageTimer(
+                registry,
+                "eap_order_outbox_select_duration",
+                "Time spent selecting pending order outbox records");
+        this.outboxPublishEnqueueDuration = stageTimer(
+                registry,
+                "eap_order_outbox_publish_enqueue_duration",
+                "Time spent deserializing and enqueueing order outbox records to RabbitMQ");
+        this.outboxConfirmDuration = stageTimer(
+                registry,
+                "eap_order_outbox_confirm_duration",
+                "Time spent waiting for RabbitMQ publisher confirms for order outbox records");
+        this.outboxMarkSentDuration = stageTimer(
+                registry,
+                "eap_order_outbox_mark_sent_duration",
+                "Time spent marking confirmed order outbox records as SENT");
+        this.outboxBatchDuration = stageTimer(
+                registry,
+                "eap_order_outbox_batch_duration",
+                "Wall-clock time spent processing one order outbox relay batch");
     }
 
     public void confirmed() {
@@ -37,5 +62,32 @@ public class OrderPublishMetrics {
 
     public void recordDuration(Duration duration) {
         confirmDuration.record(duration);
+    }
+
+    public void recordOutboxSelect(Duration duration) {
+        outboxSelectDuration.record(duration);
+    }
+
+    public void recordOutboxPublishEnqueue(Duration duration) {
+        outboxPublishEnqueueDuration.record(duration);
+    }
+
+    public void recordOutboxConfirm(Duration duration) {
+        outboxConfirmDuration.record(duration);
+    }
+
+    public void recordOutboxMarkSent(Duration duration) {
+        outboxMarkSentDuration.record(duration);
+    }
+
+    public void recordOutboxBatch(Duration duration) {
+        outboxBatchDuration.record(duration);
+    }
+
+    private Timer stageTimer(MeterRegistry registry, String name, String description) {
+        return Timer.builder(name)
+                .description(description)
+                .publishPercentileHistogram()
+                .register(registry);
     }
 }
