@@ -590,7 +590,7 @@ public class MatchedE2eLoadGenerator {
             long now = System.nanoTime();
             boolean shouldSnapshotDb = now >= nextDbSnapshotNanos || consecutiveFullyDrainedSamples >= 3;
             if (shouldSnapshotDb) {
-                latest = snapshot(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, false);
+                latest = progressSnapshot(config, orderJdbc, walletJdbc, matchJdbc, queueLatest);
                 nextDbSnapshotNanos = now + TimeUnit.SECONDS.toNanos(1);
                 if (tradeExecutionsReachedSeconds < 0 && latest.tradeExecutions() == config.events()) {
                     tradeExecutionsReachedSeconds = elapsedSeconds;
@@ -607,7 +607,7 @@ public class MatchedE2eLoadGenerator {
                 if (projectionCaughtUpSeconds < 0 && projectionSatisfied(config, latest)) {
                     projectionCaughtUpSeconds = elapsedSeconds;
                 }
-                if (invariantsSatisfied(config, latest) && consecutiveFullyDrainedSamples >= 3) {
+                if (coreBusinessCountsReached(config, latest) && consecutiveFullyDrainedSamples >= 3) {
                     WaitResult verified = snapshot(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, true);
                     if (!invariantsSatisfied(config, verified)) {
                         latest = verified;
@@ -702,6 +702,14 @@ public class MatchedE2eLoadGenerator {
                 && verified.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT;
     }
 
+    private static boolean coreBusinessCountsReached(Config config, WaitResult latest) {
+        return latest.orderMatchedEvents() == config.events() * 2L
+                && latest.orderCommandMatchedRows() == config.events() * 2L
+                && latest.tradeExecutions() == config.events()
+                && latest.completedTrades() == config.events()
+                && latest.walletTradeSettlements() == config.events();
+    }
+
     private static boolean projectionSatisfied(Config config, WaitResult verified) {
         return verified.orderCurrentMatchedRows() == config.events() * 2L
                 && verified.orderProjectionStaleRows() == 0;
@@ -760,6 +768,58 @@ public class MatchedE2eLoadGenerator {
                 0);
     }
 
+    private static WaitResult progressSnapshot(
+            Config config,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            JdbcTemplate matchJdbc,
+            WaitResult queueLatest) {
+        long orderCommandMatchedRows = countOrderCommandMatchedRows(orderJdbc);
+        return new WaitResult(
+                orderCommandMatchedRows,
+                orderCommandMatchedRows,
+                -1,
+                -1,
+                -1,
+                count(matchJdbc, "SELECT count(*) FROM match_engine.trade_executions"),
+                countCompletedTrades(matchJdbc, false),
+                count(walletJdbc, "SELECT count(*) FROM wallet_service.trade_settlements"),
+                -1,
+                -1,
+                -1,
+                -1,
+                queueLatest.matchEngineQueueReady(),
+                queueLatest.orderMatchedQueueReady(),
+                queueLatest.walletMatchedQueueReady(),
+                queueLatest.orderTradeExecutedQueueReady(),
+                queueLatest.walletTradeExecutedQueueReady(),
+                queueLatest.orderTradeAppliedQueueReady(),
+                queueLatest.walletTradeSettledQueueReady(),
+                queueLatest.matchEngineQueueUnacked(),
+                queueLatest.orderTradeExecutedQueueUnacked(),
+                queueLatest.walletTradeExecutedQueueUnacked(),
+                queueLatest.orderTradeAppliedQueueUnacked(),
+                queueLatest.walletTradeSettledQueueUnacked(),
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0);
+    }
+
     private static WaitResult snapshot(
             Config config,
             JdbcTemplate orderJdbc,
@@ -774,14 +834,10 @@ public class MatchedE2eLoadGenerator {
         QueueDepth walletTradeExecuted = queueDepth(config, rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
         QueueDepth orderTradeApplied = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE);
         QueueDepth walletTradeSettled = queueDepth(config, rabbitAdmin, MATCH_ENGINE_WALLET_TRADE_SETTLED_QUEUE);
+        long orderCommandMatchedRows = countOrderCommandMatchedRows(orderJdbc);
         return new WaitResult(
-                countOrderMatchedEvents(orderJdbc, strictCompletionCheck),
-                count(orderJdbc, """
-                        SELECT count(*)
-                        FROM order_service.order_matching_state
-                        WHERE status = 'MATCHED'
-                          AND remaining_amount = 0
-                        """),
+                orderCommandMatchedRows,
+                orderCommandMatchedRows,
                 count(orderJdbc, """
                         SELECT count(*)
                         FROM order_service.orders_current
@@ -835,7 +891,7 @@ public class MatchedE2eLoadGenerator {
                 0);
     }
 
-    private static long countOrderMatchedEvents(JdbcTemplate orderJdbc, boolean strictCompletionCheck) {
+    private static long countOrderCommandMatchedRows(JdbcTemplate orderJdbc) {
         return count(orderJdbc, """
                 SELECT count(*)
                 FROM order_service.order_matching_state
