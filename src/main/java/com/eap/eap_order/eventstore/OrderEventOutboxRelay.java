@@ -1,10 +1,10 @@
 package com.eap.eap_order.eventstore;
 
-import com.eap.common.event.OrderSubmittedEvent;
-import com.eap.common.event.OrderTradeAppliedEvent;
 import com.eap.eap_order.configuration.publishing.OrderPublishMetrics;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.amqp.AmqpException;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -16,6 +16,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PreDestroy;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -33,7 +34,6 @@ public class OrderEventOutboxRelay {
     private final JdbcTemplate jdbc;
     private final NamedParameterJdbcTemplate namedJdbc;
     private final RabbitTemplate rabbitTemplate;
-    private final ObjectMapper objectMapper;
     private final OrderPublishMetrics metrics;
     private final int batchSize;
     private final int publishConcurrency;
@@ -44,7 +44,6 @@ public class OrderEventOutboxRelay {
             @Qualifier("orderConsumerJdbcTemplate") JdbcTemplate jdbc,
             @Qualifier("orderConsumerNamedParameterJdbcTemplate") NamedParameterJdbcTemplate namedJdbc,
             RabbitTemplate rabbitTemplate,
-            ObjectMapper objectMapper,
             OrderPublishMetrics metrics,
             @Value("${eap.order-event-outbox.batch-size:200}") int batchSize,
             @Value("${eap.order-event-outbox.publish-concurrency:1}") int publishConcurrency,
@@ -52,7 +51,6 @@ public class OrderEventOutboxRelay {
         this.jdbc = jdbc;
         this.namedJdbc = namedJdbc;
         this.rabbitTemplate = rabbitTemplate;
-        this.objectMapper = objectMapper;
         this.metrics = metrics;
         this.batchSize = batchSize;
         this.publishConcurrency = Math.max(1, publishConcurrency);
@@ -191,9 +189,8 @@ public class OrderEventOutboxRelay {
         Instant startedAt = Instant.now();
         Instant enqueueStartedAt = Instant.now();
         try {
-            Object message = deserialize(row);
             CorrelationData correlation = new CorrelationData(row.eventId().toString());
-            rabbitTemplate.convertAndSend(row.exchange(), row.routingKey(), message, correlation);
+            rabbitTemplate.send(row.exchange(), row.routingKey(), toJsonMessage(row), correlation);
             return PublishResult.success(row, correlation, startedAt);
         } catch (Exception e) {
             return PublishResult.failure(row, startedAt, e);
@@ -202,14 +199,16 @@ public class OrderEventOutboxRelay {
         }
     }
 
-    private Object deserialize(OutboxRow row) throws Exception {
-        if (OrderSubmittedEvent.class.getName().equals(row.messageType())) {
-            return objectMapper.readValue(row.payload(), OrderSubmittedEvent.class);
+    private Message toJsonMessage(OutboxRow row) {
+        if (!"com.eap.common.event.OrderSubmittedEvent".equals(row.messageType())
+                && !"com.eap.common.event.OrderTradeAppliedEvent".equals(row.messageType())) {
+            throw new IllegalArgumentException("Unsupported Order outbox message type: " + row.messageType());
         }
-        if (OrderTradeAppliedEvent.class.getName().equals(row.messageType())) {
-            return objectMapper.readValue(row.payload(), OrderTradeAppliedEvent.class);
-        }
-        throw new IllegalArgumentException("Unsupported Order outbox message type: " + row.messageType());
+        MessageProperties properties = new MessageProperties();
+        properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
+        properties.setContentEncoding(StandardCharsets.UTF_8.name());
+        properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+        return new Message(row.payload().getBytes(StandardCharsets.UTF_8), properties);
     }
 
     private void recordFailure(OutboxRow row, Exception failure) {
