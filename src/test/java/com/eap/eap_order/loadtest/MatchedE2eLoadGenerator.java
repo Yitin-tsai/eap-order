@@ -43,8 +43,11 @@ import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
+import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -356,7 +359,16 @@ public class MatchedE2eLoadGenerator {
 
         long remainingSellOrders = zsetSize(redisTemplate, "orderbook:" + config.marketId() + ":sell");
         long remainingBuyOrders = zsetSize(redisTemplate, "orderbook:" + config.marketId() + ":buy");
-        printResult(config, sellPublish, buyPublish, waitResult, elapsedSeconds, remainingSellOrders, remainingBuyOrders);
+        long activeReservations = countRedisKeys(redisTemplate, "order:reservation:*");
+        printResult(
+                config,
+                sellPublish,
+                buyPublish,
+                waitResult,
+                elapsedSeconds,
+                remainingSellOrders,
+                remainingBuyOrders,
+                activeReservations);
 
         require(sellPublish.failures() == 0, "SELL publish should have no failures");
         require(buyPublish.failures() == 0, "BUY publish should have no failures");
@@ -371,6 +383,7 @@ public class MatchedE2eLoadGenerator {
         require(waitResult.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT, "Wallet sellers should receive currency");
         require(remainingSellOrders == 0, "all resting SELL orders should be consumed");
         require(remainingBuyOrders == 0, "incoming BUY orders should not remain in order book");
+        require(activeReservations == 0, "MatchEngine reservations should converge to zero");
     }
 
     private static double businessCompletionSeconds(WaitResult waitResult, long startedNanos) {
@@ -937,10 +950,13 @@ public class MatchedE2eLoadGenerator {
         for (Pair pair : pairs) {
             keys.add("order:" + pair.buyOrderId());
             keys.add("order:" + pair.sellOrderId());
+            keys.add("order:reservation:" + pair.buyOrderId());
+            keys.add("order:reservation:" + pair.sellOrderId());
             keys.add("user:" + pair.buyerId() + ":orders");
             keys.add("user:" + pair.sellerId() + ":orders");
         }
         redisTemplate.delete(keys);
+        deleteRedisKeys(redisTemplate, "order:reservation:*");
     }
 
     private static OrderSubmittedEvent submitted(UUID orderId, UUID userId, String side, long sequence, String marketId) {
@@ -1074,6 +1090,47 @@ public class MatchedE2eLoadGenerator {
         return size == null ? 0L : size;
     }
 
+    private static long countRedisKeys(RedisTemplate<String, String> redisTemplate, String pattern) {
+        Long count = redisTemplate.execute((RedisCallback<Long>) connection -> {
+            long matched = 0;
+            ScanOptions options = ScanOptions.scanOptions()
+                    .match(pattern)
+                    .count(1_000)
+                    .build();
+            try (Cursor<byte[]> cursor = connection.scan(options)) {
+                while (cursor.hasNext()) {
+                    cursor.next();
+                    matched++;
+                }
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("Failed to scan Redis keys for pattern " + pattern, e);
+            }
+            return matched;
+        });
+        return count == null ? 0L : count;
+    }
+
+    private static void deleteRedisKeys(RedisTemplate<String, String> redisTemplate, String pattern) {
+        List<String> keys = redisTemplate.execute((RedisCallback<List<String>>) connection -> {
+            List<String> matched = new ArrayList<>();
+            ScanOptions options = ScanOptions.scanOptions()
+                    .match(pattern)
+                    .count(1_000)
+                    .build();
+            try (Cursor<byte[]> cursor = connection.scan(options)) {
+                while (cursor.hasNext()) {
+                    matched.add(new String(cursor.next(), StandardCharsets.UTF_8));
+                }
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("Failed to scan Redis keys for pattern " + pattern, e);
+            }
+            return matched;
+        });
+        if (keys != null && !keys.isEmpty()) {
+            redisTemplate.delete(keys);
+        }
+    }
+
     private static long queueReady(RabbitAdmin rabbitAdmin, String queueName) {
         try {
             Properties properties = rabbitAdmin.getQueueProperties(queueName);
@@ -1132,7 +1189,8 @@ public class MatchedE2eLoadGenerator {
             WaitResult waitResult,
             double elapsedSeconds,
             long remainingSellOrders,
-            long remainingBuyOrders) {
+            long remainingBuyOrders,
+            long activeReservations) {
         System.out.println("{");
         System.out.printf("  \"mode\": \"matchedE2e\",%n");
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
@@ -1203,7 +1261,8 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"maxOrderTradeAppliedQueueUnacked\": %d,%n", waitResult.maxOrderTradeAppliedQueueUnacked());
         System.out.printf("  \"maxWalletTradeSettledQueueUnacked\": %d,%n", waitResult.maxWalletTradeSettledQueueUnacked());
         System.out.printf("  \"remainingSellOrders\": %d,%n", remainingSellOrders);
-        System.out.printf("  \"remainingBuyOrders\": %d%n", remainingBuyOrders);
+        System.out.printf("  \"remainingBuyOrders\": %d,%n", remainingBuyOrders);
+        System.out.printf("  \"activeReservations\": %d%n", activeReservations);
         System.out.println("}");
     }
 
