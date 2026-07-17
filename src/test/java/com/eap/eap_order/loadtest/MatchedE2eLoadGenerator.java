@@ -4,9 +4,13 @@ import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
 import com.eap.eap_order.EapOrderApplication;
 import com.eap.eap_order.application.OrderEventSourcingService;
+import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.eap.eap_order.eventstore.OrdersCurrentProjector;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.io.IOException;
 import java.net.URI;
@@ -15,10 +19,14 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -64,7 +72,15 @@ public class MatchedE2eLoadGenerator {
 
     private static final int PRICE = 100;
     private static final int AMOUNT = 1;
+    private static final String AGGREGATE_TYPE = "Order";
+    private static final String GENESIS_HASH = "0".repeat(64);
+    private static final int SEED_BATCH_PAIRS = 1_000;
     private static final ObjectMapper METRICS_OBJECT_MAPPER = new ObjectMapper();
+    private static final ObjectMapper CANONICAL_OBJECT_MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true)
+            .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true)
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
 
     public static void main(String[] args) throws Exception {
@@ -143,8 +159,25 @@ public class MatchedE2eLoadGenerator {
         purgeQueues(rabbitAdmin);
         cleanupRedis(config, pairs, redisTemplate);
 
-        System.out.printf("seeding %d matched pairs into Order Event Store and Wallet DB, marketId=%s%n",
-                config.events(), config.marketId());
+        System.out.printf("seeding %d matched pairs into Order Event Store and Wallet DB, marketId=%s, seedMode=%s%n",
+                config.events(), config.marketId(), config.seedMode());
+        if ("service".equalsIgnoreCase(config.seedMode())) {
+            seedOrdersThroughService(config, pairs, eventSourcingService);
+        } else if ("bulk".equalsIgnoreCase(config.seedMode())) {
+            seedOrdersBulk(config, pairs, orderJdbc);
+        } else {
+            throw new IllegalArgumentException("--seed-mode must be bulk or service");
+        }
+
+        orderJdbc.execute("TRUNCATE TABLE order_service.order_event_outbox RESTART IDENTITY");
+        seedWallets(walletJdbc, pairs);
+        System.out.println("seed complete; start matchEngine/order/wallet services before --phase run");
+    }
+
+    private static void seedOrdersThroughService(
+            Config config,
+            List<Pair> pairs,
+            OrderEventSourcingService eventSourcingService) {
         for (Pair pair : pairs) {
             OrderSubmittedEvent buySubmitted = submitted(pair.buyOrderId(), pair.buyerId(), "BUY", pair.buySequence(), config.marketId());
             OrderSubmittedEvent sellSubmitted = submitted(pair.sellOrderId(), pair.sellerId(), "SELL", pair.sellSequence(), config.marketId());
@@ -153,10 +186,129 @@ public class MatchedE2eLoadGenerator {
             eventSourcingService.request(sellSubmitted);
             eventSourcingService.confirm(confirmed(sellSubmitted));
         }
+    }
 
-        orderJdbc.execute("TRUNCATE TABLE order_service.order_event_outbox RESTART IDENTITY");
-        seedWallets(walletJdbc, pairs);
-        System.out.println("seed complete; start matchEngine/order/wallet services before --phase run");
+    private static void seedOrdersBulk(Config config, List<Pair> pairs, JdbcTemplate orderJdbc) {
+        for (int start = 0; start < pairs.size(); start += SEED_BATCH_PAIRS) {
+            int end = Math.min(start + SEED_BATCH_PAIRS, pairs.size());
+            List<Object[]> headRows = new ArrayList<>((end - start) * 2);
+            List<Object[]> eventRows = new ArrayList<>((end - start) * 4);
+            List<Object[]> matchingStateRows = new ArrayList<>((end - start) * 2);
+            for (int i = start; i < end; i++) {
+                Pair pair = pairs.get(i);
+                addSeededOrderRows(
+                        config.marketId(),
+                        pair.buyOrderId(),
+                        pair.buyerId(),
+                        "BUY",
+                        pair.buySequence(),
+                        headRows,
+                        eventRows,
+                        matchingStateRows);
+                addSeededOrderRows(
+                        config.marketId(),
+                        pair.sellOrderId(),
+                        pair.sellerId(),
+                        "SELL",
+                        pair.sellSequence(),
+                        headRows,
+                        eventRows,
+                        matchingStateRows);
+            }
+            orderJdbc.batchUpdate("""
+                    INSERT INTO order_service.order_stream_heads
+                        (aggregate_id, current_version, last_event_id, last_hash,
+                         updated_at, user_id, remaining_amount, status)
+                    VALUES (?, 2, ?, ?, CURRENT_TIMESTAMP, ?, ?, 'OPEN')
+                    """, headRows);
+            orderJdbc.batchUpdate("""
+                    INSERT INTO order_service.order_event_store
+                        (event_id, aggregate_id, aggregate_type, aggregate_version,
+                         event_type, payload_canonical, metadata_canonical,
+                         schema_version, occurred_at, prev_hash, hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """, eventRows);
+            orderJdbc.batchUpdate("""
+                    INSERT INTO order_service.order_matching_state
+                        (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
+                    VALUES (?, ?, ?, 0, 'OPEN', CURRENT_TIMESTAMP)
+                    """, matchingStateRows);
+        }
+    }
+
+    private static void addSeededOrderRows(
+            String marketId,
+            UUID orderId,
+            UUID userId,
+            String side,
+            long marketSequence,
+            List<Object[]> headRows,
+            List<Object[]> eventRows,
+            List<Object[]> matchingStateRows) {
+        LocalDateTime occurredAt = LocalDateTime.now();
+        UUID requestedEventId = eventId(orderId, "REQUESTED");
+        UUID confirmedEventId = eventId(orderId, "ASSET_RESERVATION_CONFIRMED");
+        String metadataCanonical = serializeCanonical(Map.of(
+                "correlationId", orderId.toString(),
+                "userId", userId.toString()));
+        OrderSubmissionRequestedV1 requested = new OrderSubmissionRequestedV1(
+                orderId,
+                userId,
+                marketId,
+                marketSequence,
+                side,
+                PRICE,
+                AMOUNT,
+                occurredAt);
+        String requestedPayload = serializeCanonical(requested);
+        String requestedHash = computeHash(
+                requestedEventId,
+                orderId,
+                1,
+                "OrderSubmissionRequestedV1",
+                requestedPayload,
+                metadataCanonical,
+                occurredAt,
+                GENESIS_HASH);
+        OrderAssetReservationConfirmedV1 confirmed =
+                new OrderAssetReservationConfirmedV1(orderId, userId, occurredAt);
+        String confirmedPayload = serializeCanonical(confirmed);
+        String confirmedHash = computeHash(
+                confirmedEventId,
+                orderId,
+                2,
+                "OrderAssetReservationConfirmedV1",
+                confirmedPayload,
+                metadataCanonical,
+                occurredAt,
+                requestedHash);
+
+        headRows.add(new Object[] { orderId, confirmedEventId, confirmedHash, userId, AMOUNT });
+        eventRows.add(new Object[] {
+                requestedEventId,
+                orderId,
+                AGGREGATE_TYPE,
+                1,
+                "OrderSubmissionRequestedV1",
+                requestedPayload,
+                metadataCanonical,
+                occurredAt,
+                GENESIS_HASH,
+                requestedHash
+        });
+        eventRows.add(new Object[] {
+                confirmedEventId,
+                orderId,
+                AGGREGATE_TYPE,
+                2,
+                "OrderAssetReservationConfirmedV1",
+                confirmedPayload,
+                metadataCanonical,
+                occurredAt,
+                requestedHash,
+                confirmedHash
+        });
+        matchingStateRows.add(new Object[] { orderId, userId, AMOUNT });
     }
 
     private static void projectSeededOrders(
@@ -837,6 +989,45 @@ public class MatchedE2eLoadGenerator {
         return UUID.nameUUIDFromBytes((marketId + ":" + type + ":" + index).getBytes(StandardCharsets.UTF_8));
     }
 
+    private static UUID eventId(UUID orderId, String discriminator) {
+        return UUID.nameUUIDFromBytes((orderId + ":" + discriminator).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String serializeCanonical(Object value) {
+        try {
+            return CANONICAL_OBJECT_MAPPER.writeValueAsString(value);
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Seed payload cannot be serialized", e);
+        }
+    }
+
+    private static String computeHash(
+            UUID eventId,
+            UUID aggregateId,
+            long aggregateVersion,
+            String eventType,
+            String payloadCanonical,
+            String metadataCanonical,
+            LocalDateTime occurredAt,
+            String prevHash) {
+        String material = eventId + "|"
+                + aggregateId + "|"
+                + aggregateVersion + "|"
+                + eventType + "|"
+                + payloadCanonical + "|"
+                + metadataCanonical + "|"
+                + 1 + "|"
+                + occurredAt + "|"
+                + prevHash;
+        try {
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(material.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
     private static CachingConnectionFactory rabbitConnectionFactory(Config config) {
         CachingConnectionFactory connectionFactory = new CachingConnectionFactory(config.rabbitHost(), config.rabbitPort());
         connectionFactory.setUsername(config.rabbitUser());
@@ -1170,6 +1361,7 @@ public class MatchedE2eLoadGenerator {
             int timeoutSeconds,
             int targetTps,
             int durationSeconds,
+            String seedMode,
             boolean truncate,
             String redisHost,
             int redisPort,
@@ -1205,6 +1397,7 @@ public class MatchedE2eLoadGenerator {
                     intArg(args, "--timeout-seconds", 60),
                     targetTps,
                     durationSeconds,
+                    stringArg(args, "--seed-mode", "bulk"),
                     booleanArg(args, "--truncate", true),
                     stringArg(args, "--redis-host", "localhost"),
                     intArg(args, "--redis-port", 6379),
