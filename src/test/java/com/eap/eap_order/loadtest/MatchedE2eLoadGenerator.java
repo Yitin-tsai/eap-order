@@ -1261,7 +1261,26 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"buyPublished\": %d,%n", buyPublish.published());
         System.out.printf("  \"buyPublishFailures\": %d,%n", buyPublish.failures());
         System.out.printf("  \"buyPublishSeconds\": %.2f,%n", buyPublish.elapsedSeconds());
-        System.out.printf("  \"actualBuyPublishTps\": %.2f,%n", buyPublish.published() / Math.max(buyPublish.elapsedSeconds(), 0.001));
+        double actualBuyPublishTps = buyPublish.published() / Math.max(buyPublish.elapsedSeconds(), 0.001);
+        double offeredLoadRatio = config.targetTps() > 0 ? actualBuyPublishTps / config.targetTps() : 1.0;
+        long finalQueueBacklog = finalQueueBacklog(waitResult);
+        List<String> capacityInvalidReasons = capacityInvalidReasons(
+                config,
+                sellPublish,
+                buyPublish,
+                waitResult,
+                remainingSellOrders,
+                remainingBuyOrders,
+                activeReservations,
+                offeredLoadRatio,
+                finalQueueBacklog);
+        System.out.printf("  \"actualBuyPublishTps\": %.2f,%n", actualBuyPublishTps);
+        System.out.printf("  \"minOfferedLoadRatio\": %.4f,%n", config.minOfferedLoadRatio());
+        System.out.printf("  \"offeredLoadRatio\": %.4f,%n", offeredLoadRatio);
+        System.out.printf("  \"validForCapacityComparison\": %s,%n", capacityInvalidReasons.isEmpty());
+        System.out.print("  \"capacityInvalidReasons\": ");
+        printJsonStringArray(capacityInvalidReasons);
+        System.out.println(",");
         System.out.printf("  \"drainSecondsAfterBuyPublish\": %.2f,%n", Math.max(0.0, elapsedSeconds - buyPublish.elapsedSeconds()));
         System.out.printf("  \"elapsedSeconds\": %.2f,%n", elapsedSeconds);
         System.out.printf("  \"businessMatchedE2eTps\": %.2f,%n", config.events() / Math.max(elapsedSeconds, 0.001));
@@ -1316,10 +1335,84 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"maxWalletTradeExecutedQueueUnacked\": %d,%n", waitResult.maxWalletTradeExecutedQueueUnacked());
         System.out.printf("  \"maxOrderTradeAppliedQueueUnacked\": %d,%n", waitResult.maxOrderTradeAppliedQueueUnacked());
         System.out.printf("  \"maxWalletTradeSettledQueueUnacked\": %d,%n", waitResult.maxWalletTradeSettledQueueUnacked());
+        System.out.printf("  \"finalQueueBacklog\": %d,%n", finalQueueBacklog);
         System.out.printf("  \"remainingSellOrders\": %d,%n", remainingSellOrders);
         System.out.printf("  \"remainingBuyOrders\": %d,%n", remainingBuyOrders);
         System.out.printf("  \"activeReservations\": %d%n", activeReservations);
         System.out.println("}");
+    }
+
+    private static List<String> capacityInvalidReasons(
+            Config config,
+            PublishResult sellPublish,
+            PublishResult buyPublish,
+            WaitResult waitResult,
+            long remainingSellOrders,
+            long remainingBuyOrders,
+            long activeReservations,
+            double offeredLoadRatio,
+            long finalQueueBacklog) {
+        List<String> reasons = new ArrayList<>();
+        if (config.targetTps() > 0 && offeredLoadRatio < config.minOfferedLoadRatio()) {
+            reasons.add("driver_offered_tps_below_threshold");
+        }
+        if (buyPublish.failures() != 0) {
+            reasons.add("buy_publish_failures");
+        }
+        if (sellPublish.failures() != 0) {
+            reasons.add("sell_publish_failures");
+        }
+        if (waitResult.completedTrades() != config.events()) {
+            reasons.add("completed_trades_mismatch");
+        }
+        if (waitResult.tradeExecutions() != config.events()) {
+            reasons.add("trade_executions_mismatch");
+        }
+        if (waitResult.walletTradeSettlements() != config.events()) {
+            reasons.add("wallet_settlements_mismatch");
+        }
+        if (waitResult.orderCommandMatchedRows() != config.events() * 2L) {
+            reasons.add("order_command_rows_mismatch");
+        }
+        if (remainingSellOrders != 0) {
+            reasons.add("remaining_sell_orders");
+        }
+        if (remainingBuyOrders != 0) {
+            reasons.add("remaining_buy_orders");
+        }
+        if (activeReservations != 0) {
+            reasons.add("active_reservations");
+        }
+        if (finalQueueBacklog != 0) {
+            reasons.add("final_queue_backlog");
+        }
+        return reasons;
+    }
+
+    private static long finalQueueBacklog(WaitResult waitResult) {
+        return waitResult.matchEngineQueueReady()
+                + waitResult.orderMatchedQueueReady()
+                + waitResult.walletMatchedQueueReady()
+                + waitResult.orderTradeExecutedQueueReady()
+                + waitResult.walletTradeExecutedQueueReady()
+                + waitResult.orderTradeAppliedQueueReady()
+                + waitResult.walletTradeSettledQueueReady()
+                + waitResult.matchEngineQueueUnacked()
+                + waitResult.orderTradeExecutedQueueUnacked()
+                + waitResult.walletTradeExecutedQueueUnacked()
+                + waitResult.orderTradeAppliedQueueUnacked()
+                + waitResult.walletTradeSettledQueueUnacked();
+    }
+
+    private static void printJsonStringArray(List<String> values) {
+        System.out.print("[");
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                System.out.print(", ");
+            }
+            System.out.printf("\"%s\"", values.get(i));
+        }
+        System.out.print("]");
     }
 
     private static void require(boolean condition, String message) {
@@ -1476,6 +1569,7 @@ public class MatchedE2eLoadGenerator {
             int timeoutSeconds,
             int targetTps,
             int durationSeconds,
+            double minOfferedLoadRatio,
             String seedMode,
             boolean truncate,
             String redisHost,
@@ -1512,6 +1606,7 @@ public class MatchedE2eLoadGenerator {
                     intArg(args, "--timeout-seconds", 60),
                     targetTps,
                     durationSeconds,
+                    doubleArg(args, "--min-offered-load-ratio", 0.95),
                     stringArg(args, "--seed-mode", "bulk"),
                     booleanArg(args, "--truncate", true),
                     stringArg(args, "--redis-host", "localhost"),
@@ -1532,6 +1627,10 @@ public class MatchedE2eLoadGenerator {
 
         private static boolean booleanArg(String[] args, String name, boolean defaultValue) {
             return Boolean.parseBoolean(stringArg(args, name, String.valueOf(defaultValue)));
+        }
+
+        private static double doubleArg(String[] args, String name, double defaultValue) {
+            return Double.parseDouble(stringArg(args, name, String.valueOf(defaultValue)));
         }
 
         private static String stringArg(String[] args, String name, String defaultValue) {
