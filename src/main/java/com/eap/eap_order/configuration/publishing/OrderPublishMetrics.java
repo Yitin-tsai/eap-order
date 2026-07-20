@@ -37,7 +37,7 @@ public class OrderPublishMetrics {
         this.outboxPublishEnqueueDuration = stageTimer(
                 registry,
                 "eap_order_outbox_publish_enqueue_duration",
-                "Time spent deserializing and enqueueing order outbox records to RabbitMQ");
+                "Time spent building and enqueueing order outbox messages to RabbitMQ");
         this.outboxConfirmDuration = stageTimer(
                 registry,
                 "eap_order_outbox_confirm_duration",
