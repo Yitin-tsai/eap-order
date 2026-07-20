@@ -34,7 +34,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
@@ -58,9 +60,6 @@ import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONF
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_WALLET_TRADE_SETTLED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CLEARED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CREATED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_CREATE_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_CREATED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_MATCHED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
@@ -440,6 +439,11 @@ public class MatchedE2eLoadGenerator {
             int targetTps) throws InterruptedException {
         AtomicInteger published = new AtomicInteger();
         AtomicInteger failures = new AtomicInteger();
+        LongAdder acquireWaitNanos = new LongAdder();
+        LongAdder sendNanos = new LongAdder();
+        AtomicLong maxAcquireWaitNanos = new AtomicLong();
+        AtomicLong maxSendNanos = new AtomicLong();
+        AtomicLong maxScheduleLagNanos = new AtomicLong();
         CountDownLatch done = new CountDownLatch(pairs.size());
         ExecutorService executor = Executors.newFixedThreadPool(config.publishers());
         Semaphore inFlight = new Semaphore(config.publishers() * 2);
@@ -449,14 +453,24 @@ public class MatchedE2eLoadGenerator {
         long scheduledIndex = 0;
         for (Pair pair : pairs) {
             if (intervalNanos > 0) {
-                sleepUntil(started + intervalNanos * scheduledIndex);
+                long scheduledNanos = started + intervalNanos * scheduledIndex;
+                sleepUntil(scheduledNanos);
+                updateMax(maxScheduleLagNanos, Math.max(0, System.nanoTime() - scheduledNanos));
                 scheduledIndex++;
             }
+            long acquireStarted = System.nanoTime();
             inFlight.acquire();
+            long acquireElapsed = System.nanoTime() - acquireStarted;
+            acquireWaitNanos.add(acquireElapsed);
+            updateMax(maxAcquireWaitNanos, acquireElapsed);
             executor.execute(() -> {
                 try {
                     OrderConfirmedEvent event = sell ? pair.sellConfirmed(config.marketId()) : pair.buyConfirmed(config.marketId());
+                    long sendStarted = System.nanoTime();
                     rabbitTemplate.convertAndSend("", MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, event);
+                    long sendElapsed = System.nanoTime() - sendStarted;
+                    sendNanos.add(sendElapsed);
+                    updateMax(maxSendNanos, sendElapsed);
                     published.incrementAndGet();
                 } catch (Exception e) {
                     failures.incrementAndGet();
@@ -474,7 +488,16 @@ public class MatchedE2eLoadGenerator {
         executor.shutdown();
         executor.awaitTermination(30, TimeUnit.SECONDS);
         double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
-        return new PublishResult(published.get(), failures.get(), elapsedSeconds, targetTps);
+        return new PublishResult(
+                published.get(),
+                failures.get(),
+                elapsedSeconds,
+                targetTps,
+                acquireWaitNanos.sum() / 1_000_000_000.0,
+                maxAcquireWaitNanos.get() / 1_000_000.0,
+                sendNanos.sum() / 1_000_000_000.0,
+                maxSendNanos.get() / 1_000_000.0,
+                maxScheduleLagNanos.get() / 1_000_000.0);
     }
 
     private static void sleepUntil(long targetNanos) throws InterruptedException {
@@ -485,6 +508,16 @@ public class MatchedE2eLoadGenerator {
             }
             TimeUnit.NANOSECONDS.sleep(Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(1)));
         }
+    }
+
+    private static void updateMax(AtomicLong target, long value) {
+        long current;
+        do {
+            current = target.get();
+            if (value <= current) {
+                return;
+            }
+        } while (!target.compareAndSet(current, value));
     }
 
     private static void waitForRedisSellBook(
@@ -984,9 +1017,6 @@ public class MatchedE2eLoadGenerator {
         purgeIfPresent(rabbitAdmin, WALLET_AUCTION_CLEARED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_AUCTION_CLEARED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_AUCTION_CREATED_QUEUE);
-        purgeIfPresent(rabbitAdmin, ORDER_CREATE_QUEUE);
-        purgeIfPresent(rabbitAdmin, ORDER_CREATED_QUEUE);
-        purgeIfPresent(rabbitAdmin, ORDER_FAILED_QUEUE);
         purgeIfPresent(rabbitAdmin, DEAD_LETTER_QUEUE);
     }
 
@@ -1104,6 +1134,7 @@ public class MatchedE2eLoadGenerator {
         CachingConnectionFactory connectionFactory = new CachingConnectionFactory(config.rabbitHost(), config.rabbitPort());
         connectionFactory.setUsername(config.rabbitUser());
         connectionFactory.setPassword(config.rabbitPassword());
+        connectionFactory.setChannelCacheSize(config.publisherChannelCacheSize());
         return connectionFactory;
     }
 
@@ -1252,6 +1283,7 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"matches\": %d,%n", config.events());
         System.out.printf("  \"publishers\": %d,%n", config.publishers());
+        System.out.printf("  \"publisherChannelCacheSize\": %d,%n", config.publisherChannelCacheSize());
         System.out.printf("  \"targetTps\": %d,%n", config.targetTps());
         System.out.printf("  \"durationSeconds\": %d,%n", config.durationSeconds());
         System.out.printf("  \"expectedBuyPublishSeconds\": %.2f,%n", config.expectedBuyPublishSeconds());
@@ -1261,6 +1293,16 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"buyPublished\": %d,%n", buyPublish.published());
         System.out.printf("  \"buyPublishFailures\": %d,%n", buyPublish.failures());
         System.out.printf("  \"buyPublishSeconds\": %.2f,%n", buyPublish.elapsedSeconds());
+        System.out.printf("  \"sellPublishAcquireWaitSeconds\": %.4f,%n", sellPublish.acquireWaitSeconds());
+        System.out.printf("  \"sellPublishMaxAcquireWaitMs\": %.3f,%n", sellPublish.maxAcquireWaitMs());
+        System.out.printf("  \"sellPublishSendSeconds\": %.4f,%n", sellPublish.sendSeconds());
+        System.out.printf("  \"sellPublishMaxSendMs\": %.3f,%n", sellPublish.maxSendMs());
+        System.out.printf("  \"sellPublishMaxScheduleLagMs\": %.3f,%n", sellPublish.maxScheduleLagMs());
+        System.out.printf("  \"buyPublishAcquireWaitSeconds\": %.4f,%n", buyPublish.acquireWaitSeconds());
+        System.out.printf("  \"buyPublishMaxAcquireWaitMs\": %.3f,%n", buyPublish.maxAcquireWaitMs());
+        System.out.printf("  \"buyPublishSendSeconds\": %.4f,%n", buyPublish.sendSeconds());
+        System.out.printf("  \"buyPublishMaxSendMs\": %.3f,%n", buyPublish.maxSendMs());
+        System.out.printf("  \"buyPublishMaxScheduleLagMs\": %.3f,%n", buyPublish.maxScheduleLagMs());
         double actualBuyPublishTps = buyPublish.published() / Math.max(buyPublish.elapsedSeconds(), 0.001);
         double offeredLoadRatio = config.targetTps() > 0 ? actualBuyPublishTps / config.targetTps() : 1.0;
         long finalQueueBacklog = finalQueueBacklog(waitResult);
@@ -1447,7 +1489,16 @@ public class MatchedE2eLoadGenerator {
         }
     }
 
-    private record PublishResult(int published, int failures, double elapsedSeconds, int targetTps) {
+    private record PublishResult(
+            int published,
+            int failures,
+            double elapsedSeconds,
+            int targetTps,
+            double acquireWaitSeconds,
+            double maxAcquireWaitMs,
+            double sendSeconds,
+            double maxSendMs,
+            double maxScheduleLagMs) {
     }
 
     private record QueueDepth(long ready, long unacked, long total) {
@@ -1576,6 +1627,7 @@ public class MatchedE2eLoadGenerator {
             int redisPort,
             String rabbitHost,
             int rabbitPort,
+            int publisherChannelCacheSize,
             int rabbitManagementPort,
             String rabbitUser,
             String rabbitPassword,
@@ -1613,6 +1665,7 @@ public class MatchedE2eLoadGenerator {
                     intArg(args, "--redis-port", 6379),
                     stringArg(args, "--rabbit-host", "localhost"),
                     intArg(args, "--rabbit-port", 5672),
+                    intArg(args, "--publisher-channel-cache-size", Math.max(128, intArg(args, "--publishers", 16) * 2)),
                     intArg(args, "--rabbit-management-port", 15672),
                     stringArg(args, "--rabbit-user", "admin"),
                     stringArg(args, "--rabbit-pass", "admin123"),
