@@ -75,6 +75,13 @@ tasks.register('matchedE2eLoadTest', JavaExec) {
     systemProperty 'eap.order-projection.enabled', 'false'
 }
 
+tasks.register('orderDbCeilingProbe', JavaExec) {
+    group = 'verification'
+    description = 'Measure isolated Order trade-apply SQL ceiling without RabbitMQ or Spring listener overhead.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.OrderDbCeilingProbe'
+}
+
 openApiGenerate {
     generatorName = "spring"
     inputSpec = new File("$projectDir/src/main/resources/openapi/orderService.yml").toURI().toASCIIString()
