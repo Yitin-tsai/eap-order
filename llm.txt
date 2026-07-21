@@ -54,7 +54,7 @@
 | Queue | Listener Class | Handles |
 |-------|---------------|---------|
 | order.orderConfirmed.queue | OrderStatusUpdateListener | Update order status on confirmation |
-| order.orderMatched.queue | MatchEventListener | Save match_history, update order status, push WebSocket |
+| order.tradeExecuted.queue | TradeExecutedListener | Apply matched trade state → write OrderTradeApplied outbox |
 | order.orderFailed.queue | OrderStatusUpdateListener | Update order status on failure via SSE |
 
 ## Key Files

@@ -6,6 +6,7 @@ import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageDeliveryMode;
 import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
+import org.springframework.amqp.rabbit.core.RabbitOperations;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
@@ -171,26 +172,66 @@ public class OrderEventOutboxRelay {
     private List<PublishResult> publishBatch(List<OutboxRow> rows) {
         if (publishConcurrency == 1 || rows.size() <= 1) {
             List<PublishResult> results = new ArrayList<>(rows.size());
-            for (OutboxRow row : rows) {
-                results.add(publishOne(row));
+            try {
+                rabbitTemplate.invoke(operations -> {
+                    for (OutboxRow row : rows) {
+                        results.add(publishOne(row, operations));
+                    }
+                    return null;
+                });
+            } catch (Exception e) {
+                int publishedOrFailed = results.size();
+                for (int i = publishedOrFailed; i < rows.size(); i++) {
+                    results.add(PublishResult.failure(rows.get(i), Instant.now(), e));
+                }
             }
             return results;
         }
 
-        List<CompletableFuture<PublishResult>> futures = rows.stream()
-                .map(row -> CompletableFuture.supplyAsync(() -> publishOne(row), publishExecutor))
+        List<List<OutboxRow>> chunks = partition(rows, publishConcurrency);
+        List<CompletableFuture<List<PublishResult>>> futures = chunks.stream()
+                .map(chunk -> CompletableFuture.supplyAsync(() -> publishChunk(chunk), publishExecutor))
                 .toList();
         return futures.stream()
                 .map(CompletableFuture::join)
+                .flatMap(List::stream)
                 .toList();
     }
 
-    private PublishResult publishOne(OutboxRow row) {
+    private List<PublishResult> publishChunk(List<OutboxRow> chunk) {
+        List<PublishResult> results = new ArrayList<>(chunk.size());
+        try {
+            rabbitTemplate.invoke(operations -> {
+                for (OutboxRow row : chunk) {
+                    results.add(publishOne(row, operations));
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            int publishedOrFailed = results.size();
+            for (int i = publishedOrFailed; i < chunk.size(); i++) {
+                results.add(PublishResult.failure(chunk.get(i), Instant.now(), e));
+            }
+        }
+        return results;
+    }
+
+    private List<List<OutboxRow>> partition(List<OutboxRow> rows, int maxChunks) {
+        int chunkCount = Math.min(maxChunks, rows.size());
+        int chunkSize = (int) Math.ceil(rows.size() / (double) chunkCount);
+        List<List<OutboxRow>> chunks = new ArrayList<>(chunkCount);
+        for (int start = 0; start < rows.size(); start += chunkSize) {
+            chunks.add(rows.subList(start, Math.min(start + chunkSize, rows.size())));
+        }
+        return chunks;
+    }
+
+    private PublishResult publishOne(OutboxRow row, RabbitOperations operations) {
         Instant startedAt = Instant.now();
         Instant enqueueStartedAt = Instant.now();
         try {
             CorrelationData correlation = new CorrelationData(row.eventId().toString());
-            rabbitTemplate.send(row.exchange(), row.routingKey(), toJsonMessage(row), correlation);
+            operations.send(row.exchange(), row.routingKey(), toJsonMessage(row), correlation);
             return PublishResult.success(row, correlation, startedAt);
         } catch (Exception e) {
             return PublishResult.failure(row, startedAt, e);

@@ -13,10 +13,6 @@ spring:
 
 eap:
   order:
-    event-sourcing:
-      trade-idempotency-source: trade-application
-      fast-match-from-projection:
-        enabled: true
     datasource:
       consumer:
         maximum-pool-size: 20

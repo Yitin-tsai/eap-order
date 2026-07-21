@@ -17,12 +17,12 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  * Order Module RabbitMQ Configuration
  * 
  * This module consumes:
- * - order.created events (for status updates after wallet validation)
- * - order.matched events (for status updates and trade recording)
+ * - order.confirmed events (for status updates after wallet validation)
+ * - trade.executed events (for matched order-state application)
  * - order.failed events (for failure handling)
  * 
  * This module publishes:
- * - order.create events (initial order placement)
+ * - order.submitted events (initial order placement)
  * 
  * Topology: Each module gets its own queues bound to shared routing keys
  */
@@ -71,13 +71,6 @@ public class RabbitMQConfig {
   }
 
   @Bean
-  public Queue orderOrderMatchedQueue() {
-    return QueueBuilder.durable(ORDER_ORDER_MATCHED_QUEUE)
-        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
-        .build();
-  }
-
-  @Bean
   public Queue orderTradeExecutedQueue() {
     return QueueBuilder.durable(ORDER_TRADE_EXECUTED_QUEUE)
         .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
@@ -95,12 +88,6 @@ public class RabbitMQConfig {
   public Binding orderOrderConfirmedBinding(@Qualifier("orderOrderConfirmedQueue") Queue orderOrderConfirmedQueue,
       @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderConfirmedQueue).to(orderExchange).with(ORDER_CONFIRMED_KEY);
-  }
-
-  @Bean
-  public Binding orderOrderMatchedBinding(@Qualifier("orderOrderMatchedQueue") Queue orderOrderMatchedQueue,
-      @Qualifier("orderExchange") TopicExchange orderExchange) {
-    return BindingBuilder.bind(orderOrderMatchedQueue).to(orderExchange).with(ORDER_MATCHED_KEY);
   }
 
   @Bean

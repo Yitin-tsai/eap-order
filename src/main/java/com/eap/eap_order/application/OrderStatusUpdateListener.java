@@ -1,7 +1,6 @@
 package com.eap.eap_order.application;
 
 import com.eap.common.event.OrderConfirmedEvent;
-import com.eap.common.event.OrderMatchedEvent;
 import com.eap.common.event.OrderFailedEvent;
 import com.eap.eap_order.controller.OrderStatusController;
 import lombok.extern.slf4j.Slf4j;
@@ -41,7 +40,6 @@ public class OrderStatusUpdateListener {
 
     /**
      * 監聽 Wallet 資產保留失敗的 integration event，轉成 OrderAssetReservationFailedV1 domain event。
-     * Note: Removed duplicate ORDER_MATCHED listener - MatchEventListener handles that event
      */
     @RabbitListener(
             queues = ORDER_ORDER_FAILED_QUEUE,

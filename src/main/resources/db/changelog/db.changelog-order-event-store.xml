@@ -309,4 +309,19 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-017" author="eap">
+        <comment>Drop retired order execution links table after standardizing TradeExecuted idempotency on order_trade_applications</comment>
+        <sql>
+            DROP TABLE IF EXISTS order_service.order_execution_links;
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-018" author="eap">
+        <comment>Drop redundant Order outbox event-id uniqueness; idempotency is enforced by event store and trade applications</comment>
+        <sql>
+            ALTER TABLE order_service.order_event_outbox
+            DROP CONSTRAINT IF EXISTS uk_order_outbox_event_id;
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

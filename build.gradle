@@ -56,27 +56,6 @@ tasks.register('orderHttpLoadTest', JavaExec) {
     mainClass = 'com.eap.eap_order.loadtest.OrderHttpLoadGenerator'
 }
 
-tasks.register('orderMatchedDbLoadTest', JavaExec) {
-    group = 'verification'
-    description = 'Seed valid OPEN orders and benchmark OrderMatchedEvent DB write path.'
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.eap.eap_order.loadtest.OrderMatchedDbLoadGenerator'
-    systemProperty 'spring.profiles.active', 'loadtest'
-    systemProperty 'spring.rabbitmq.listener.simple.auto-startup', 'false'
-    systemProperty 'spring.datasource.url', 'jdbc:postgresql://localhost:15432/eap_order_db'
-    systemProperty 'spring.datasource.username', 'admin'
-    systemProperty 'spring.datasource.password', 'admin123'
-    systemProperty 'spring.datasource.driver-class-name', 'org.postgresql.Driver'
-    systemProperty 'spring.jpa.hibernate.ddl-auto', 'validate'
-    systemProperty 'spring.liquibase.enabled', 'true'
-    systemProperty 'spring.liquibase.change-log', 'classpath:db/changelog/db.changelog-master.xml'
-    systemProperty 'eap.scheduling.enabled', 'false'
-    systemProperty 'eap.order-event-outbox.batch-size', '0'
-    systemProperty 'eap.order-projection.enabled', 'false'
-    systemProperty 'eap.matchEngine.base-url', 'http://localhost:8082/match-engine'
-    systemProperty 'eap.wallet.base-url', 'http://localhost:8081/eap-wallet'
-}
-
 tasks.register('matchedE2eLoadTest', JavaExec) {
     group = 'verification'
     description = 'Seed valid Order/Wallet state and drive matchEngine -> Order/Wallet matched E2E through RabbitMQ.'
