@@ -347,7 +347,8 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("publishing %d resting SELL confirmations directly to %s%n",
                 config.events(), MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
         PublishResult sellPublish = publishToMatchEngine(config, rabbitTemplate, pairs, true);
-        waitForRedisSellBook(config, redisTemplate, rabbitAdmin);
+        SellBookWaitResult sellBookWait = waitForRedisSellBook(config, redisTemplate, rabbitAdmin);
+        double orderbookAdmissionSeconds = sellPublish.elapsedSeconds() + sellBookWait.elapsedSeconds();
 
         System.out.printf("publishing %d incoming BUY confirmations directly to %s%n",
                 config.events(), MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
@@ -362,6 +363,8 @@ public class MatchedE2eLoadGenerator {
         printResult(
                 config,
                 sellPublish,
+                sellBookWait,
+                orderbookAdmissionSeconds,
                 buyPublish,
                 waitResult,
                 elapsedSeconds,
@@ -520,17 +523,19 @@ public class MatchedE2eLoadGenerator {
         } while (!target.compareAndSet(current, value));
     }
 
-    private static void waitForRedisSellBook(
+    private static SellBookWaitResult waitForRedisSellBook(
             Config config,
             RedisTemplate<String, String> redisTemplate,
             RabbitAdmin rabbitAdmin) throws InterruptedException {
         String key = "orderbook:" + config.marketId() + ":sell";
+        long started = System.nanoTime();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(config.timeoutSeconds());
         long latestSize = 0;
         while (System.nanoTime() < deadline) {
             latestSize = zsetSize(redisTemplate, key);
             if (latestSize == config.events()) {
-                return;
+                double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+                return new SellBookWaitResult(latestSize, elapsedSeconds);
             }
             TimeUnit.MILLISECONDS.sleep(100);
         }
@@ -1280,6 +1285,8 @@ public class MatchedE2eLoadGenerator {
     private static void printResult(
             Config config,
             PublishResult sellPublish,
+            SellBookWaitResult sellBookWait,
+            double orderbookAdmissionSeconds,
             PublishResult buyPublish,
             WaitResult waitResult,
             double elapsedSeconds,
@@ -1298,6 +1305,9 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"sellPublished\": %d,%n", sellPublish.published());
         System.out.printf("  \"sellPublishFailures\": %d,%n", sellPublish.failures());
         System.out.printf("  \"sellPublishSeconds\": %.2f,%n", sellPublish.elapsedSeconds());
+        System.out.printf("  \"sellBookReachedOrders\": %d,%n", sellBookWait.readyOrders());
+        System.out.printf("  \"sellBookPostPublishWaitSeconds\": %.2f,%n", sellBookWait.elapsedSeconds());
+        System.out.printf("  \"orderbookAdmissionSeconds\": %.2f,%n", orderbookAdmissionSeconds);
         System.out.printf("  \"buyPublished\": %d,%n", buyPublish.published());
         System.out.printf("  \"buyPublishFailures\": %d,%n", buyPublish.failures());
         System.out.printf("  \"buyPublishSeconds\": %.2f,%n", buyPublish.elapsedSeconds());
@@ -1333,8 +1343,18 @@ public class MatchedE2eLoadGenerator {
         System.out.println(",");
         System.out.printf("  \"drainSecondsAfterBuyPublish\": %.2f,%n", Math.max(0.0, elapsedSeconds - buyPublish.elapsedSeconds()));
         System.out.printf("  \"elapsedSeconds\": %.2f,%n", elapsedSeconds);
-        System.out.printf("  \"businessMatchedE2eTps\": %.2f,%n", config.events() / Math.max(elapsedSeconds, 0.001));
-        System.out.printf("  \"matchedE2eTps\": %.2f,%n", config.events() / Math.max(elapsedSeconds, 0.001));
+        double businessCompletedTradeTps = waitResult.completedTrades() / Math.max(elapsedSeconds, 0.001);
+        long blendedMarketFlowOrders = (long) sellPublish.published() + buyPublish.published();
+        double blendedMarketFlowSeconds = orderbookAdmissionSeconds + elapsedSeconds;
+        System.out.printf("  \"orderbookAdmissionTps\": %.2f,%n",
+                sellBookWait.readyOrders() / Math.max(orderbookAdmissionSeconds, 0.001));
+        System.out.printf("  \"businessCompletedTradeTps\": %.2f,%n", businessCompletedTradeTps);
+        System.out.printf("  \"blendedMarketFlowOrders\": %d,%n", blendedMarketFlowOrders);
+        System.out.printf("  \"blendedMarketFlowSeconds\": %.2f,%n", blendedMarketFlowSeconds);
+        System.out.printf("  \"blendedMarketFlowTps\": %.2f,%n",
+                blendedMarketFlowOrders / Math.max(blendedMarketFlowSeconds, 0.001));
+        System.out.printf("  \"businessMatchedE2eTps\": %.2f,%n", businessCompletedTradeTps);
+        System.out.printf("  \"matchedE2eTps\": %.2f,%n", businessCompletedTradeTps);
         System.out.printf("  \"businessCompletionSeconds\": %.2f,%n", elapsedSeconds);
         System.out.printf("  \"projectionIncludedInBusinessGate\": false,%n");
         System.out.printf("  \"queueReadyDrainedSeconds\": %.2f,%n", waitResult.queueReadyDrainedSeconds());
@@ -1542,6 +1562,9 @@ public class MatchedE2eLoadGenerator {
             double sendSeconds,
             double maxSendMs,
             double maxScheduleLagMs) {
+    }
+
+    private record SellBookWaitResult(long readyOrders, double elapsedSeconds) {
     }
 
     private record QueueDepth(long ready, long unacked, long total) {

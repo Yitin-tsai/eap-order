@@ -11,12 +11,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.sql.Array;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Timestamp;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -36,6 +41,93 @@ public class OrderEventAppender {
 
     private static final String AGGREGATE_TYPE = "Order";
     private static final String GENESIS_HASH = "0".repeat(64);
+    private static final String INSERT_TRADE_APPLICATIONS_MATCHING_STATES_AND_OUTBOXES_SQL = """
+            WITH input(trade_id, trade_buyer_order_id, trade_seller_order_id, trade_price,
+                       trade_quantity, trade_applied_at,
+                       buyer_order_id, buyer_quantity, buyer_previous_remaining_amount,
+                       buyer_remaining_amount, buyer_matched_amount, buyer_status,
+                       seller_order_id, seller_quantity, seller_previous_remaining_amount,
+                       seller_remaining_amount, seller_matched_amount, seller_status,
+                       outbox_event_id, outbox_aggregate_id, outbox_exchange, outbox_routing_key,
+                       outbox_message_type, outbox_payload) AS (
+                SELECT *
+                FROM unnest(?::varchar[], ?::uuid[], ?::uuid[], ?::integer[],
+                            ?::integer[], ?::timestamp[],
+                            ?::uuid[], ?::integer[], ?::integer[],
+                            ?::integer[], ?::integer[], ?::varchar[],
+                            ?::uuid[], ?::integer[], ?::integer[],
+                            ?::integer[], ?::integer[], ?::varchar[],
+                            ?::uuid[], ?::uuid[], ?::varchar[], ?::varchar[],
+                            ?::varchar[], ?::text[])
+            ),
+            existing_trade_applications AS (
+                SELECT COUNT(*) AS count
+                FROM order_service.order_trade_applications existing
+                JOIN input ON input.trade_id = existing.trade_id
+            ),
+            trade_application AS (
+                INSERT INTO order_service.order_trade_applications
+                    (trade_id, buyer_order_id, seller_order_id, price, quantity, applied_at)
+                SELECT trade_id, trade_buyer_order_id, trade_seller_order_id,
+                       trade_price, trade_quantity, trade_applied_at
+                FROM input
+                WHERE (SELECT count FROM existing_trade_applications) = 0
+                ON CONFLICT (trade_id) DO NOTHING
+                RETURNING trade_id
+            ),
+            matching_input AS (
+                SELECT input.buyer_order_id AS order_id,
+                       input.buyer_quantity AS quantity,
+                       input.buyer_previous_remaining_amount AS previous_remaining_amount,
+                       input.buyer_remaining_amount AS remaining_amount,
+                       input.buyer_matched_amount AS matched_amount,
+                       input.buyer_status AS order_status,
+                       input.trade_id AS trade_id
+                FROM input
+                JOIN trade_application ON trade_application.trade_id = input.trade_id
+                UNION ALL
+                SELECT input.seller_order_id AS order_id,
+                       input.seller_quantity AS quantity,
+                       input.seller_previous_remaining_amount AS previous_remaining_amount,
+                       input.seller_remaining_amount AS remaining_amount,
+                       input.seller_matched_amount AS matched_amount,
+                       input.seller_status AS order_status,
+                       input.trade_id AS trade_id
+                FROM input
+                JOIN trade_application ON trade_application.trade_id = input.trade_id
+            ),
+            updated_matching_states AS (
+                UPDATE order_service.order_matching_state state
+                SET remaining_amount = matching_input.remaining_amount,
+                    matched_amount = matching_input.matched_amount,
+                    status = matching_input.order_status,
+                    last_trade_id = matching_input.trade_id,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM matching_input
+                WHERE state.order_id = matching_input.order_id
+                  AND state.remaining_amount = matching_input.previous_remaining_amount
+                  AND state.status IN ('OPEN', 'PARTIALLY_MATCHED')
+                  AND state.remaining_amount >= matching_input.quantity
+                RETURNING 1
+            ),
+            inserted_outbox AS (
+                INSERT INTO order_service.order_event_outbox
+                    (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
+                     status, attempt_count, next_retry_at, created_at, updated_at)
+                SELECT outbox_event_id, outbox_aggregate_id, outbox_exchange, outbox_routing_key,
+                       outbox_message_type, outbox_payload,
+                       'PENDING', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM input
+                JOIN trade_application ON trade_application.trade_id = input.trade_id
+                WHERE outbox_event_id IS NOT NULL
+                RETURNING 1
+            )
+            SELECT
+                (SELECT count FROM existing_trade_applications) AS existing_trade_applications,
+                (SELECT COUNT(*) FROM trade_application) AS inserted_trade_applications,
+                (SELECT COUNT(*) FROM updated_matching_states) AS updated_matching_states,
+                (SELECT COUNT(*) FROM inserted_outbox) AS inserted_outboxes
+            """;
 
     private final NamedParameterJdbcTemplate commandJdbc;
     private final NamedParameterJdbcTemplate consumerJdbc;
@@ -547,133 +639,121 @@ public class OrderEventAppender {
         if (preparedBatch.isEmpty()) {
             return new TradeApplicationHotPathBatchOutcome(0, 0, 0, 0);
         }
-        StringBuilder values = new StringBuilder();
-        MapSqlParameterSource params = new MapSqlParameterSource();
-        for (int i = 0; i < preparedBatch.size(); i++) {
-            if (i > 0) {
-                values.append(",\n");
+        return consumerJdbc.getJdbcTemplate().execute((ConnectionCallback<TradeApplicationHotPathBatchOutcome>) connection -> {
+            Array tradeIds = null;
+            Array tradeBuyerOrderIds = null;
+            Array tradeSellerOrderIds = null;
+            Array tradePrices = null;
+            Array tradeQuantities = null;
+            Array tradeAppliedAts = null;
+            Array buyerOrderIds = null;
+            Array buyerQuantities = null;
+            Array buyerPreviousRemainingAmounts = null;
+            Array buyerRemainingAmounts = null;
+            Array buyerMatchedAmounts = null;
+            Array buyerStatuses = null;
+            Array sellerOrderIds = null;
+            Array sellerQuantities = null;
+            Array sellerPreviousRemainingAmounts = null;
+            Array sellerRemainingAmounts = null;
+            Array sellerMatchedAmounts = null;
+            Array sellerStatuses = null;
+            Array outboxEventIds = null;
+            Array outboxAggregateIds = null;
+            Array outboxExchanges = null;
+            Array outboxRoutingKeys = null;
+            Array outboxMessageTypes = null;
+            Array outboxPayloads = null;
+            try (PreparedStatement statement = connection.prepareStatement(
+                    INSERT_TRADE_APPLICATIONS_MATCHING_STATES_AND_OUTBOXES_SQL)) {
+                TradeApplicationBatchArrays arrays = tradeApplicationBatchArrays(preparedBatch);
+                tradeIds = connection.createArrayOf("varchar", arrays.tradeIds());
+                tradeBuyerOrderIds = connection.createArrayOf("uuid", arrays.tradeBuyerOrderIds());
+                tradeSellerOrderIds = connection.createArrayOf("uuid", arrays.tradeSellerOrderIds());
+                tradePrices = connection.createArrayOf("integer", arrays.tradePrices());
+                tradeQuantities = connection.createArrayOf("integer", arrays.tradeQuantities());
+                tradeAppliedAts = connection.createArrayOf("timestamp", arrays.tradeAppliedAts());
+                buyerOrderIds = connection.createArrayOf("uuid", arrays.buyerOrderIds());
+                buyerQuantities = connection.createArrayOf("integer", arrays.buyerQuantities());
+                buyerPreviousRemainingAmounts = connection.createArrayOf("integer", arrays.buyerPreviousRemainingAmounts());
+                buyerRemainingAmounts = connection.createArrayOf("integer", arrays.buyerRemainingAmounts());
+                buyerMatchedAmounts = connection.createArrayOf("integer", arrays.buyerMatchedAmounts());
+                buyerStatuses = connection.createArrayOf("varchar", arrays.buyerStatuses());
+                sellerOrderIds = connection.createArrayOf("uuid", arrays.sellerOrderIds());
+                sellerQuantities = connection.createArrayOf("integer", arrays.sellerQuantities());
+                sellerPreviousRemainingAmounts = connection.createArrayOf("integer", arrays.sellerPreviousRemainingAmounts());
+                sellerRemainingAmounts = connection.createArrayOf("integer", arrays.sellerRemainingAmounts());
+                sellerMatchedAmounts = connection.createArrayOf("integer", arrays.sellerMatchedAmounts());
+                sellerStatuses = connection.createArrayOf("varchar", arrays.sellerStatuses());
+                outboxEventIds = connection.createArrayOf("uuid", arrays.outboxEventIds());
+                outboxAggregateIds = connection.createArrayOf("uuid", arrays.outboxAggregateIds());
+                outboxExchanges = connection.createArrayOf("varchar", arrays.outboxExchanges());
+                outboxRoutingKeys = connection.createArrayOf("varchar", arrays.outboxRoutingKeys());
+                outboxMessageTypes = connection.createArrayOf("varchar", arrays.outboxMessageTypes());
+                outboxPayloads = connection.createArrayOf("text", arrays.outboxPayloads());
+
+                statement.setArray(1, tradeIds);
+                statement.setArray(2, tradeBuyerOrderIds);
+                statement.setArray(3, tradeSellerOrderIds);
+                statement.setArray(4, tradePrices);
+                statement.setArray(5, tradeQuantities);
+                statement.setArray(6, tradeAppliedAts);
+                statement.setArray(7, buyerOrderIds);
+                statement.setArray(8, buyerQuantities);
+                statement.setArray(9, buyerPreviousRemainingAmounts);
+                statement.setArray(10, buyerRemainingAmounts);
+                statement.setArray(11, buyerMatchedAmounts);
+                statement.setArray(12, buyerStatuses);
+                statement.setArray(13, sellerOrderIds);
+                statement.setArray(14, sellerQuantities);
+                statement.setArray(15, sellerPreviousRemainingAmounts);
+                statement.setArray(16, sellerRemainingAmounts);
+                statement.setArray(17, sellerMatchedAmounts);
+                statement.setArray(18, sellerStatuses);
+                statement.setArray(19, outboxEventIds);
+                statement.setArray(20, outboxAggregateIds);
+                statement.setArray(21, outboxExchanges);
+                statement.setArray(22, outboxRoutingKeys);
+                statement.setArray(23, outboxMessageTypes);
+                statement.setArray(24, outboxPayloads);
+
+                try (ResultSet rs = statement.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new IllegalStateException("Order trade application batch did not return an outcome");
+                    }
+                    return new TradeApplicationHotPathBatchOutcome(
+                            rs.getInt("existing_trade_applications"),
+                            rs.getInt("inserted_trade_applications"),
+                            rs.getInt("updated_matching_states"),
+                            rs.getInt("inserted_outboxes"));
+                }
+            } finally {
+                freeQuietly(tradeIds);
+                freeQuietly(tradeBuyerOrderIds);
+                freeQuietly(tradeSellerOrderIds);
+                freeQuietly(tradePrices);
+                freeQuietly(tradeQuantities);
+                freeQuietly(tradeAppliedAts);
+                freeQuietly(buyerOrderIds);
+                freeQuietly(buyerQuantities);
+                freeQuietly(buyerPreviousRemainingAmounts);
+                freeQuietly(buyerRemainingAmounts);
+                freeQuietly(buyerMatchedAmounts);
+                freeQuietly(buyerStatuses);
+                freeQuietly(sellerOrderIds);
+                freeQuietly(sellerQuantities);
+                freeQuietly(sellerPreviousRemainingAmounts);
+                freeQuietly(sellerRemainingAmounts);
+                freeQuietly(sellerMatchedAmounts);
+                freeQuietly(sellerStatuses);
+                freeQuietly(outboxEventIds);
+                freeQuietly(outboxAggregateIds);
+                freeQuietly(outboxExchanges);
+                freeQuietly(outboxRoutingKeys);
+                freeQuietly(outboxMessageTypes);
+                freeQuietly(outboxPayloads);
             }
-            values.append("(:tradeId").append(i)
-                    .append(", :tradeBuyerOrderId").append(i)
-                    .append(", :tradeSellerOrderId").append(i)
-                    .append(", :tradePrice").append(i)
-                    .append(", :tradeQuantity").append(i)
-                    .append(", :tradeAppliedAt").append(i)
-                    .append(", :buyerOrderId").append(i)
-                    .append(", :buyerQuantity").append(i)
-                    .append(", :buyerPreviousRemainingAmount").append(i)
-                    .append(", :buyerRemainingAmount").append(i)
-                    .append(", :buyerMatchedAmount").append(i)
-                    .append(", :buyerStatus").append(i)
-                    .append(", :sellerOrderId").append(i)
-                    .append(", :sellerQuantity").append(i)
-                    .append(", :sellerPreviousRemainingAmount").append(i)
-                    .append(", :sellerRemainingAmount").append(i)
-                    .append(", :sellerMatchedAmount").append(i)
-                    .append(", :sellerStatus").append(i)
-                    .append(", :outboxEventId").append(i)
-                    .append(", :outboxAggregateId").append(i)
-                    .append(", :outboxExchange").append(i)
-                    .append(", :outboxRoutingKey").append(i)
-                    .append(", :outboxMessageType").append(i)
-                    .append(", :outboxPayload").append(i)
-                    .append(")");
-            addHotPathBatchParams(params, preparedBatch.get(i), i);
-        }
-        final int[] existingTradeApplications = {0};
-        final int[] insertedTradeApplications = {0};
-        final int[] updatedMatchingStates = {0};
-        final int[] insertedOutboxes = {0};
-        consumerJdbc.query("""
-                WITH input(trade_id, trade_buyer_order_id, trade_seller_order_id, trade_price,
-                           trade_quantity, trade_applied_at,
-                           buyer_order_id, buyer_quantity, buyer_previous_remaining_amount,
-                           buyer_remaining_amount, buyer_matched_amount, buyer_status,
-                           seller_order_id, seller_quantity, seller_previous_remaining_amount,
-                           seller_remaining_amount, seller_matched_amount, seller_status,
-                           outbox_event_id, outbox_aggregate_id, outbox_exchange, outbox_routing_key,
-                           outbox_message_type, outbox_payload) AS (
-                    VALUES
-                """ + values + """
-                ),
-                existing_trade_applications AS (
-                    SELECT COUNT(*) AS count
-                    FROM order_service.order_trade_applications existing
-                    JOIN input ON input.trade_id = existing.trade_id
-                ),
-                trade_application AS (
-                    INSERT INTO order_service.order_trade_applications
-                        (trade_id, buyer_order_id, seller_order_id, price, quantity, applied_at)
-                    SELECT trade_id, trade_buyer_order_id, trade_seller_order_id,
-                           trade_price, trade_quantity, trade_applied_at
-                    FROM input
-                    WHERE (SELECT count FROM existing_trade_applications) = 0
-                    ON CONFLICT (trade_id) DO NOTHING
-                    RETURNING trade_id
-                ),
-                matching_input AS (
-                    SELECT input.buyer_order_id AS order_id,
-                           input.buyer_quantity AS quantity,
-                           input.buyer_previous_remaining_amount AS previous_remaining_amount,
-                           input.buyer_remaining_amount AS remaining_amount,
-                           input.buyer_matched_amount AS matched_amount,
-                           input.buyer_status AS order_status,
-                           input.trade_id AS trade_id
-                    FROM input
-                    JOIN trade_application ON trade_application.trade_id = input.trade_id
-                    UNION ALL
-                    SELECT input.seller_order_id AS order_id,
-                           input.seller_quantity AS quantity,
-                           input.seller_previous_remaining_amount AS previous_remaining_amount,
-                           input.seller_remaining_amount AS remaining_amount,
-                           input.seller_matched_amount AS matched_amount,
-                           input.seller_status AS order_status,
-                           input.trade_id AS trade_id
-                    FROM input
-                    JOIN trade_application ON trade_application.trade_id = input.trade_id
-                ),
-                updated_matching_states AS (
-                    UPDATE order_service.order_matching_state state
-                    SET remaining_amount = matching_input.remaining_amount,
-                        matched_amount = matching_input.matched_amount,
-                        status = matching_input.order_status,
-                        last_trade_id = matching_input.trade_id,
-                        updated_at = CURRENT_TIMESTAMP
-                    FROM matching_input
-                    WHERE state.order_id = matching_input.order_id
-                      AND state.remaining_amount = matching_input.previous_remaining_amount
-                      AND state.status IN ('OPEN', 'PARTIALLY_MATCHED')
-                      AND state.remaining_amount >= matching_input.quantity
-                    RETURNING 1
-                ),
-                inserted_outbox AS (
-                    INSERT INTO order_service.order_event_outbox
-                        (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
-                         status, attempt_count, next_retry_at, created_at, updated_at)
-                    SELECT outbox_event_id, outbox_aggregate_id, outbox_exchange, outbox_routing_key,
-                           outbox_message_type, outbox_payload,
-                           'PENDING', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                    FROM input
-                    JOIN trade_application ON trade_application.trade_id = input.trade_id
-                    WHERE outbox_event_id IS NOT NULL
-                    RETURNING 1
-                )
-                SELECT
-                    (SELECT count FROM existing_trade_applications) AS existing_trade_applications,
-                    (SELECT COUNT(*) FROM trade_application) AS inserted_trade_applications,
-                    (SELECT COUNT(*) FROM updated_matching_states) AS updated_matching_states,
-                    (SELECT COUNT(*) FROM inserted_outbox) AS inserted_outboxes
-                """, params, rs -> {
-            existingTradeApplications[0] = rs.getInt("existing_trade_applications");
-            insertedTradeApplications[0] = rs.getInt("inserted_trade_applications");
-            updatedMatchingStates[0] = rs.getInt("updated_matching_states");
-            insertedOutboxes[0] = rs.getInt("inserted_outboxes");
         });
-        return new TradeApplicationHotPathBatchOutcome(
-                existingTradeApplications[0],
-                insertedTradeApplications[0],
-                updatedMatchingStates[0],
-                insertedOutboxes[0]);
     }
 
     private void assertBatchCount(String label, int expected, int[] counts) {
@@ -924,6 +1004,108 @@ public class OrderEventAppender {
                 .addValue("routingKey", integrationEvent.routingKey())
                 .addValue("messageType", integrationEvent.payload().getClass().getName())
                 .addValue("payload", prepared.integrationPayload());
+    }
+
+    private TradeApplicationBatchArrays tradeApplicationBatchArrays(
+            List<TradeApplicationHotPathBatchAppend> preparedBatch) {
+        int size = preparedBatch.size();
+        String[] tradeIds = new String[size];
+        UUID[] tradeBuyerOrderIds = new UUID[size];
+        UUID[] tradeSellerOrderIds = new UUID[size];
+        Integer[] tradePrices = new Integer[size];
+        Integer[] tradeQuantities = new Integer[size];
+        Timestamp[] tradeAppliedAts = new Timestamp[size];
+        UUID[] buyerOrderIds = new UUID[size];
+        Integer[] buyerQuantities = new Integer[size];
+        Integer[] buyerPreviousRemainingAmounts = new Integer[size];
+        Integer[] buyerRemainingAmounts = new Integer[size];
+        Integer[] buyerMatchedAmounts = new Integer[size];
+        String[] buyerStatuses = new String[size];
+        UUID[] sellerOrderIds = new UUID[size];
+        Integer[] sellerQuantities = new Integer[size];
+        Integer[] sellerPreviousRemainingAmounts = new Integer[size];
+        Integer[] sellerRemainingAmounts = new Integer[size];
+        Integer[] sellerMatchedAmounts = new Integer[size];
+        String[] sellerStatuses = new String[size];
+        UUID[] outboxEventIds = new UUID[size];
+        UUID[] outboxAggregateIds = new UUID[size];
+        String[] outboxExchanges = new String[size];
+        String[] outboxRoutingKeys = new String[size];
+        String[] outboxMessageTypes = new String[size];
+        String[] outboxPayloads = new String[size];
+
+        for (int i = 0; i < size; i++) {
+            TradeApplicationHotPathBatchAppend prepared = preparedBatch.get(i);
+            MatchingState buyerNext = prepared.buyerState().apply(prepared.buyerMatchedQuantity());
+            MatchingState sellerNext = prepared.sellerState().apply(prepared.sellerMatchedQuantity());
+            OrderTradeApplication tradeApplication = prepared.tradeApplication();
+
+            tradeIds[i] = tradeApplication.tradeId();
+            tradeBuyerOrderIds[i] = tradeApplication.buyerOrderId();
+            tradeSellerOrderIds[i] = tradeApplication.sellerOrderId();
+            tradePrices[i] = tradeApplication.price();
+            tradeQuantities[i] = tradeApplication.quantity();
+            tradeAppliedAts[i] = Timestamp.valueOf(tradeApplication.appliedAt());
+            buyerOrderIds[i] = prepared.buyerOrderId();
+            buyerQuantities[i] = prepared.buyerMatchedQuantity();
+            buyerPreviousRemainingAmounts[i] = prepared.buyerState().remainingAmount();
+            buyerRemainingAmounts[i] = buyerNext.remainingAmount();
+            buyerMatchedAmounts[i] = buyerNext.matchedAmount();
+            buyerStatuses[i] = buyerNext.status();
+            sellerOrderIds[i] = prepared.sellerOrderId();
+            sellerQuantities[i] = prepared.sellerMatchedQuantity();
+            sellerPreviousRemainingAmounts[i] = prepared.sellerState().remainingAmount();
+            sellerRemainingAmounts[i] = sellerNext.remainingAmount();
+            sellerMatchedAmounts[i] = sellerNext.matchedAmount();
+            sellerStatuses[i] = sellerNext.status();
+
+            OrderIntegrationEvent integrationEvent = prepared.integrationEvent();
+            if (integrationEvent != null) {
+                outboxEventIds[i] = UUID.nameUUIDFromBytes(
+                        ("ORDER_TRADE_APPLIED:" + tradeApplication.tradeId())
+                                .getBytes(StandardCharsets.UTF_8));
+                outboxAggregateIds[i] = prepared.buyerOrderId();
+                outboxExchanges[i] = integrationEvent.exchange();
+                outboxRoutingKeys[i] = integrationEvent.routingKey();
+                outboxMessageTypes[i] = integrationEvent.payload().getClass().getName();
+                outboxPayloads[i] = prepared.integrationPayload();
+            }
+        }
+        return new TradeApplicationBatchArrays(
+                tradeIds,
+                tradeBuyerOrderIds,
+                tradeSellerOrderIds,
+                tradePrices,
+                tradeQuantities,
+                tradeAppliedAts,
+                buyerOrderIds,
+                buyerQuantities,
+                buyerPreviousRemainingAmounts,
+                buyerRemainingAmounts,
+                buyerMatchedAmounts,
+                buyerStatuses,
+                sellerOrderIds,
+                sellerQuantities,
+                sellerPreviousRemainingAmounts,
+                sellerRemainingAmounts,
+                sellerMatchedAmounts,
+                sellerStatuses,
+                outboxEventIds,
+                outboxAggregateIds,
+                outboxExchanges,
+                outboxRoutingKeys,
+                outboxMessageTypes,
+                outboxPayloads);
+    }
+
+    private void freeQuietly(Array array) {
+        if (array == null) {
+            return;
+        }
+        try {
+            array.free();
+        } catch (Exception ignored) {
+        }
     }
 
     private void addHotPathBatchParams(
@@ -1283,6 +1465,33 @@ public class OrderEventAppender {
             OrderTradeApplication tradeApplication,
             OrderIntegrationEvent integrationEvent,
             String integrationPayload) {
+    }
+
+    private record TradeApplicationBatchArrays(
+            String[] tradeIds,
+            UUID[] tradeBuyerOrderIds,
+            UUID[] tradeSellerOrderIds,
+            Integer[] tradePrices,
+            Integer[] tradeQuantities,
+            Timestamp[] tradeAppliedAts,
+            UUID[] buyerOrderIds,
+            Integer[] buyerQuantities,
+            Integer[] buyerPreviousRemainingAmounts,
+            Integer[] buyerRemainingAmounts,
+            Integer[] buyerMatchedAmounts,
+            String[] buyerStatuses,
+            UUID[] sellerOrderIds,
+            Integer[] sellerQuantities,
+            Integer[] sellerPreviousRemainingAmounts,
+            Integer[] sellerRemainingAmounts,
+            Integer[] sellerMatchedAmounts,
+            String[] sellerStatuses,
+            UUID[] outboxEventIds,
+            UUID[] outboxAggregateIds,
+            String[] outboxExchanges,
+            String[] outboxRoutingKeys,
+            String[] outboxMessageTypes,
+            String[] outboxPayloads) {
     }
 
     private record MatchingState(

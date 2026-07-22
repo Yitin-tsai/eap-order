@@ -38,6 +38,7 @@ public class OrderEventOutboxRelay {
     private final OrderPublishMetrics metrics;
     private final int batchSize;
     private final int publishConcurrency;
+    private final boolean batchConfirmEnabled;
     private final ExecutorService publishExecutor;
     private final long confirmTimeoutMs;
 
@@ -48,6 +49,7 @@ public class OrderEventOutboxRelay {
             OrderPublishMetrics metrics,
             @Value("${eap.order-event-outbox.batch-size:200}") int batchSize,
             @Value("${eap.order-event-outbox.publish-concurrency:1}") int publishConcurrency,
+            @Value("${eap.order-event-outbox.batch-confirm-enabled:false}") boolean batchConfirmEnabled,
             @Value("${eap.order-event-outbox.confirm-timeout-ms:5000}") long confirmTimeoutMs) {
         this.jdbc = jdbc;
         this.namedJdbc = namedJdbc;
@@ -55,6 +57,7 @@ public class OrderEventOutboxRelay {
         this.metrics = metrics;
         this.batchSize = batchSize;
         this.publishConcurrency = Math.max(1, publishConcurrency);
+        this.batchConfirmEnabled = batchConfirmEnabled;
         this.publishExecutor = this.publishConcurrency > 1
                 ? Executors.newFixedThreadPool(this.publishConcurrency, new OrderOutboxPublishThreadFactory())
                 : null;
@@ -115,32 +118,36 @@ public class OrderEventOutboxRelay {
 
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(confirmTimeoutMs);
             List<PublishAttempt> confirmed = new ArrayList<>(attempts.size());
-            for (PublishAttempt attempt : attempts) {
-                Instant confirmStartedAt = Instant.now();
-                try {
-                    long remaining = deadline - System.nanoTime();
-                    if (remaining <= 0) {
-                        throw new TimeoutException("Order outbox confirm batch timed out");
+            if (batchConfirmEnabled) {
+                confirmed.addAll(attempts);
+            } else {
+                for (PublishAttempt attempt : attempts) {
+                    Instant confirmStartedAt = Instant.now();
+                    try {
+                        long remaining = deadline - System.nanoTime();
+                        if (remaining <= 0) {
+                            throw new TimeoutException("Order outbox confirm batch timed out");
+                        }
+                        CorrelationData.Confirm confirm = attempt.correlation().getFuture()
+                                .get(remaining, TimeUnit.NANOSECONDS);
+                        if (!confirm.isAck()) {
+                            throw new AmqpException("RabbitMQ nack: " + confirm.getReason());
+                        }
+                        if (attempt.correlation().getReturned() != null) {
+                            throw new AmqpException("Unroutable Order integration event: " + attempt.row().eventId());
+                        }
+                        confirmed.add(attempt);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    } catch (Exception e) {
+                        batchSucceeded = false;
+                        recordFailure(attempt.row(), e);
+                        metrics.failed();
+                        metrics.recordDuration(Duration.between(attempt.startedAt(), Instant.now()));
+                    } finally {
+                        metrics.recordOutboxConfirm(Duration.between(confirmStartedAt, Instant.now()));
                     }
-                    CorrelationData.Confirm confirm = attempt.correlation().getFuture()
-                            .get(remaining, TimeUnit.NANOSECONDS);
-                    if (!confirm.isAck()) {
-                        throw new AmqpException("RabbitMQ nack: " + confirm.getReason());
-                    }
-                    if (attempt.correlation().getReturned() != null) {
-                        throw new AmqpException("Unroutable Order integration event: " + attempt.row().eventId());
-                    }
-                    confirmed.add(attempt);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                } catch (Exception e) {
-                    batchSucceeded = false;
-                    recordFailure(attempt.row(), e);
-                    metrics.failed();
-                    metrics.recordDuration(Duration.between(attempt.startedAt(), Instant.now()));
-                } finally {
-                    metrics.recordOutboxConfirm(Duration.between(confirmStartedAt, Instant.now()));
                 }
             }
 
@@ -171,21 +178,7 @@ public class OrderEventOutboxRelay {
 
     private List<PublishResult> publishBatch(List<OutboxRow> rows) {
         if (publishConcurrency == 1 || rows.size() <= 1) {
-            List<PublishResult> results = new ArrayList<>(rows.size());
-            try {
-                rabbitTemplate.invoke(operations -> {
-                    for (OutboxRow row : rows) {
-                        results.add(publishOne(row, operations));
-                    }
-                    return null;
-                });
-            } catch (Exception e) {
-                int publishedOrFailed = results.size();
-                for (int i = publishedOrFailed; i < rows.size(); i++) {
-                    results.add(PublishResult.failure(rows.get(i), Instant.now(), e));
-                }
-            }
-            return results;
+            return publishChunk(rows);
         }
 
         List<List<OutboxRow>> chunks = partition(rows, publishConcurrency);
@@ -205,15 +198,44 @@ public class OrderEventOutboxRelay {
                 for (OutboxRow row : chunk) {
                     results.add(publishOne(row, operations));
                 }
+                if (batchConfirmEnabled && !results.isEmpty()) {
+                    Instant confirmStartedAt = Instant.now();
+                    operations.waitForConfirmsOrDie(confirmTimeoutMs);
+                    Duration confirmDuration = Duration.between(confirmStartedAt, Instant.now());
+                    recordBatchConfirm(results.size(), confirmDuration);
+                    for (PublishResult result : results) {
+                        if (result.correlation().getReturned() != null) {
+                            throw new AmqpException(
+                                    "Unroutable Order integration event: " + result.row().eventId());
+                        }
+                    }
+                }
                 return null;
             });
         } catch (Exception e) {
+            if (batchConfirmEnabled && !results.isEmpty()) {
+                results.clear();
+                for (OutboxRow row : chunk) {
+                    results.add(PublishResult.failure(row, Instant.now(), e));
+                }
+                return results;
+            }
             int publishedOrFailed = results.size();
             for (int i = publishedOrFailed; i < chunk.size(); i++) {
                 results.add(PublishResult.failure(chunk.get(i), Instant.now(), e));
             }
         }
         return results;
+    }
+
+    private void recordBatchConfirm(int confirmedCount, Duration confirmDuration) {
+        if (confirmedCount <= 0) {
+            return;
+        }
+        Duration perMessageDuration = confirmDuration.dividedBy(confirmedCount);
+        for (int i = 0; i < confirmedCount; i++) {
+            metrics.recordOutboxConfirm(perMessageDuration);
+        }
     }
 
     private List<List<OutboxRow>> partition(List<OutboxRow> rows, int maxChunks) {
