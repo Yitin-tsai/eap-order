@@ -356,10 +356,11 @@ public class MatchedE2eLoadGenerator {
         PublishResult buyPublish = publishBuyToMatchEngine(config, rabbitTemplate, pairs);
         WaitResult waitResult = waitForDownstream(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, started);
         double elapsedSeconds = businessCompletionSeconds(waitResult, started);
+        long activeReservationsAtBusinessCompletion = countRedisKeys(redisTemplate, "order:reservation:*");
+        ReservationCleanupWaitResult reservationCleanupWait = waitForReservationCleanup(config, redisTemplate, started);
 
         long remainingSellOrders = zsetSize(redisTemplate, "orderbook:" + config.marketId() + ":sell");
         long remainingBuyOrders = zsetSize(redisTemplate, "orderbook:" + config.marketId() + ":buy");
-        long activeReservations = countRedisKeys(redisTemplate, "order:reservation:*");
         printResult(
                 config,
                 sellPublish,
@@ -368,16 +369,18 @@ public class MatchedE2eLoadGenerator {
                 buyPublish,
                 waitResult,
                 elapsedSeconds,
+                activeReservationsAtBusinessCompletion,
+                reservationCleanupWait,
                 remainingSellOrders,
-                remainingBuyOrders,
-                activeReservations);
+                remainingBuyOrders);
 
         require(sellPublish.failures() == 0, "SELL publish should have no failures");
         require(buyPublish.failures() == 0, "BUY publish should have no failures");
         require(waitResult.orderCommandMatchedRows() == config.events() * 2L,
                 "Order command state should mark buyer and seller orders as MATCHED");
         require(waitResult.tradeExecutions() == config.events(), "MatchEngine should persist one TradeExecuted per match");
-        require(waitResult.completedTrades() == config.events(), "Trade completion view should complete every match");
+        require(waitResult.completedTrades() == config.events(),
+                "Durable trade convergence should include MatchEngine execution, Order trade application, and Wallet settlement");
         require(waitResult.walletTradeSettlements() == config.events(), "Wallet should settle every TradeExecuted exactly once");
         require(waitResult.lockedCurrency() == 0, "Wallet buyer locked currency should be released");
         require(waitResult.lockedAmount() == 0, "Wallet seller locked amount should be released");
@@ -385,7 +388,7 @@ public class MatchedE2eLoadGenerator {
         require(waitResult.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT, "Wallet sellers should receive currency");
         require(remainingSellOrders == 0, "all resting SELL orders should be consumed");
         require(remainingBuyOrders == 0, "incoming BUY orders should not remain in order book");
-        require(activeReservations == 0, "MatchEngine reservations should converge to zero");
+        require(reservationCleanupWait.activeReservations() == 0, "MatchEngine reservations should converge to zero");
     }
 
     private static double businessCompletionSeconds(WaitResult waitResult, long startedNanos) {
@@ -397,6 +400,27 @@ public class MatchedE2eLoadGenerator {
                 ? waitResult.queueFullyDrainedSeconds()
                 : nowSeconds;
         return Math.max(completedTradesSeconds, fullyDrainedSeconds);
+    }
+
+    private static ReservationCleanupWaitResult waitForReservationCleanup(
+            Config config,
+            RedisTemplate<String, String> redisTemplate,
+            long startedNanos)
+            throws InterruptedException {
+        long deadline = startedNanos + TimeUnit.SECONDS.toNanos(config.timeoutSeconds());
+        long activeReservations;
+        do {
+            activeReservations = countRedisKeys(redisTemplate, "order:reservation:*");
+            double elapsedSeconds = (System.nanoTime() - startedNanos) / 1_000_000_000.0;
+            if (activeReservations == 0) {
+                return new ReservationCleanupWaitResult(0, elapsedSeconds);
+            }
+            TimeUnit.MILLISECONDS.sleep(100);
+        } while (System.nanoTime() < deadline);
+
+        activeReservations = countRedisKeys(redisTemplate, "order:reservation:*");
+        double elapsedSeconds = (System.nanoTime() - startedNanos) / 1_000_000_000.0;
+        return new ReservationCleanupWaitResult(activeReservations, elapsedSeconds);
     }
 
     private static void seedWallets(JdbcTemplate jdbcTemplate, List<Pair> pairs) {
@@ -646,16 +670,13 @@ public class MatchedE2eLoadGenerator {
                     completedTradesReachedSeconds = elapsedSeconds;
                 }
                 if (strictCompletedTradesReachedSeconds < 0 && latest.completedTrades() == config.events()) {
-                    long strictCompletedTrades = countCompletedTrades(matchJdbc, true);
-                    if (strictCompletedTrades == config.events()) {
-                        strictCompletedTradesReachedSeconds = elapsedSeconds;
-                    }
+                    strictCompletedTradesReachedSeconds = elapsedSeconds;
                 }
                 if (projectionCaughtUpSeconds < 0 && projectionSatisfied(config, latest)) {
                     projectionCaughtUpSeconds = elapsedSeconds;
                 }
                 if (coreBusinessCountsReached(config, latest) && consecutiveFullyDrainedSamples >= 3) {
-                    WaitResult verified = snapshot(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, true);
+                    WaitResult verified = snapshot(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin);
                     if (!invariantsSatisfied(config, verified)) {
                         latest = verified;
                         TimeUnit.MILLISECONDS.sleep(100);
@@ -699,7 +720,7 @@ public class MatchedE2eLoadGenerator {
             TimeUnit.MILLISECONDS.sleep(100);
         } while (System.nanoTime() < deadline);
 
-        WaitResult finalSnapshot = snapshot(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, true);
+        WaitResult finalSnapshot = snapshot(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin);
         return finalSnapshot.withDiagnostics(
                 tradeExecutionsReachedSeconds,
                 orderMatchedReachedSeconds,
@@ -832,7 +853,7 @@ public class MatchedE2eLoadGenerator {
                 -1,
                 -1,
                 count(matchJdbc, "SELECT count(*) FROM match_engine.trade_executions"),
-                countCompletedTrades(matchJdbc, false),
+                countCompletedTrades(orderJdbc, walletJdbc, matchJdbc),
                 count(walletJdbc, "SELECT count(*) FROM wallet_service.trade_settlements"),
                 -1,
                 -1,
@@ -875,8 +896,7 @@ public class MatchedE2eLoadGenerator {
             JdbcTemplate orderJdbc,
             JdbcTemplate walletJdbc,
             JdbcTemplate matchJdbc,
-            RabbitAdmin rabbitAdmin,
-            boolean strictCompletionCheck) {
+            RabbitAdmin rabbitAdmin) {
         QueueDepth matchEngineOrderConfirmed = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
         QueueDepth orderTradeExecuted = queueDepth(config, rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
         QueueDepth walletTradeExecuted = queueDepth(config, rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
@@ -901,7 +921,7 @@ public class MatchedE2eLoadGenerator {
                         """),
                 count(orderJdbc, "SELECT count(*) FROM order_service.match_history"),
                 count(matchJdbc, "SELECT count(*) FROM match_engine.trade_executions"),
-                countCompletedTrades(matchJdbc, strictCompletionCheck),
+                countCompletedTrades(orderJdbc, walletJdbc, matchJdbc),
                 count(walletJdbc, "SELECT count(*) FROM wallet_service.trade_settlements"),
                 count(walletJdbc, "SELECT COALESCE(sum(locked_currency), 0) FROM wallet_service.wallets"),
                 count(walletJdbc, "SELECT COALESCE(sum(locked_amount), 0) FROM wallet_service.wallets"),
@@ -949,39 +969,20 @@ public class MatchedE2eLoadGenerator {
     }
 
     private static long countCompletedTrades(
-            JdbcTemplate matchJdbc,
-            boolean strictCompletionCheck) {
-        if (strictCompletionCheck) {
-            return count(matchJdbc, """
-                    SELECT count(*)
-                    FROM match_engine.trade_executions executions
-                    WHERE EXISTS (
-                        SELECT 1
-                        FROM match_engine.trade_completion_markers markers
-                        WHERE markers.trade_id = executions.trade_id
-                          AND markers.marker_type = 'ORDER_APPLIED'
-                    )
-                      AND EXISTS (
-                        SELECT 1
-                        FROM match_engine.trade_completion_markers markers
-                        WHERE markers.trade_id = executions.trade_id
-                          AND markers.marker_type = 'WALLET_SETTLED'
-                    )
-                    """);
-        }
-        return count(matchJdbc, """
-                SELECT LEAST(
-                    (SELECT count(*) FROM match_engine.trade_executions),
-                    (SELECT count(*) FROM match_engine.trade_completion_markers WHERE marker_type = 'ORDER_APPLIED'),
-                    (SELECT count(*) FROM match_engine.trade_completion_markers WHERE marker_type = 'WALLET_SETTLED')
-                )
-                """);
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            JdbcTemplate matchJdbc) {
+        long tradeExecutions = count(matchJdbc, "SELECT count(*) FROM match_engine.trade_executions");
+        long orderTradeApplications = count(orderJdbc, "SELECT count(*) FROM order_service.order_trade_applications");
+        long walletTradeSettlements = count(walletJdbc, "SELECT count(*) FROM wallet_service.trade_settlements");
+        return Math.min(tradeExecutions, Math.min(orderTradeApplications, walletTradeSettlements));
     }
 
     private static void truncateOrderTestData(JdbcTemplate jdbcTemplate) {
         jdbcTemplate.execute("""
                 TRUNCATE TABLE
                     order_service.match_history,
+                    order_service.order_trade_execution_inbox,
                     order_service.order_trade_applications,
                     order_service.order_event_outbox,
                     order_service.order_matching_state,
@@ -1006,6 +1007,17 @@ public class MatchedE2eLoadGenerator {
     }
 
     private static void truncateMatchTestData(JdbcTemplate jdbcTemplate) {
+        jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                    IF to_regclass('match_engine.trade_publish_checkpoints') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.trade_publish_checkpoints RESTART IDENTITY CASCADE;
+                    END IF;
+                    IF to_regclass('match_engine.reservation_cleanup_tasks') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.reservation_cleanup_tasks RESTART IDENTITY CASCADE;
+                    END IF;
+                END $$;
+                """);
         jdbcTemplate.execute("""
                 TRUNCATE TABLE
                     match_engine.trade_completion_markers,
@@ -1290,9 +1302,10 @@ public class MatchedE2eLoadGenerator {
             PublishResult buyPublish,
             WaitResult waitResult,
             double elapsedSeconds,
+            long activeReservationsAtBusinessCompletion,
+            ReservationCleanupWaitResult reservationCleanupWait,
             long remainingSellOrders,
-            long remainingBuyOrders,
-            long activeReservations) {
+            long remainingBuyOrders) {
         System.out.println("{");
         System.out.printf("  \"mode\": \"matchedE2e\",%n");
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
@@ -1331,7 +1344,7 @@ public class MatchedE2eLoadGenerator {
                 waitResult,
                 remainingSellOrders,
                 remainingBuyOrders,
-                activeReservations,
+                reservationCleanupWait.activeReservations(),
                 offeredLoadRatio,
                 finalQueueBacklog);
         System.out.printf("  \"actualBuyPublishTps\": %.2f,%n", actualBuyPublishTps);
@@ -1356,6 +1369,10 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"businessMatchedE2eTps\": %.2f,%n", businessCompletedTradeTps);
         System.out.printf("  \"matchedE2eTps\": %.2f,%n", businessCompletedTradeTps);
         System.out.printf("  \"businessCompletionSeconds\": %.2f,%n", elapsedSeconds);
+        System.out.printf("  \"activeReservationsAtBusinessCompletion\": %d,%n", activeReservationsAtBusinessCompletion);
+        System.out.printf("  \"reservationCleanupReachedSeconds\": %.2f,%n", reservationCleanupWait.reachedSeconds());
+        System.out.printf("  \"reservationCleanupTailAfterBusinessSeconds\": %.2f,%n",
+                Math.max(0.0, reservationCleanupWait.reachedSeconds() - elapsedSeconds));
         System.out.printf("  \"projectionIncludedInBusinessGate\": false,%n");
         System.out.printf("  \"queueReadyDrainedSeconds\": %.2f,%n", waitResult.queueReadyDrainedSeconds());
         System.out.printf("  \"queueFullyDrainedSeconds\": %.2f,%n", waitResult.queueFullyDrainedSeconds());
@@ -1366,8 +1383,10 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"walletSettlementsReachedSeconds\": %.2f,%n", waitResult.walletSettlementsReachedSeconds());
         System.out.printf("  \"walletSettlementReachTps\": %.2f,%n", rate(config.events(), waitResult.walletSettlementsReachedSeconds()));
         System.out.printf("  \"completedTradesReachedSeconds\": %.2f,%n", waitResult.completedTradesReachedSeconds());
+        System.out.printf("  \"businessConvergenceReachTps\": %.2f,%n", rate(config.events(), waitResult.completedTradesReachedSeconds()));
         System.out.printf("  \"completionMarkerReachTps\": %.2f,%n", rate(config.events(), waitResult.completedTradesReachedSeconds()));
         System.out.printf("  \"strictCompletedTradesReachedSeconds\": %.2f,%n", waitResult.strictCompletedTradesReachedSeconds());
+        System.out.printf("  \"strictBusinessConvergenceReachTps\": %.2f,%n", rate(config.events(), waitResult.strictCompletedTradesReachedSeconds()));
         System.out.printf("  \"strictCompletionMarkerReachTps\": %.2f,%n", rate(config.events(), waitResult.strictCompletedTradesReachedSeconds()));
         System.out.printf("  \"orderProjectionCaughtUpSeconds\": %.2f,%n", waitResult.orderProjectionCaughtUpSeconds());
         System.out.printf("  \"orderProjectionLagSeconds\": %.2f,%n", waitResult.orderProjectionLagSeconds());
@@ -1424,7 +1443,7 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"finalQueueBacklog\": %d,%n", finalQueueBacklog);
         System.out.printf("  \"remainingSellOrders\": %d,%n", remainingSellOrders);
         System.out.printf("  \"remainingBuyOrders\": %d,%n", remainingBuyOrders);
-        System.out.printf("  \"activeReservations\": %d%n", activeReservations);
+        System.out.printf("  \"activeReservations\": %d%n", reservationCleanupWait.activeReservations());
         System.out.println("}");
     }
 
@@ -1550,6 +1569,11 @@ public class MatchedE2eLoadGenerator {
         OrderConfirmedEvent sellConfirmed(String marketId) {
             return confirmed(submitted(sellOrderId, sellerId, "SELL", sellSequence, marketId));
         }
+    }
+
+    private record ReservationCleanupWaitResult(
+            long activeReservations,
+            double reachedSeconds) {
     }
 
     private record PublishResult(

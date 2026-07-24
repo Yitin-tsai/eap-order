@@ -324,4 +324,32 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-019" author="eap">
+        <comment>Create durable Order inbox for TradeExecuted events before manual ACK</comment>
+        <sql>
+            CREATE TABLE order_service.order_trade_execution_inbox (
+                trade_id VARCHAR(80) PRIMARY KEY,
+                legacy_match_id INTEGER,
+                buyer_order_id UUID NOT NULL,
+                seller_order_id UUID NOT NULL,
+                deal_price INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'RECEIVED',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TIMESTAMP,
+                last_error TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_trade_execution_inbox_status
+                    CHECK (status IN ('RECEIVED', 'APPLIED', 'FAILED_RETRYABLE')),
+                CONSTRAINT ck_order_trade_execution_inbox_attempt_non_negative
+                    CHECK (attempt_count &gt;= 0)
+            );
+
+            CREATE INDEX idx_order_trade_execution_inbox_status_updated
+                ON order_service.order_trade_execution_inbox(status, updated_at);
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

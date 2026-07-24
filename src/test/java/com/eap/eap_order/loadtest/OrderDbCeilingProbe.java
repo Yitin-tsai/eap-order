@@ -182,8 +182,7 @@ public class OrderDbCeilingProbe {
                     .append("?::varchar, ?::uuid, ?::uuid, ?::integer, ")
                     .append("?::integer, ?::timestamp, ")
                     .append("?::uuid, ?::integer, ?::integer, ?::integer, ?::integer, ?::varchar, ")
-                    .append("?::uuid, ?::integer, ?::integer, ?::integer, ?::integer, ?::varchar, ")
-                    .append("?::uuid, ?::uuid, ?::varchar, ?::varchar, ?::varchar, ?::text")
+                    .append("?::uuid, ?::integer, ?::integer, ?::integer, ?::integer, ?::varchar")
                     .append(")");
         }
         return """
@@ -192,9 +191,7 @@ public class OrderDbCeilingProbe {
                            buyer_order_id, buyer_quantity, buyer_previous_remaining_amount,
                            buyer_remaining_amount, buyer_matched_amount, buyer_status,
                            seller_order_id, seller_quantity, seller_previous_remaining_amount,
-                           seller_remaining_amount, seller_matched_amount, seller_status,
-                           outbox_event_id, outbox_aggregate_id, outbox_exchange, outbox_routing_key,
-                           outbox_message_type, outbox_payload) AS (
+                           seller_remaining_amount, seller_matched_amount, seller_status) AS (
                     VALUES
                 """ + values + """
                 ),
@@ -247,24 +244,11 @@ public class OrderDbCeilingProbe {
                       AND state.status IN ('OPEN', 'PARTIALLY_MATCHED')
                       AND state.remaining_amount >= matching_input.quantity
                     RETURNING 1
-                ),
-                inserted_outbox AS (
-                    INSERT INTO order_service.order_event_outbox
-                        (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
-                         status, attempt_count, next_retry_at, created_at, updated_at)
-                    SELECT outbox_event_id, outbox_aggregate_id, outbox_exchange, outbox_routing_key,
-                           outbox_message_type, outbox_payload,
-                           'PENDING', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                    FROM input
-                    JOIN trade_application ON trade_application.trade_id = input.trade_id
-                    WHERE outbox_event_id IS NOT NULL
-                    RETURNING 1
                 )
                 SELECT
                     (SELECT count FROM existing_trade_applications) AS existing_trade_applications,
                     (SELECT COUNT(*) FROM trade_application) AS inserted_trade_applications,
-                    (SELECT COUNT(*) FROM updated_matching_states) AS updated_matching_states,
-                    (SELECT COUNT(*) FROM inserted_outbox) AS inserted_outboxes
+                    (SELECT COUNT(*) FROM updated_matching_states) AS updated_matching_states
                 """;
     }
 
@@ -298,25 +282,18 @@ public class OrderDbCeilingProbe {
             statement.setInt(param++, 0);
             statement.setInt(param++, 1);
             statement.setString(param++, "FILLED");
-            statement.setObject(param++, uuid(sequence, 5));
-            statement.setObject(param++, buyerOrderId);
-            statement.setString(param++, "eap.events");
-            statement.setString(param++, "order.matched");
-            statement.setString(param++, "com.eap.common.event.OrderCommandMatchedEvent");
-            statement.setString(param++, "{\"tradeId\":\"" + tradeId + "\",\"marketId\":\"" + marketId + "\"}");
         }
     }
 
     private static TradeApplyCounts executeTradeApply(PreparedStatement statement) throws SQLException {
         try (ResultSet rs = statement.executeQuery()) {
             if (!rs.next()) {
-                return new TradeApplyCounts(0, 0, 0, 0);
+                return new TradeApplyCounts(0, 0, 0);
             }
             return new TradeApplyCounts(
                     rs.getInt("existing_trade_applications"),
                     rs.getInt("inserted_trade_applications"),
-                    rs.getInt("updated_matching_states"),
-                    rs.getInt("inserted_outboxes"));
+                    rs.getInt("updated_matching_states"));
         }
     }
 
@@ -386,13 +363,11 @@ public class OrderDbCeilingProbe {
     private record TradeApplyCounts(
             int existingTradeApplications,
             int insertedTradeApplications,
-            int updatedMatchingStates,
-            int insertedOutboxes) {
+            int updatedMatchingStates) {
         boolean completed(int batchSize) {
             return existingTradeApplications == 0
                     && insertedTradeApplications == batchSize
-                    && updatedMatchingStates == batchSize * 2
-                    && insertedOutboxes == batchSize;
+                    && updatedMatchingStates == batchSize * 2;
         }
     }
 

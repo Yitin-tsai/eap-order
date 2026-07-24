@@ -3,7 +3,6 @@ package com.eap.eap_order.application;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderFailedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
-import com.eap.common.event.OrderTradeAppliedEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAggregate;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
@@ -34,8 +33,6 @@ import java.util.UUID;
 
 import static com.eap.common.constants.RabbitMQConstants.ORDER_EXCHANGE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_SUBMITTED_KEY;
-import static com.eap.common.constants.RabbitMQConstants.TRADE_EXCHANGE;
-import static com.eap.common.constants.RabbitMQConstants.TRADE_ORDER_APPLIED_KEY;
 
 @Service
 public class OrderEventSourcingService {
@@ -156,21 +153,19 @@ public class OrderEventSourcingService {
                 source.getBuyerOrderId(), source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
         OrderMatchedV1 sellerFastPathEvent = new OrderMatchedV1(
                 source.getSellerOrderId(), source.getLegacyMatchId(), source.getQuantity(), source.getDealPrice(), occurredAt);
-        OrderIntegrationEvent integrationEvent = tradeAppliedIntegration(source, occurredAt);
         OrderTradeApplication tradeApplication = tradeApplication(source, occurredAt);
         return new PreparedTrade(
                 source,
                 buyerFastPathEvent,
                 sellerFastPathEvent,
-                integrationEvent,
                 tradeApplication);
     }
 
     private void applyPreparedTrade(PreparedTrade preparedTrade) {
         TradeExecutedEvent source = preparedTrade.source();
         if (applyTradeFromCaughtUpProjection(source, preparedTrade.buyerFastPathEvent(),
-                preparedTrade.sellerFastPathEvent(), preparedTrade.integrationEvent(),
-                preparedTrade.tradeApplication(), source.getQuantity())) {
+                preparedTrade.sellerFastPathEvent(), preparedTrade.tradeApplication(),
+                source.getQuantity())) {
             return;
         }
         throw new IllegalStateException("TradeExecutedEvent could not be applied from command state: tradeId="
@@ -181,7 +176,6 @@ public class OrderEventSourcingService {
             TradeExecutedEvent source,
             OrderMatchedV1 buyerEvent,
             OrderMatchedV1 sellerEvent,
-            OrderIntegrationEvent integrationEvent,
             OrderTradeApplication tradeApplication,
             int quantity) {
         OrderEventAppendCommand buyerCommand = new OrderEventAppendCommand(
@@ -208,27 +202,9 @@ public class OrderEventSourcingService {
                 appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
                         buyerCommand, quantity,
                         sellerCommand, quantity,
-                        tradeApplication,
-                        integrationEvent);
+                        tradeApplication);
         return result.status() == TradeExecutionAppendStatus.APPLIED
                 || result.status() == TradeExecutionAppendStatus.DUPLICATE;
-    }
-
-    private OrderIntegrationEvent tradeAppliedIntegration(
-            TradeExecutedEvent source,
-            LocalDateTime occurredAt) {
-        OrderTradeAppliedEvent integrationEvent = OrderTradeAppliedEvent.builder()
-                .tradeId(source.getTradeId())
-                .buyerOrderId(source.getBuyerOrderId())
-                .sellerOrderId(source.getSellerOrderId())
-                .legacyMatchId(source.getLegacyMatchId())
-                .dealPrice(source.getDealPrice())
-                .quantity(source.getQuantity())
-                .buyerAppliedAt(occurredAt)
-                .sellerAppliedAt(occurredAt)
-                .appliedAt(occurredAt)
-                .build();
-        return new OrderIntegrationEvent(TRADE_EXCHANGE, TRADE_ORDER_APPLIED_KEY, integrationEvent);
     }
 
     private OrderTradeApplication tradeApplication(
@@ -247,7 +223,6 @@ public class OrderEventSourcingService {
             TradeExecutedEvent source,
             OrderMatchedV1 buyerFastPathEvent,
             OrderMatchedV1 sellerFastPathEvent,
-            OrderIntegrationEvent integrationEvent,
             OrderTradeApplication tradeApplication) {
 
         private TradeApplicationBatchAppendCommand toBatchAppendCommand() {
@@ -274,8 +249,7 @@ public class OrderEventSourcingService {
                             sellerFastPathEvent.matchedAt(),
                             null),
                     source.getQuantity(),
-                    tradeApplication,
-                    integrationEvent);
+                    tradeApplication);
         }
     }
 

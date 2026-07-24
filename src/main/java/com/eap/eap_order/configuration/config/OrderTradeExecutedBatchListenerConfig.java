@@ -1,5 +1,6 @@
 package com.eap.eap_order.configuration.config;
 
+import org.springframework.amqp.core.AcknowledgeMode;
 import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -22,6 +23,7 @@ public class OrderTradeExecutedBatchListenerConfig {
         factory.setConsumerBatchEnabled(true);
         factory.setBatchSize(Math.max(1, batchSize));
         factory.setReceiveTimeout(receiveTimeoutMs);
+        factory.setAcknowledgeMode(AcknowledgeMode.MANUAL);
         return factory;
     }
 }

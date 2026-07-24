@@ -104,7 +104,13 @@ public class OrderEventOutboxRelay {
 
             List<PublishAttempt> attempts = new ArrayList<>(rows.size());
             boolean batchSucceeded = true;
-            List<PublishResult> publishResults = publishBatch(rows);
+            Instant publishStageStartedAt = Instant.now();
+            List<PublishResult> publishResults;
+            try {
+                publishResults = publishBatch(rows);
+            } finally {
+                metrics.recordOutboxPublishStage(Duration.between(publishStageStartedAt, Instant.now()));
+            }
             for (PublishResult result : publishResults) {
                 if (result.succeeded()) {
                     attempts.add(new PublishAttempt(result.row(), result.correlation(), result.startedAt()));
@@ -118,6 +124,7 @@ public class OrderEventOutboxRelay {
 
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(confirmTimeoutMs);
             List<PublishAttempt> confirmed = new ArrayList<>(attempts.size());
+            Instant confirmStageStartedAt = Instant.now();
             if (batchConfirmEnabled) {
                 confirmed.addAll(attempts);
             } else {
@@ -150,8 +157,13 @@ public class OrderEventOutboxRelay {
                     }
                 }
             }
+            Instant confirmStageCompletedAt = Instant.now();
+            if (!batchConfirmEnabled) {
+                metrics.recordOutboxConfirmWall(Duration.between(confirmStageStartedAt, confirmStageCompletedAt));
+            }
 
             if (!confirmed.isEmpty()) {
+                metrics.recordOutboxPostConfirmMarkGap(Duration.between(confirmStageCompletedAt, Instant.now()));
                 List<Long> ids = confirmed.stream().map(a -> a.row().id()).toList();
                 Instant markStartedAt = Instant.now();
                 try {
@@ -233,6 +245,7 @@ public class OrderEventOutboxRelay {
             return;
         }
         Duration perMessageDuration = confirmDuration.dividedBy(confirmedCount);
+        metrics.recordOutboxConfirmWall(confirmDuration);
         for (int i = 0; i < confirmedCount; i++) {
             metrics.recordOutboxConfirm(perMessageDuration);
         }

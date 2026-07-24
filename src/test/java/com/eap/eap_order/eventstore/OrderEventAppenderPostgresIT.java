@@ -262,17 +262,12 @@ class OrderEventAppenderPostgresIT {
     }
 
     @Test
-    void appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent_shouldAppendBothOrdersAndOneOutbox() {
+    void appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent_shouldApplyTradeWithoutOutbox() {
         UUID buyerOrderId = aggregateId();
         UUID sellerOrderId = aggregateId();
         LocalDateTime appliedAt = LocalDateTime.now();
         seedCaughtUpProjection(buyerOrderId, 2, "OPEN", 10);
         seedCaughtUpProjection(sellerOrderId, 2, "OPEN", 10);
-
-        OrderIntegrationEvent sharedMarker = new OrderIntegrationEvent(
-                "trade.exchange",
-                "trade.order.applied",
-                Map.of("tradeId", "trade-application", "buyerOrderId", buyerOrderId, "sellerOrderId", sellerOrderId));
 
         OrderEventAppender.TradeExecutionAppendResult result =
                 appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
@@ -280,14 +275,13 @@ class OrderEventAppenderPostgresIT {
                         4,
                         matchedCommandWithoutOutbox(sellerOrderId, "trade-application"),
                         4,
-                        tradeApplication("trade-application", buyerOrderId, sellerOrderId, 4, appliedAt),
-                        sharedMarker);
+                        tradeApplication("trade-application", buyerOrderId, sellerOrderId, 4, appliedAt));
 
         assertEquals(APPLIED, result.status());
         assertEquals(0, count("order_event_store", buyerOrderId));
         assertEquals(0, count("order_event_store", sellerOrderId));
         assertEquals(1, countTradeApplications("trade-application"));
-        assertEquals(1, count("order_event_outbox", buyerOrderId));
+        assertEquals(0, count("order_event_outbox", buyerOrderId));
         assertEquals(0, count("order_event_outbox", sellerOrderId));
         assertEquals(2L, currentVersion(buyerOrderId));
         assertEquals(2L, currentVersion(sellerOrderId));
@@ -302,10 +296,6 @@ class OrderEventAppenderPostgresIT {
         LocalDateTime appliedAt = LocalDateTime.now();
         seedCaughtUpProjection(buyerOrderId, 2, "OPEN", 10);
         seedCaughtUpProjection(sellerOrderId, 2, "OPEN", 10);
-        OrderIntegrationEvent sharedMarker = new OrderIntegrationEvent(
-                "trade.exchange",
-                "trade.order.applied",
-                Map.of("tradeId", "trade-application-duplicate"));
 
         OrderTradeApplication tradeApplication =
                 tradeApplication("trade-application-duplicate", buyerOrderId, sellerOrderId, 4, appliedAt);
@@ -315,23 +305,21 @@ class OrderEventAppenderPostgresIT {
                         4,
                         matchedCommandWithoutOutbox(sellerOrderId, "trade-application-duplicate"),
                         4,
-                        tradeApplication,
-                        sharedMarker);
+                        tradeApplication);
         OrderEventAppender.TradeExecutionAppendResult duplicate =
                 appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
                         matchedCommandWithoutOutbox(buyerOrderId, "trade-application-duplicate"),
                         4,
                         matchedCommandWithoutOutbox(sellerOrderId, "trade-application-duplicate"),
                         4,
-                        tradeApplication,
-                        sharedMarker);
+                        tradeApplication);
 
         assertEquals(APPLIED, first.status());
         assertEquals(DUPLICATE, duplicate.status());
         assertEquals(0, count("order_event_store", buyerOrderId));
         assertEquals(0, count("order_event_store", sellerOrderId));
         assertEquals(1, countTradeApplications("trade-application-duplicate"));
-        assertEquals(1, count("order_event_outbox", buyerOrderId));
+        assertEquals(0, count("order_event_outbox", buyerOrderId));
         assertEquals(0, count("order_event_outbox", sellerOrderId));
         assertEquals(2L, currentVersion(buyerOrderId));
         assertEquals(2L, currentVersion(sellerOrderId));
@@ -364,9 +352,9 @@ class OrderEventAppenderPostgresIT {
         }
         assertEquals(1, countTradeApplications("trade-batch-1"));
         assertEquals(1, countTradeApplications("trade-batch-2"));
-        assertEquals(1, count("order_event_outbox", buyerOrderId1));
+        assertEquals(0, count("order_event_outbox", buyerOrderId1));
         assertEquals(0, count("order_event_outbox", sellerOrderId1));
-        assertEquals(1, count("order_event_outbox", buyerOrderId2));
+        assertEquals(0, count("order_event_outbox", buyerOrderId2));
         assertEquals(0, count("order_event_outbox", sellerOrderId2));
     }
 
@@ -477,11 +465,7 @@ class OrderEventAppenderPostgresIT {
                 4,
                 matchedCommandWithoutOutbox(sellerOrderId, tradeId),
                 4,
-                tradeApplication(tradeId, buyerOrderId, sellerOrderId, 4, appliedAt),
-                new OrderIntegrationEvent(
-                        "trade.exchange",
-                        "trade.order.applied",
-                        Map.of("tradeId", tradeId, "buyerOrderId", buyerOrderId, "sellerOrderId", sellerOrderId)));
+                tradeApplication(tradeId, buyerOrderId, sellerOrderId, 4, appliedAt));
     }
 
     private void seedCaughtUpProjection(UUID aggregateId, long version, String status, int remainingAmount) {

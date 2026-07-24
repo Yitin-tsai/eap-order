@@ -14,8 +14,11 @@ public class OrderPublishMetrics {
     private final Counter failed;
     private final Timer confirmDuration;
     private final Timer outboxSelectDuration;
+    private final Timer outboxPublishStageDuration;
     private final Timer outboxPublishEnqueueDuration;
     private final Timer outboxConfirmDuration;
+    private final Timer outboxConfirmWallDuration;
+    private final Timer outboxPostConfirmMarkGapDuration;
     private final Timer outboxMarkSentDuration;
     private final Timer outboxBatchDuration;
 
@@ -34,6 +37,10 @@ public class OrderPublishMetrics {
                 registry,
                 "eap_order_outbox_select_duration",
                 "Time spent selecting pending order outbox records");
+        this.outboxPublishStageDuration = stageTimer(
+                registry,
+                "eap_order_outbox_publish_stage_duration",
+                "Wall-clock time spent in the order outbox publish stage before mark-SENT");
         this.outboxPublishEnqueueDuration = stageTimer(
                 registry,
                 "eap_order_outbox_publish_enqueue_duration",
@@ -42,6 +49,14 @@ public class OrderPublishMetrics {
                 registry,
                 "eap_order_outbox_confirm_duration",
                 "Time spent waiting for RabbitMQ publisher confirms for order outbox records");
+        this.outboxConfirmWallDuration = stageTimer(
+                registry,
+                "eap_order_outbox_confirm_wall_duration",
+                "Batch or chunk wall-clock time spent waiting for RabbitMQ publisher confirms for order outbox records");
+        this.outboxPostConfirmMarkGapDuration = stageTimer(
+                registry,
+                "eap_order_outbox_post_confirm_mark_gap_duration",
+                "Wall-clock gap between completing order outbox publisher confirms and starting mark-SENT");
         this.outboxMarkSentDuration = stageTimer(
                 registry,
                 "eap_order_outbox_mark_sent_duration",
@@ -68,12 +83,24 @@ public class OrderPublishMetrics {
         outboxSelectDuration.record(duration);
     }
 
+    public void recordOutboxPublishStage(Duration duration) {
+        outboxPublishStageDuration.record(duration);
+    }
+
     public void recordOutboxPublishEnqueue(Duration duration) {
         outboxPublishEnqueueDuration.record(duration);
     }
 
     public void recordOutboxConfirm(Duration duration) {
         outboxConfirmDuration.record(duration);
+    }
+
+    public void recordOutboxConfirmWall(Duration duration) {
+        outboxConfirmWallDuration.record(duration);
+    }
+
+    public void recordOutboxPostConfirmMarkGap(Duration duration) {
+        outboxPostConfirmMarkGapDuration.record(duration);
     }
 
     public void recordOutboxMarkSent(Duration duration) {
