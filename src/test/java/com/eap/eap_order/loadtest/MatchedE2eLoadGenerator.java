@@ -1347,7 +1347,7 @@ public class MatchedE2eLoadGenerator {
                 reservationCleanupWait.activeReservations(),
                 offeredLoadRatio,
                 finalQueueBacklog);
-        System.out.printf("  \"actualBuyPublishTps\": %.2f,%n", actualBuyPublishTps);
+        System.out.printf("  \"businessInputOrderTps\": %.2f,%n", actualBuyPublishTps);
         System.out.printf("  \"minOfferedLoadRatio\": %.4f,%n", config.minOfferedLoadRatio());
         System.out.printf("  \"offeredLoadRatio\": %.4f,%n", offeredLoadRatio);
         System.out.printf("  \"validForCapacityComparison\": %s,%n", capacityInvalidReasons.isEmpty());
@@ -1359,15 +1359,13 @@ public class MatchedE2eLoadGenerator {
         double businessCompletedTradeTps = waitResult.completedTrades() / Math.max(elapsedSeconds, 0.001);
         long blendedMarketFlowOrders = (long) sellPublish.published() + buyPublish.published();
         double blendedMarketFlowSeconds = orderbookAdmissionSeconds + elapsedSeconds;
-        System.out.printf("  \"orderbookAdmissionTps\": %.2f,%n",
+        System.out.printf("  \"businessOrderbookAdmissionTps\": %.2f,%n",
                 sellBookWait.readyOrders() / Math.max(orderbookAdmissionSeconds, 0.001));
         System.out.printf("  \"businessCompletedTradeTps\": %.2f,%n", businessCompletedTradeTps);
-        System.out.printf("  \"blendedMarketFlowOrders\": %d,%n", blendedMarketFlowOrders);
-        System.out.printf("  \"blendedMarketFlowSeconds\": %.2f,%n", blendedMarketFlowSeconds);
-        System.out.printf("  \"blendedMarketFlowTps\": %.2f,%n",
+        System.out.printf("  \"businessMarketFlowOrders\": %d,%n", blendedMarketFlowOrders);
+        System.out.printf("  \"businessMarketFlowSeconds\": %.2f,%n", blendedMarketFlowSeconds);
+        System.out.printf("  \"businessMarketFlowTps\": %.2f,%n",
                 blendedMarketFlowOrders / Math.max(blendedMarketFlowSeconds, 0.001));
-        System.out.printf("  \"businessMatchedE2eTps\": %.2f,%n", businessCompletedTradeTps);
-        System.out.printf("  \"matchedE2eTps\": %.2f,%n", businessCompletedTradeTps);
         System.out.printf("  \"businessCompletionSeconds\": %.2f,%n", elapsedSeconds);
         System.out.printf("  \"activeReservationsAtBusinessCompletion\": %d,%n", activeReservationsAtBusinessCompletion);
         System.out.printf("  \"reservationCleanupReachedSeconds\": %.2f,%n", reservationCleanupWait.reachedSeconds());
@@ -1377,17 +1375,15 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"queueReadyDrainedSeconds\": %.2f,%n", waitResult.queueReadyDrainedSeconds());
         System.out.printf("  \"queueFullyDrainedSeconds\": %.2f,%n", waitResult.queueFullyDrainedSeconds());
         System.out.printf("  \"tradeExecutionsReachedSeconds\": %.2f,%n", waitResult.tradeExecutionsReachedSeconds());
-        System.out.printf("  \"tradeExecutionReachTps\": %.2f,%n", rate(config.events(), waitResult.tradeExecutionsReachedSeconds()));
+        System.out.printf("  \"matchEngineTradeExecutionReachTps\": %.2f,%n", rate(config.events(), waitResult.tradeExecutionsReachedSeconds()));
         System.out.printf("  \"orderMatchedReachedSeconds\": %.2f,%n", waitResult.orderMatchedReachedSeconds());
-        System.out.printf("  \"orderCommandMatchReachTps\": %.2f,%n", rate(config.events(), waitResult.orderMatchedReachedSeconds()));
+        System.out.printf("  \"orderTradeApplicationReachTps\": %.2f,%n", rate(config.events(), waitResult.orderMatchedReachedSeconds()));
         System.out.printf("  \"walletSettlementsReachedSeconds\": %.2f,%n", waitResult.walletSettlementsReachedSeconds());
-        System.out.printf("  \"walletSettlementReachTps\": %.2f,%n", rate(config.events(), waitResult.walletSettlementsReachedSeconds()));
+        System.out.printf("  \"walletTradeSettlementReachTps\": %.2f,%n", rate(config.events(), waitResult.walletSettlementsReachedSeconds()));
         System.out.printf("  \"completedTradesReachedSeconds\": %.2f,%n", waitResult.completedTradesReachedSeconds());
         System.out.printf("  \"businessConvergenceReachTps\": %.2f,%n", rate(config.events(), waitResult.completedTradesReachedSeconds()));
-        System.out.printf("  \"completionMarkerReachTps\": %.2f,%n", rate(config.events(), waitResult.completedTradesReachedSeconds()));
         System.out.printf("  \"strictCompletedTradesReachedSeconds\": %.2f,%n", waitResult.strictCompletedTradesReachedSeconds());
         System.out.printf("  \"strictBusinessConvergenceReachTps\": %.2f,%n", rate(config.events(), waitResult.strictCompletedTradesReachedSeconds()));
-        System.out.printf("  \"strictCompletionMarkerReachTps\": %.2f,%n", rate(config.events(), waitResult.strictCompletedTradesReachedSeconds()));
         System.out.printf("  \"orderProjectionCaughtUpSeconds\": %.2f,%n", waitResult.orderProjectionCaughtUpSeconds());
         System.out.printf("  \"orderProjectionLagSeconds\": %.2f,%n", waitResult.orderProjectionLagSeconds());
         System.out.printf("  \"orderMatchedEvents\": %d,%n", waitResult.orderMatchedEvents());
