@@ -24,21 +24,26 @@ import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
@@ -75,6 +80,7 @@ public class MatchedE2eLoadGenerator {
     private static final String AGGREGATE_TYPE = "Order";
     private static final String GENESIS_HASH = "0".repeat(64);
     private static final int SEED_BATCH_PAIRS = 1_000;
+    private static final int BENCHMARK_SCHEMA_VERSION = 2;
     private static final ObjectMapper METRICS_OBJECT_MAPPER = new ObjectMapper();
     private static final ObjectMapper CANONICAL_OBJECT_MAPPER = new ObjectMapper()
             .registerModule(new JavaTimeModule())
@@ -82,11 +88,15 @@ public class MatchedE2eLoadGenerator {
             .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true)
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+    private static final AtomicLong QUEUE_METRICS_READ_FAILURES = new AtomicLong();
+    private static final AtomicLong PUBLISH_RETURNED_MESSAGES = new AtomicLong();
     private static final QueueDrainDiagnostics EMPTY_QUEUE_DRAIN_DIAGNOSTICS =
             new QueueDrainDiagnostics(List.of(), "none", "none", -1, 0, 0);
 
     public static void main(String[] args) throws Exception {
         Config config = Config.from(args);
+        QUEUE_METRICS_READ_FAILURES.set(0);
+        PUBLISH_RETURNED_MESSAGES.set(0);
 
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(EapOrderApplication.class)
                 .profiles("loadtest")
@@ -355,6 +365,7 @@ public class MatchedE2eLoadGenerator {
         long started = System.nanoTime();
         PublishResult buyPublish = publishBuyToMatchEngine(config, rabbitTemplate, pairs);
         WaitResult waitResult = waitForDownstream(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, started);
+        TradeIdSetCheck tradeIdSetCheck = checkTradeIdSets(config, orderJdbc, walletJdbc, matchJdbc);
         double elapsedSeconds = businessCompletionSeconds(waitResult, started);
         long activeReservationsAtBusinessCompletion = countRedisKeys(redisTemplate, "order:reservation:*");
         ReservationCleanupWaitResult reservationCleanupWait = waitForReservationCleanup(config, redisTemplate, started);
@@ -368,6 +379,7 @@ public class MatchedE2eLoadGenerator {
                 orderbookAdmissionSeconds,
                 buyPublish,
                 waitResult,
+                tradeIdSetCheck,
                 elapsedSeconds,
                 activeReservationsAtBusinessCompletion,
                 reservationCleanupWait,
@@ -376,11 +388,17 @@ public class MatchedE2eLoadGenerator {
 
         require(sellPublish.failures() == 0, "SELL publish should have no failures");
         require(buyPublish.failures() == 0, "BUY publish should have no failures");
+        require(sellPublish.published() == config.events(), "SELL publish should be broker-acked for every event");
+        require(buyPublish.published() == config.events(), "BUY publish should be broker-acked for every event");
+        require(sellPublish.brokerNacked() == 0 && buyPublish.brokerNacked() == 0, "Broker should not nack load-test input publishes");
+        require(sellPublish.returned() == 0 && buyPublish.returned() == 0, "Broker should not return unroutable load-test input publishes");
+        require(sellPublish.confirmTimedOut() == 0 && buyPublish.confirmTimedOut() == 0, "Load-test input publisher confirms should not time out");
         require(waitResult.orderCommandMatchedRows() == config.events() * 2L,
                 "Order command state should mark buyer and seller orders as MATCHED");
         require(waitResult.tradeExecutions() == config.events(), "MatchEngine should persist one TradeExecuted per match");
         require(waitResult.completedTrades() == config.events(),
                 "Durable trade convergence should include MatchEngine execution, Order trade application, and Wallet settlement");
+        require(tradeIdSetCheck.equal(), "Durable trade convergence should contain the same trade IDs across MatchEngine, Order, and Wallet");
         require(waitResult.walletTradeSettlements() == config.events(), "Wallet should settle every TradeExecuted exactly once");
         require(waitResult.lockedCurrency() == 0, "Wallet buyer locked currency should be released");
         require(waitResult.lockedAmount() == 0, "Wallet seller locked amount should be released");
@@ -465,6 +483,10 @@ public class MatchedE2eLoadGenerator {
             boolean sell,
             int targetTps) throws InterruptedException {
         AtomicInteger published = new AtomicInteger();
+        AtomicInteger attempted = new AtomicInteger();
+        AtomicInteger brokerNacked = new AtomicInteger();
+        AtomicInteger returned = new AtomicInteger();
+        AtomicInteger confirmTimedOut = new AtomicInteger();
         AtomicInteger failures = new AtomicInteger();
         LongAdder acquireWaitNanos = new LongAdder();
         LongAdder sendNanos = new LongAdder();
@@ -476,6 +498,7 @@ public class MatchedE2eLoadGenerator {
         Semaphore inFlight = new Semaphore(config.publishers() * 2);
 
         long started = System.nanoTime();
+        long returnedBefore = PUBLISH_RETURNED_MESSAGES.get();
         long intervalNanos = targetTps > 0 ? Math.max(1L, 1_000_000_000L / targetTps) : 0L;
         long scheduledIndex = 0;
         for (Pair pair : pairs) {
@@ -494,11 +517,33 @@ public class MatchedE2eLoadGenerator {
                 try {
                     OrderConfirmedEvent event = sell ? pair.sellConfirmed(config.marketId()) : pair.buyConfirmed(config.marketId());
                     long sendStarted = System.nanoTime();
-                    rabbitTemplate.convertAndSend("", MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, event);
+                    CorrelationData correlationData = new CorrelationData(event.getOrderId().toString());
+                    rabbitTemplate.convertAndSend("", MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, event, correlationData);
+                    attempted.incrementAndGet();
+                    CorrelationData.Confirm confirm = correlationData.getFuture()
+                            .get(config.publisherConfirmTimeoutMs(), TimeUnit.MILLISECONDS);
                     long sendElapsed = System.nanoTime() - sendStarted;
                     sendNanos.add(sendElapsed);
                     updateMax(maxSendNanos, sendElapsed);
-                    published.incrementAndGet();
+                    if (confirm.isAck()) {
+                        published.incrementAndGet();
+                    } else {
+                        brokerNacked.incrementAndGet();
+                        if (brokerNacked.get() <= 10) {
+                            System.err.printf("publish nacked: sell=%s, reason=%s%n", sell, confirm.getReason());
+                        }
+                    }
+                } catch (TimeoutException e) {
+                    confirmTimedOut.incrementAndGet();
+                    if (confirmTimedOut.get() <= 10) {
+                        System.err.printf("publish confirm timed out: sell=%s, timeoutMs=%d%n",
+                                sell, config.publisherConfirmTimeoutMs());
+                    }
+                } catch (ExecutionException e) {
+                    failures.incrementAndGet();
+                    if (failures.get() <= 10) {
+                        System.err.printf("publish confirm failed: sell=%s, error=%s%n", sell, e.getMessage());
+                    }
                 } catch (Exception e) {
                     failures.incrementAndGet();
                     if (failures.get() <= 10) {
@@ -515,8 +560,13 @@ public class MatchedE2eLoadGenerator {
         executor.shutdown();
         executor.awaitTermination(30, TimeUnit.SECONDS);
         double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        returned.set(Math.toIntExact(PUBLISH_RETURNED_MESSAGES.get() - returnedBefore));
         return new PublishResult(
                 published.get(),
+                attempted.get(),
+                brokerNacked.get(),
+                returned.get(),
+                confirmTimedOut.get(),
                 failures.get(),
                 elapsedSeconds,
                 targetTps,
@@ -978,6 +1028,74 @@ public class MatchedE2eLoadGenerator {
         return Math.min(tradeExecutions, Math.min(orderTradeApplications, walletTradeSettlements));
     }
 
+    private static TradeIdSetCheck checkTradeIdSets(
+            Config config,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            JdbcTemplate matchJdbc) {
+        Set<String> matchTradeIds = new HashSet<>(matchJdbc.queryForList("""
+                SELECT trade_id
+                FROM match_engine.trade_executions
+                WHERE market_id = ?
+                """, String.class, config.marketId()));
+        Set<String> orderTradeIds = new HashSet<>(tradeIdsForMarketPrefix(
+                orderJdbc,
+                "SELECT trade_id FROM order_service.order_trade_applications WHERE left(trade_id, ?) = ?",
+                config.marketId()));
+        Set<String> walletTradeIds = new HashSet<>(tradeIdsForMarketPrefix(
+                walletJdbc,
+                "SELECT trade_id FROM wallet_service.trade_settlements WHERE left(trade_id, ?) = ?",
+                config.marketId()));
+
+        Set<String> union = new HashSet<>(matchTradeIds);
+        union.addAll(orderTradeIds);
+        union.addAll(walletTradeIds);
+
+        boolean equal = matchTradeIds.equals(orderTradeIds)
+                && matchTradeIds.equals(walletTradeIds)
+                && matchTradeIds.size() == config.events();
+        return new TradeIdSetCheck(
+                equal,
+                matchTradeIds.size(),
+                orderTradeIds.size(),
+                walletTradeIds.size(),
+                union.size(),
+                missingFrom(union, matchTradeIds),
+                missingFrom(union, orderTradeIds),
+                missingFrom(union, walletTradeIds),
+                fingerprint(union));
+    }
+
+    private static List<String> tradeIdsForMarketPrefix(JdbcTemplate jdbcTemplate, String sql, String marketId) {
+        String prefix = marketId + "-";
+        return jdbcTemplate.queryForList(sql, String.class, prefix.length(), prefix);
+    }
+
+    private static int missingFrom(Set<String> expected, Set<String> actual) {
+        int missing = 0;
+        for (String value : expected) {
+            if (!actual.contains(value)) {
+                missing++;
+            }
+        }
+        return missing;
+    }
+
+    private static String fingerprint(Set<String> tradeIds) {
+        List<String> sorted = new ArrayList<>(tradeIds);
+        sorted.sort(String::compareTo);
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (String tradeId : sorted) {
+                digest.update(tradeId.getBytes(StandardCharsets.UTF_8));
+                digest.update((byte) 0);
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
     private static void truncateOrderTestData(JdbcTemplate jdbcTemplate) {
         jdbcTemplate.execute("""
                 TRUNCATE TABLE
@@ -1159,6 +1277,8 @@ public class MatchedE2eLoadGenerator {
         connectionFactory.setUsername(config.rabbitUser());
         connectionFactory.setPassword(config.rabbitPassword());
         connectionFactory.setChannelCacheSize(config.publisherChannelCacheSize());
+        connectionFactory.setPublisherConfirmType(CachingConnectionFactory.ConfirmType.CORRELATED);
+        connectionFactory.setPublisherReturns(true);
         return connectionFactory;
     }
 
@@ -1166,6 +1286,7 @@ public class MatchedE2eLoadGenerator {
         RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
         rabbitTemplate.setMessageConverter(new Jackson2JsonMessageConverter(objectMapper));
         rabbitTemplate.setMandatory(true);
+        rabbitTemplate.setReturnsCallback(message -> PUBLISH_RETURNED_MESSAGES.incrementAndGet());
         return rabbitTemplate;
     }
 
@@ -1269,6 +1390,7 @@ public class MatchedE2eLoadGenerator {
                     .build();
             HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                QUEUE_METRICS_READ_FAILURES.incrementAndGet();
                 return new QueueDepth(queueReady(rabbitAdmin, queueName), 0, queueReady(rabbitAdmin, queueName));
             }
             JsonNode json = METRICS_OBJECT_MAPPER.readTree(response.body());
@@ -1280,6 +1402,7 @@ public class MatchedE2eLoadGenerator {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
+            QUEUE_METRICS_READ_FAILURES.incrementAndGet();
             long ready = queueReady(rabbitAdmin, queueName);
             return new QueueDepth(ready, 0, ready);
         }
@@ -1301,6 +1424,7 @@ public class MatchedE2eLoadGenerator {
             double orderbookAdmissionSeconds,
             PublishResult buyPublish,
             WaitResult waitResult,
+            TradeIdSetCheck tradeIdSetCheck,
             double elapsedSeconds,
             long activeReservationsAtBusinessCompletion,
             ReservationCleanupWaitResult reservationCleanupWait,
@@ -1308,20 +1432,32 @@ public class MatchedE2eLoadGenerator {
             long remainingBuyOrders) {
         System.out.println("{");
         System.out.printf("  \"mode\": \"matchedE2e\",%n");
+        System.out.printf("  \"benchmarkSchemaVersion\": %d,%n", BENCHMARK_SCHEMA_VERSION);
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"matches\": %d,%n", config.events());
         System.out.printf("  \"publishers\": %d,%n", config.publishers());
         System.out.printf("  \"publisherChannelCacheSize\": %d,%n", config.publisherChannelCacheSize());
+        System.out.printf("  \"publisherConfirmTimeoutMs\": %d,%n", config.publisherConfirmTimeoutMs());
         System.out.printf("  \"targetTps\": %d,%n", config.targetTps());
         System.out.printf("  \"durationSeconds\": %d,%n", config.durationSeconds());
         System.out.printf("  \"expectedBuyPublishSeconds\": %.2f,%n", config.expectedBuyPublishSeconds());
         System.out.printf("  \"sellPublished\": %d,%n", sellPublish.published());
+        System.out.printf("  \"sellPublishAttempts\": %d,%n", sellPublish.attempted());
+        System.out.printf("  \"sellPublishBrokerAcked\": %d,%n", sellPublish.published());
+        System.out.printf("  \"sellPublishBrokerNacked\": %d,%n", sellPublish.brokerNacked());
+        System.out.printf("  \"sellPublishReturned\": %d,%n", sellPublish.returned());
+        System.out.printf("  \"sellPublishConfirmTimedOut\": %d,%n", sellPublish.confirmTimedOut());
         System.out.printf("  \"sellPublishFailures\": %d,%n", sellPublish.failures());
         System.out.printf("  \"sellPublishSeconds\": %.2f,%n", sellPublish.elapsedSeconds());
         System.out.printf("  \"sellBookReachedOrders\": %d,%n", sellBookWait.readyOrders());
         System.out.printf("  \"sellBookPostPublishWaitSeconds\": %.2f,%n", sellBookWait.elapsedSeconds());
         System.out.printf("  \"orderbookAdmissionSeconds\": %.2f,%n", orderbookAdmissionSeconds);
         System.out.printf("  \"buyPublished\": %d,%n", buyPublish.published());
+        System.out.printf("  \"buyPublishAttempts\": %d,%n", buyPublish.attempted());
+        System.out.printf("  \"buyPublishBrokerAcked\": %d,%n", buyPublish.published());
+        System.out.printf("  \"buyPublishBrokerNacked\": %d,%n", buyPublish.brokerNacked());
+        System.out.printf("  \"buyPublishReturned\": %d,%n", buyPublish.returned());
+        System.out.printf("  \"buyPublishConfirmTimedOut\": %d,%n", buyPublish.confirmTimedOut());
         System.out.printf("  \"buyPublishFailures\": %d,%n", buyPublish.failures());
         System.out.printf("  \"buyPublishSeconds\": %.2f,%n", buyPublish.elapsedSeconds());
         System.out.printf("  \"sellPublishAcquireWaitSeconds\": %.4f,%n", sellPublish.acquireWaitSeconds());
@@ -1345,8 +1481,10 @@ public class MatchedE2eLoadGenerator {
                 remainingSellOrders,
                 remainingBuyOrders,
                 reservationCleanupWait.activeReservations(),
+                tradeIdSetCheck,
                 offeredLoadRatio,
-                finalQueueBacklog);
+                finalQueueBacklog,
+                QUEUE_METRICS_READ_FAILURES.get());
         System.out.printf("  \"businessInputOrderTps\": %.2f,%n", actualBuyPublishTps);
         System.out.printf("  \"minOfferedLoadRatio\": %.4f,%n", config.minOfferedLoadRatio());
         System.out.printf("  \"offeredLoadRatio\": %.4f,%n", offeredLoadRatio);
@@ -1396,6 +1534,15 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"tradeExecutions\": %d,%n", waitResult.tradeExecutions());
         System.out.printf("  \"completedTrades\": %d,%n", waitResult.completedTrades());
         System.out.printf("  \"walletTradeSettlements\": %d,%n", waitResult.walletTradeSettlements());
+        System.out.printf("  \"completedTradeIdSetsEqual\": %s,%n", tradeIdSetCheck.equal());
+        System.out.printf("  \"matchTradeIdCount\": %d,%n", tradeIdSetCheck.matchCount());
+        System.out.printf("  \"orderTradeIdCount\": %d,%n", tradeIdSetCheck.orderCount());
+        System.out.printf("  \"walletTradeIdCount\": %d,%n", tradeIdSetCheck.walletCount());
+        System.out.printf("  \"tradeIdUnionCount\": %d,%n", tradeIdSetCheck.unionCount());
+        System.out.printf("  \"tradeIdsMissingInMatch\": %d,%n", tradeIdSetCheck.missingInMatch());
+        System.out.printf("  \"tradeIdsMissingInOrder\": %d,%n", tradeIdSetCheck.missingInOrder());
+        System.out.printf("  \"tradeIdsMissingInWallet\": %d,%n", tradeIdSetCheck.missingInWallet());
+        System.out.printf("  \"tradeIdSetFingerprint\": \"%s\",%n", tradeIdSetCheck.fingerprint());
         System.out.printf("  \"lockedCurrency\": %d,%n", waitResult.lockedCurrency());
         System.out.printf("  \"lockedAmount\": %d,%n", waitResult.lockedAmount());
         System.out.printf("  \"buyerAvailableAmount\": %d,%n", waitResult.buyerAvailableAmount());
@@ -1437,6 +1584,7 @@ public class MatchedE2eLoadGenerator {
         printQueueDrainTimeline(waitResult.queueDrainDiagnostics());
         System.out.println(",");
         System.out.printf("  \"finalQueueBacklog\": %d,%n", finalQueueBacklog);
+        System.out.printf("  \"queueMetricsReadFailures\": %d,%n", QUEUE_METRICS_READ_FAILURES.get());
         System.out.printf("  \"remainingSellOrders\": %d,%n", remainingSellOrders);
         System.out.printf("  \"remainingBuyOrders\": %d,%n", remainingBuyOrders);
         System.out.printf("  \"activeReservations\": %d%n", reservationCleanupWait.activeReservations());
@@ -1451,8 +1599,10 @@ public class MatchedE2eLoadGenerator {
             long remainingSellOrders,
             long remainingBuyOrders,
             long activeReservations,
+            TradeIdSetCheck tradeIdSetCheck,
             double offeredLoadRatio,
-            long finalQueueBacklog) {
+            long finalQueueBacklog,
+            long queueMetricsReadFailures) {
         List<String> reasons = new ArrayList<>();
         if (config.targetTps() > 0 && offeredLoadRatio < config.minOfferedLoadRatio()) {
             reasons.add("driver_offered_tps_below_threshold");
@@ -1463,6 +1613,21 @@ public class MatchedE2eLoadGenerator {
         if (sellPublish.failures() != 0) {
             reasons.add("sell_publish_failures");
         }
+        if (buyPublish.published() != config.events()) {
+            reasons.add("buy_publish_broker_ack_mismatch");
+        }
+        if (sellPublish.published() != config.events()) {
+            reasons.add("sell_publish_broker_ack_mismatch");
+        }
+        if (buyPublish.brokerNacked() != 0 || sellPublish.brokerNacked() != 0) {
+            reasons.add("publish_broker_nacks");
+        }
+        if (buyPublish.returned() != 0 || sellPublish.returned() != 0) {
+            reasons.add("publish_returns");
+        }
+        if (buyPublish.confirmTimedOut() != 0 || sellPublish.confirmTimedOut() != 0) {
+            reasons.add("publish_confirm_timeouts");
+        }
         if (waitResult.completedTrades() != config.events()) {
             reasons.add("completed_trades_mismatch");
         }
@@ -1471,6 +1636,9 @@ public class MatchedE2eLoadGenerator {
         }
         if (waitResult.walletTradeSettlements() != config.events()) {
             reasons.add("wallet_settlements_mismatch");
+        }
+        if (!tradeIdSetCheck.equal()) {
+            reasons.add("completed_trade_id_set_mismatch");
         }
         if (waitResult.orderCommandMatchedRows() != config.events() * 2L) {
             reasons.add("order_command_rows_mismatch");
@@ -1486,6 +1654,9 @@ public class MatchedE2eLoadGenerator {
         }
         if (finalQueueBacklog != 0) {
             reasons.add("final_queue_backlog");
+        }
+        if (queueMetricsReadFailures != 0) {
+            reasons.add("queue_metrics_read_failures");
         }
         return reasons;
     }
@@ -1574,6 +1745,10 @@ public class MatchedE2eLoadGenerator {
 
     private record PublishResult(
             int published,
+            int attempted,
+            int brokerNacked,
+            int returned,
+            int confirmTimedOut,
             int failures,
             double elapsedSeconds,
             int targetTps,
@@ -1585,6 +1760,18 @@ public class MatchedE2eLoadGenerator {
     }
 
     private record SellBookWaitResult(long readyOrders, double elapsedSeconds) {
+    }
+
+    private record TradeIdSetCheck(
+            boolean equal,
+            int matchCount,
+            int orderCount,
+            int walletCount,
+            int unionCount,
+            int missingInMatch,
+            int missingInOrder,
+            int missingInWallet,
+            String fingerprint) {
     }
 
     private record QueueDepth(long ready, long unacked, long total) {
@@ -1825,6 +2012,7 @@ public class MatchedE2eLoadGenerator {
             String rabbitHost,
             int rabbitPort,
             int publisherChannelCacheSize,
+            int publisherConfirmTimeoutMs,
             int rabbitManagementPort,
             String rabbitUser,
             String rabbitPassword,
@@ -1863,6 +2051,7 @@ public class MatchedE2eLoadGenerator {
                     stringArg(args, "--rabbit-host", "localhost"),
                     intArg(args, "--rabbit-port", 5672),
                     intArg(args, "--publisher-channel-cache-size", Math.max(128, intArg(args, "--publishers", 16) * 2)),
+                    intArg(args, "--publisher-confirm-timeout-ms", 5000),
                     intArg(args, "--rabbit-management-port", 15672),
                     stringArg(args, "--rabbit-user", "admin"),
                     stringArg(args, "--rabbit-pass", "admin123"),
