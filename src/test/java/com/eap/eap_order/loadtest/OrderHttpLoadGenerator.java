@@ -188,6 +188,7 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"users\": %d,%n", config.users());
         System.out.printf("  \"targetTps\": %d,%n", config.tps());
         System.out.printf("  \"resetData\": %s,%n", config.resetData());
+        System.out.printf("  \"flushRedisOnReset\": %s,%n", config.flushRedisOnReset());
         System.out.printf("  \"httpAccepted\": %d,%n", accepted.get());
         System.out.printf("  \"http429\": %d,%n", tooManyRequests.get());
         System.out.printf("  \"http503\": %d,%n", unavailable.get());
@@ -257,9 +258,13 @@ public class OrderHttpLoadGenerator {
         truncateOrderAdmissionOrderData(config);
         truncateOrderAdmissionWalletData(config);
         purgeQueues(config, httpClient, objectMapper);
-        redisDel(config,
-                orderbookKey(config.marketId(), "buy"),
-                orderbookKey(config.marketId(), "sell"));
+        if (config.flushRedisOnReset()) {
+            redisCommand(config, command("FLUSHDB"));
+        } else {
+            redisDel(config,
+                    orderbookKey(config.marketId(), "buy"),
+                    orderbookKey(config.marketId(), "sell"));
+        }
     }
 
     private static void truncateOrderAdmissionOrderData(Config config) throws Exception {
@@ -797,7 +802,8 @@ public class OrderHttpLoadGenerator {
             int redisPort,
             String rabbitManagementUrl,
             String rabbitManagementUser,
-            String rabbitManagementPassword) {
+            String rabbitManagementPassword,
+            boolean flushRedisOnReset) {
         private static Config from(String[] args) {
             int tps = intArg(args, "--tps", 1000);
             int durationSeconds = intArg(args, "--duration-seconds", 0);
@@ -834,7 +840,8 @@ public class OrderHttpLoadGenerator {
                     intArg(args, "--redis-port", 6379),
                     stringArg(args, "--rabbit-management-url", DEFAULT_RABBIT_MANAGEMENT_URL),
                     stringArg(args, "--rabbit-management-user", "admin"),
-                    stringArg(args, "--rabbit-management-password", "admin123")
+                    stringArg(args, "--rabbit-management-password", "admin123"),
+                    booleanArg(args, "--flush-redis-on-reset", false)
             );
         }
 
