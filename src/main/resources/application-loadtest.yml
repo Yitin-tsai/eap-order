@@ -23,6 +23,8 @@ eap:
     listeners:
       asset-reservation-confirmed:
         concurrency: 16
+        batch-size: 50
+        receive-timeout-ms: 25
       asset-reservation-failed:
         concurrency: 4
       order-matched:
@@ -32,10 +34,10 @@ eap:
         batch-size: 50
         receive-timeout-ms: 25
   order-event-outbox:
-    batch-size: 500
-    publish-concurrency: 1
-    batch-confirm-enabled: ${EAP_ORDER_OUTBOX_BATCH_CONFIRM_ENABLED:false}
-    poll-interval-ms: 100
+    batch-size: ${EAP_ORDER_OUTBOX_BATCH_SIZE:1000}
+    publish-concurrency: ${EAP_ORDER_OUTBOX_PUBLISH_CONCURRENCY:1}
+    batch-confirm-enabled: ${EAP_ORDER_OUTBOX_BATCH_CONFIRM_ENABLED:true}
+    poll-interval-ms: ${EAP_ORDER_OUTBOX_POLL_INTERVAL_MS:100}
   order-projection:
     enabled: true
     batch-size: 500

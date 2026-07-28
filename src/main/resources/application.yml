@@ -89,6 +89,8 @@ eap:
     listeners:
       asset-reservation-confirmed:
         concurrency: 8
+        batch-size: 1
+        receive-timeout-ms: 50
       asset-reservation-failed:
         concurrency: 4
       order-matched:

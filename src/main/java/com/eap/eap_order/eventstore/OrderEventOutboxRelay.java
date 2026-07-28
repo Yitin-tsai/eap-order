@@ -101,6 +101,7 @@ public class OrderEventOutboxRelay {
             if (rows.isEmpty()) {
                 return;
             }
+            metrics.recordOutboxBatchSize(rows.size());
 
             List<PublishAttempt> attempts = new ArrayList<>(rows.size());
             boolean batchSucceeded = true;
@@ -128,8 +129,10 @@ public class OrderEventOutboxRelay {
             if (batchConfirmEnabled) {
                 confirmed.addAll(attempts);
             } else {
+                boolean firstConfirm = true;
                 for (PublishAttempt attempt : attempts) {
                     Instant confirmStartedAt = Instant.now();
+                    Duration confirmDuration;
                     try {
                         long remaining = deadline - System.nanoTime();
                         if (remaining <= 0) {
@@ -153,7 +156,14 @@ public class OrderEventOutboxRelay {
                         metrics.failed();
                         metrics.recordDuration(Duration.between(attempt.startedAt(), Instant.now()));
                     } finally {
-                        metrics.recordOutboxConfirm(Duration.between(confirmStartedAt, Instant.now()));
+                        confirmDuration = Duration.between(confirmStartedAt, Instant.now());
+                        metrics.recordOutboxConfirm(confirmDuration);
+                        if (firstConfirm) {
+                            metrics.recordOutboxFirstConfirm(confirmDuration);
+                            firstConfirm = false;
+                        } else {
+                            metrics.recordOutboxRemainingConfirm(confirmDuration);
+                        }
                     }
                 }
             }
@@ -163,6 +173,7 @@ public class OrderEventOutboxRelay {
             }
 
             if (!confirmed.isEmpty()) {
+                metrics.recordOutboxConfirmedBatchSize(confirmed.size());
                 metrics.recordOutboxPostConfirmMarkGap(Duration.between(confirmStageCompletedAt, Instant.now()));
                 List<Long> ids = confirmed.stream().map(a -> a.row().id()).toList();
                 Instant markStartedAt = Instant.now();
@@ -246,6 +257,7 @@ public class OrderEventOutboxRelay {
         }
         Duration perMessageDuration = confirmDuration.dividedBy(confirmedCount);
         metrics.recordOutboxConfirmWall(confirmDuration);
+        metrics.recordOutboxFirstConfirm(confirmDuration);
         for (int i = 0; i < confirmedCount; i++) {
             metrics.recordOutboxConfirm(perMessageDuration);
         }

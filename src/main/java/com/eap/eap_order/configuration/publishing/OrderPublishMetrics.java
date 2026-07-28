@@ -1,6 +1,7 @@
 package com.eap.eap_order.configuration.publishing;
 
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Component;
@@ -17,10 +18,14 @@ public class OrderPublishMetrics {
     private final Timer outboxPublishStageDuration;
     private final Timer outboxPublishEnqueueDuration;
     private final Timer outboxConfirmDuration;
+    private final Timer outboxFirstConfirmDuration;
+    private final Timer outboxRemainingConfirmDuration;
     private final Timer outboxConfirmWallDuration;
     private final Timer outboxPostConfirmMarkGapDuration;
     private final Timer outboxMarkSentDuration;
     private final Timer outboxBatchDuration;
+    private final DistributionSummary outboxBatchSize;
+    private final DistributionSummary outboxConfirmedBatchSize;
 
     public OrderPublishMetrics(MeterRegistry registry) {
         this.confirmed = Counter.builder("eap_order_submitted_publish_confirmed_total")
@@ -49,6 +54,14 @@ public class OrderPublishMetrics {
                 registry,
                 "eap_order_outbox_confirm_duration",
                 "Time spent waiting for RabbitMQ publisher confirms for order outbox records");
+        this.outboxFirstConfirmDuration = stageTimer(
+                registry,
+                "eap_order_outbox_first_confirm_duration",
+                "Time spent waiting for the first RabbitMQ publisher confirm in an order outbox chunk");
+        this.outboxRemainingConfirmDuration = stageTimer(
+                registry,
+                "eap_order_outbox_remaining_confirm_duration",
+                "Time spent waiting for RabbitMQ publisher confirms after the first confirmed order outbox record in a chunk");
         this.outboxConfirmWallDuration = stageTimer(
                 registry,
                 "eap_order_outbox_confirm_wall_duration",
@@ -65,6 +78,12 @@ public class OrderPublishMetrics {
                 registry,
                 "eap_order_outbox_batch_duration",
                 "Wall-clock time spent processing one order outbox relay batch");
+        this.outboxBatchSize = DistributionSummary.builder("eap_order_outbox_batch_size")
+                .description("Number of order outbox records selected per relay batch")
+                .register(registry);
+        this.outboxConfirmedBatchSize = DistributionSummary.builder("eap_order_outbox_confirmed_batch_size")
+                .description("Number of order outbox records marked SENT per relay batch")
+                .register(registry);
     }
 
     public void confirmed() {
@@ -95,6 +114,14 @@ public class OrderPublishMetrics {
         outboxConfirmDuration.record(duration);
     }
 
+    public void recordOutboxFirstConfirm(Duration duration) {
+        outboxFirstConfirmDuration.record(duration);
+    }
+
+    public void recordOutboxRemainingConfirm(Duration duration) {
+        outboxRemainingConfirmDuration.record(duration);
+    }
+
     public void recordOutboxConfirmWall(Duration duration) {
         outboxConfirmWallDuration.record(duration);
     }
@@ -109,6 +136,14 @@ public class OrderPublishMetrics {
 
     public void recordOutboxBatch(Duration duration) {
         outboxBatchDuration.record(duration);
+    }
+
+    public void recordOutboxBatchSize(int size) {
+        outboxBatchSize.record(size);
+    }
+
+    public void recordOutboxConfirmedBatchSize(int size) {
+        outboxConfirmedBatchSize.record(size);
     }
 
     private Timer stageTimer(MeterRegistry registry, String name, String description) {

@@ -51,7 +51,7 @@ tasks.named('test') {
 
 tasks.register('orderHttpLoadTest', JavaExec) {
     group = 'verification'
-    description = 'Load test Order HTTP acceptance only; it does not yet gate Wallet reservation or MatchEngine orderbook admission.'
+    description = 'Load test Order HTTP acceptance and optional order-admission-chain convergence gate.'
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_order.loadtest.OrderHttpLoadGenerator'
 }
