@@ -1613,7 +1613,7 @@ public class MatchedE2eLoadGenerator {
             long remainingSellOrders,
             long remainingBuyOrders) {
         System.out.println("{");
-        System.out.printf("  \"mode\": \"matchedE2e\",%n");
+        System.out.printf("  \"mode\": \"matchedTradeCompletionChain\",%n");
         System.out.printf("  \"benchmarkSchemaVersion\": %d,%n", BENCHMARK_SCHEMA_VERSION);
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"matches\": %d,%n", config.events());
@@ -1794,7 +1794,7 @@ public class MatchedE2eLoadGenerator {
         double offeredLoadRatio = config.targetTps() > 0 ? inputBrokerAckedOrderTps / config.targetTps() : 1.0;
 
         System.out.println("{");
-        System.out.printf("  \"mode\": \"matchedE2ePublishOnly\",%n");
+        System.out.printf("  \"mode\": \"rabbitmqPublishOnly\",%n");
         System.out.printf("  \"benchmarkSchemaVersion\": %d,%n", BENCHMARK_SCHEMA_VERSION);
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"messages\": %d,%n", config.events());

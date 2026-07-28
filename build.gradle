@@ -51,14 +51,14 @@ tasks.named('test') {
 
 tasks.register('orderHttpLoadTest', JavaExec) {
     group = 'verification'
-    description = 'Load test the complete HTTP order-to-wallet path.'
+    description = 'Load test Order HTTP acceptance only; it does not yet gate Wallet reservation or MatchEngine orderbook admission.'
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_order.loadtest.OrderHttpLoadGenerator'
 }
 
 tasks.register('matchedE2eLoadTest', JavaExec) {
     group = 'verification'
-    description = 'Seed valid Order/Wallet state and drive matchEngine -> Order/Wallet matched E2E through RabbitMQ.'
+    description = 'Seed valid Order/Wallet state and drive the matched-trade-completion chain through RabbitMQ.'
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_order.loadtest.MatchedE2eLoadGenerator'
     systemProperty 'spring.profiles.active', 'loadtest'
