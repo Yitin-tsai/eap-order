@@ -186,6 +186,36 @@ public class OrderHttpLoadGenerator {
         PrometheusTimerSnapshot orderOutboxBatch = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_batch_duration", "")
                 : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendTransactionTotal = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"transaction_total\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendTransactionBody = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"transaction_body\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendCreateHead = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"create_head_if_absent\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendLockHead = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"lock_head\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendSerialize = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"serialize_payload_metadata\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendComputeHash = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"compute_hash\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendInsertEvent = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"insert_event\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendUpdateHead = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"update_head_and_matching_state\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendInsertOutbox = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"insert_outbox\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendInitialAppendCte = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"initial_append_cte\"")
+                : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderAssetReservationListener = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_asset_reservation_confirmed_listener_duration", "")
                 : PrometheusTimerSnapshot.empty();
@@ -298,6 +328,36 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"orderOutboxBatchCount\": %.0f,%n", orderOutboxBatch.count());
         System.out.printf("  \"orderOutboxBatchSumSeconds\": %.6f,%n", orderOutboxBatch.sumSeconds());
         System.out.printf("  \"orderOutboxBatchMeanMs\": %.3f,%n", orderOutboxBatch.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendTransactionTotalCount\": %.0f,%n", orderSubmissionAppendTransactionTotal.count());
+        System.out.printf("  \"orderSubmissionAppendTransactionTotalSumSeconds\": %.6f,%n", orderSubmissionAppendTransactionTotal.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendTransactionTotalMeanMs\": %.3f,%n", orderSubmissionAppendTransactionTotal.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendTransactionBodyCount\": %.0f,%n", orderSubmissionAppendTransactionBody.count());
+        System.out.printf("  \"orderSubmissionAppendTransactionBodySumSeconds\": %.6f,%n", orderSubmissionAppendTransactionBody.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendTransactionBodyMeanMs\": %.3f,%n", orderSubmissionAppendTransactionBody.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendCreateHeadCount\": %.0f,%n", orderSubmissionAppendCreateHead.count());
+        System.out.printf("  \"orderSubmissionAppendCreateHeadSumSeconds\": %.6f,%n", orderSubmissionAppendCreateHead.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendCreateHeadMeanMs\": %.3f,%n", orderSubmissionAppendCreateHead.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendLockHeadCount\": %.0f,%n", orderSubmissionAppendLockHead.count());
+        System.out.printf("  \"orderSubmissionAppendLockHeadSumSeconds\": %.6f,%n", orderSubmissionAppendLockHead.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendLockHeadMeanMs\": %.3f,%n", orderSubmissionAppendLockHead.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendSerializeCount\": %.0f,%n", orderSubmissionAppendSerialize.count());
+        System.out.printf("  \"orderSubmissionAppendSerializeSumSeconds\": %.6f,%n", orderSubmissionAppendSerialize.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendSerializeMeanMs\": %.3f,%n", orderSubmissionAppendSerialize.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendComputeHashCount\": %.0f,%n", orderSubmissionAppendComputeHash.count());
+        System.out.printf("  \"orderSubmissionAppendComputeHashSumSeconds\": %.6f,%n", orderSubmissionAppendComputeHash.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendComputeHashMeanMs\": %.3f,%n", orderSubmissionAppendComputeHash.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendInsertEventCount\": %.0f,%n", orderSubmissionAppendInsertEvent.count());
+        System.out.printf("  \"orderSubmissionAppendInsertEventSumSeconds\": %.6f,%n", orderSubmissionAppendInsertEvent.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendInsertEventMeanMs\": %.3f,%n", orderSubmissionAppendInsertEvent.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendUpdateHeadCount\": %.0f,%n", orderSubmissionAppendUpdateHead.count());
+        System.out.printf("  \"orderSubmissionAppendUpdateHeadSumSeconds\": %.6f,%n", orderSubmissionAppendUpdateHead.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendUpdateHeadMeanMs\": %.3f,%n", orderSubmissionAppendUpdateHead.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendInsertOutboxCount\": %.0f,%n", orderSubmissionAppendInsertOutbox.count());
+        System.out.printf("  \"orderSubmissionAppendInsertOutboxSumSeconds\": %.6f,%n", orderSubmissionAppendInsertOutbox.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendInsertOutboxMeanMs\": %.3f,%n", orderSubmissionAppendInsertOutbox.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendInitialAppendCteCount\": %.0f,%n", orderSubmissionAppendInitialAppendCte.count());
+        System.out.printf("  \"orderSubmissionAppendInitialAppendCteSumSeconds\": %.6f,%n", orderSubmissionAppendInitialAppendCte.sumSeconds());
+        System.out.printf("  \"orderSubmissionAppendInitialAppendCteMeanMs\": %.3f,%n", orderSubmissionAppendInitialAppendCte.meanMillis());
         System.out.printf("  \"orderAssetReservationConfirmedListenerCount\": %.0f,%n", orderAssetReservationListener.count());
         System.out.printf("  \"orderAssetReservationConfirmedListenerSumSeconds\": %.6f,%n", orderAssetReservationListener.sumSeconds());
         System.out.printf("  \"orderAssetReservationConfirmedListenerMeanMs\": %.3f,%n", orderAssetReservationListener.meanMillis());

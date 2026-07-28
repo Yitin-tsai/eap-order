@@ -1,6 +1,8 @@
 package com.eap.eap_order.eventstore;
 
+import com.eap.common.event.OrderSubmittedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
@@ -91,6 +93,45 @@ class OrderEventAppenderPostgresIT {
         assertEquals(1, count("order_event_store", aggregateId));
         assertEquals(1, count("order_event_outbox", aggregateId));
         assertEquals(1, count("order_stream_heads", aggregateId));
+    }
+
+    @Test
+    void appendInitialOrderSubmission_shouldUseFastPathAndCreateCommandStateAndOutbox() {
+        UUID aggregateId = aggregateId();
+        UUID userId = UUID.randomUUID();
+        UUID eventId = UUID.nameUUIDFromBytes(
+                (aggregateId + ":REQUESTED").getBytes(StandardCharsets.UTF_8));
+        LocalDateTime occurredAt = LocalDateTime.now();
+        OrderSubmissionRequestedV1 domainEvent = new OrderSubmissionRequestedV1(
+                aggregateId, userId, "ENERGY-SPOT", 123L, "SELL", 10, 3, occurredAt);
+        OrderSubmittedEvent integrationEvent = OrderSubmittedEvent.builder()
+                .orderId(aggregateId)
+                .userId(userId)
+                .marketId("ENERGY-SPOT")
+                .marketSequence(123L)
+                .orderType("SELL")
+                .price(10)
+                .amount(3)
+                .createdAt(occurredAt)
+                .build();
+
+        OrderEventAppendResult result = appender.append(new OrderEventAppendCommand(
+                aggregateId,
+                0,
+                eventId,
+                "OrderSubmissionRequestedV1",
+                domainEvent,
+                Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
+                1,
+                occurredAt,
+                new OrderIntegrationEvent("order.exchange", "order.submitted", integrationEvent)));
+
+        assertFalse(result.duplicate());
+        assertEquals(1, result.aggregateVersion());
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertEquals(1, count("order_event_outbox", aggregateId));
+        assertEquals(1, count("order_stream_heads", aggregateId));
+        assertMatchingState(aggregateId, 3, 0, "PENDING_ASSET_CHECK");
     }
 
     @Test

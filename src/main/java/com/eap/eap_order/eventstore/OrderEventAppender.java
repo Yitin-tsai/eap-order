@@ -118,6 +118,7 @@ public class OrderEventAppender {
     private final TransactionTemplate consumerTransactionTemplate;
     private final ObjectMapper canonicalObjectMapper;
     private final OrderTradeApplyMetrics tradeApplyMetrics;
+    private final OrderSubmissionAppendMetrics submissionAppendMetrics;
 
     public OrderEventAppender(
             @Qualifier("namedParameterJdbcTemplate") NamedParameterJdbcTemplate commandJdbc,
@@ -125,19 +126,38 @@ public class OrderEventAppender {
             @Qualifier("transactionManager") PlatformTransactionManager transactionManager,
             @Qualifier("orderConsumerTransactionManager") PlatformTransactionManager consumerTransactionManager,
             ObjectMapper objectMapper,
-            OrderTradeApplyMetrics tradeApplyMetrics) {
+            OrderTradeApplyMetrics tradeApplyMetrics,
+            OrderSubmissionAppendMetrics submissionAppendMetrics) {
         this.commandJdbc = commandJdbc;
         this.consumerJdbc = consumerJdbc;
         this.commandTransactionTemplate = new TransactionTemplate(transactionManager);
         this.consumerTransactionTemplate = new TransactionTemplate(consumerTransactionManager);
         this.tradeApplyMetrics = tradeApplyMetrics;
+        this.submissionAppendMetrics = submissionAppendMetrics;
         this.canonicalObjectMapper = objectMapper.copy()
                 .configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true)
                 .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
     }
 
     public OrderEventAppendResult append(OrderEventAppendCommand command) {
-        return commandTransactionTemplate.execute(status -> appendInTransaction(command, commandJdbc));
+        boolean recordSubmissionAppend = command.payload() instanceof OrderSubmissionRequestedV1;
+        long startedNanos = System.nanoTime();
+        try {
+            return commandTransactionTemplate.execute(status -> {
+                long bodyStartedNanos = System.nanoTime();
+                try {
+                    return appendInTransaction(command, commandJdbc, recordSubmissionAppend);
+                } finally {
+                    if (recordSubmissionAppend) {
+                        submissionAppendMetrics.record("transaction_body", bodyStartedNanos);
+                    }
+                }
+            });
+        } finally {
+            if (recordSubmissionAppend) {
+                submissionAppendMetrics.record("transaction_total", startedNanos);
+            }
+        }
     }
 
     public OrderEventAppendResult appendFromConsumer(OrderEventAppendCommand command) {
@@ -234,11 +254,146 @@ public class OrderEventAppender {
     private OrderEventAppendResult appendInTransaction(
             OrderEventAppendCommand command,
             NamedParameterJdbcTemplate jdbc) {
-        if (command.expectedVersion() == 0) {
-            createHeadIfAbsent(jdbc, command.aggregateId());
+        return appendInTransaction(command, jdbc, false);
+    }
+
+    private OrderEventAppendResult appendInTransaction(
+            OrderEventAppendCommand command,
+            NamedParameterJdbcTemplate jdbc,
+            boolean recordSubmissionAppend) {
+        if (recordSubmissionAppend && command.integrationEvent() != null) {
+            OrderEventAppendResult fastPathResult = tryAppendInitialSubmissionFastPath(command, jdbc);
+            if (fastPathResult != null) {
+                return fastPathResult;
+            }
         }
+        if (command.expectedVersion() == 0) {
+            long createHeadStartedNanos = System.nanoTime();
+            createHeadIfAbsent(jdbc, command.aggregateId());
+            if (recordSubmissionAppend) {
+                submissionAppendMetrics.record("create_head_if_absent", createHeadStartedNanos);
+            }
+        }
+        long lockHeadStartedNanos = System.nanoTime();
         StreamHead head = lockHead(jdbc, command.aggregateId());
-        return appendInTransactionWithLockedHead(command, jdbc, head);
+        if (recordSubmissionAppend) {
+            submissionAppendMetrics.record("lock_head", lockHeadStartedNanos);
+        }
+        return appendInTransactionWithLockedHead(command, jdbc, head, recordSubmissionAppend);
+    }
+
+    private OrderEventAppendResult tryAppendInitialSubmissionFastPath(
+            OrderEventAppendCommand command,
+            NamedParameterJdbcTemplate jdbc) {
+        if (command.expectedVersion() != 0 || !(command.payload() instanceof OrderSubmissionRequestedV1 requested)) {
+            return null;
+        }
+        String payloadCanonical = serialize(command.payload());
+        String metadataCanonical = serialize(command.metadata());
+        String integrationPayload = command.integrationEvent().payload() == command.payload()
+                ? payloadCanonical
+                : serialize(command.integrationEvent().payload());
+        String hash = computeHash(
+                command,
+                1,
+                payloadCanonical,
+                metadataCanonical,
+                GENESIS_HASH
+        );
+        long startedNanos = System.nanoTime();
+        InitialSubmissionAppendCounts result = jdbc.queryForObject("""
+                WITH inserted_head AS (
+                    INSERT INTO order_service.order_stream_heads
+                        (aggregate_id, current_version, last_event_id, last_hash,
+                         user_id, remaining_amount, status, updated_at)
+                    VALUES (:aggregateId, 1, :eventId, :hash,
+                            :userId, :remainingAmount, 'PENDING_ASSET_CHECK', CURRENT_TIMESTAMP)
+                    ON CONFLICT (aggregate_id) DO NOTHING
+                    RETURNING aggregate_id
+                ),
+                inserted_event AS (
+                    INSERT INTO order_service.order_event_store
+                        (event_id, aggregate_id, aggregate_type, aggregate_version,
+                         event_type, payload_canonical, metadata_canonical, schema_version,
+                         occurred_at, prev_hash, hash)
+                    SELECT :eventId, :aggregateId, :aggregateType, 1,
+                           :eventType, :payload, :metadata, :schemaVersion,
+                           :occurredAt, :genesisHash, :hash
+                    FROM inserted_head
+                    RETURNING global_position
+                ),
+                upserted_matching_state AS (
+                    INSERT INTO order_service.order_matching_state
+                        (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
+                    SELECT :aggregateId, :userId, :remainingAmount, 0, 'PENDING_ASSET_CHECK', CURRENT_TIMESTAMP
+                    FROM inserted_head
+                    ON CONFLICT (order_id) DO UPDATE
+                    SET user_id = EXCLUDED.user_id,
+                        remaining_amount = EXCLUDED.remaining_amount,
+                        status = EXCLUDED.status,
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING order_id
+                ),
+                inserted_outbox AS (
+                    INSERT INTO order_service.order_event_outbox
+                        (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
+                         status, attempt_count, next_retry_at, created_at, updated_at)
+                    SELECT :eventId, :aggregateId, :exchange, :routingKey, :messageType, :integrationPayload,
+                           'PENDING', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM inserted_event
+                    RETURNING id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM inserted_head) AS inserted_head,
+                    (SELECT COUNT(*) FROM inserted_event) AS inserted_event,
+                    (SELECT COALESCE(MAX(global_position), 0) FROM inserted_event) AS global_position,
+                    (SELECT COUNT(*) FROM inserted_head) AS updated_head,
+                    (SELECT COUNT(*) FROM upserted_matching_state) AS upserted_matching_state,
+                    (SELECT COUNT(*) FROM inserted_outbox) AS inserted_outbox
+                """, new MapSqlParameterSource()
+                .addValue("aggregateId", command.aggregateId())
+                .addValue("eventId", command.eventId())
+                .addValue("aggregateType", AGGREGATE_TYPE)
+                .addValue("eventType", command.eventType())
+                .addValue("payload", payloadCanonical)
+                .addValue("metadata", metadataCanonical)
+                .addValue("schemaVersion", command.schemaVersion())
+                .addValue("occurredAt", command.occurredAt())
+                .addValue("genesisHash", GENESIS_HASH)
+                .addValue("hash", hash)
+                .addValue("userId", requested.userId())
+                .addValue("remainingAmount", requested.amount())
+                .addValue("exchange", command.integrationEvent().exchange())
+                .addValue("routingKey", command.integrationEvent().routingKey())
+                .addValue("messageType", command.integrationEvent().payload().getClass().getName())
+                .addValue("integrationPayload", integrationPayload),
+                (rs, rowNum) -> new InitialSubmissionAppendCounts(
+                        rs.getInt("inserted_head"),
+                        rs.getInt("inserted_event"),
+                        rs.getLong("global_position"),
+                        rs.getInt("updated_head"),
+                        rs.getInt("upserted_matching_state"),
+                        rs.getInt("inserted_outbox")));
+        submissionAppendMetrics.record("initial_append_cte", startedNanos);
+        if (result == null || result.insertedHead() == 0) {
+            return null;
+        }
+        if (result.insertedEvent() != 1
+                || result.updatedHead() != 1
+                || result.upsertedMatchingState() != 1
+                || result.insertedOutbox() != 1
+                || result.globalPosition() <= 0) {
+            throw new IllegalStateException("Initial order submission append fast path did not converge: "
+                    + result);
+        }
+        return new OrderEventAppendResult(
+                command.aggregateId(),
+                command.eventId(),
+                1,
+                result.globalPosition(),
+                hash,
+                false
+        );
     }
 
     private OrderEventAppendResult appendCancellationIfCurrentStateAllowsInTransaction(
@@ -714,11 +869,27 @@ public class OrderEventAppender {
             OrderEventAppendCommand command,
             NamedParameterJdbcTemplate jdbc,
             StreamHead head) {
+        return appendInTransactionWithLockedHead(command, jdbc, head, false);
+    }
+
+    private OrderEventAppendResult appendInTransactionWithLockedHead(
+            OrderEventAppendCommand command,
+            NamedParameterJdbcTemplate jdbc,
+            StreamHead head,
+            boolean recordSubmissionAppend) {
+        long serializeStartedNanos = System.nanoTime();
         String payloadCanonical = serialize(command.payload());
         String metadataCanonical = serialize(command.metadata());
+        if (recordSubmissionAppend) {
+            submissionAppendMetrics.record("serialize_payload_metadata", serializeStartedNanos);
+        }
 
         if (head.currentVersion() != command.expectedVersion()) {
+            long findExistingStartedNanos = System.nanoTime();
             ExistingEvent existing = findByEventId(jdbc, command.eventId());
+            if (recordSubmissionAppend) {
+                submissionAppendMetrics.record("find_existing_event", findExistingStartedNanos);
+            }
             if (existing != null) {
                 return existingAppendResult(command, existing, payloadCanonical, metadataCanonical);
             }
@@ -727,6 +898,7 @@ public class OrderEventAppender {
         }
 
         long nextVersion = head.currentVersion() + 1;
+        long hashStartedNanos = System.nanoTime();
         String hash = computeHash(
                 command,
                 nextVersion,
@@ -734,8 +906,12 @@ public class OrderEventAppender {
                 metadataCanonical,
                 head.lastHash()
         );
+        if (recordSubmissionAppend) {
+            submissionAppendMetrics.record("compute_hash", hashStartedNanos);
+        }
         long globalPosition;
         try {
+            long insertEventStartedNanos = System.nanoTime();
             globalPosition = insertEvent(
                     jdbc,
                     command,
@@ -745,15 +921,30 @@ public class OrderEventAppender {
                     head.lastHash(),
                     hash
             );
+            if (recordSubmissionAppend) {
+                submissionAppendMetrics.record("insert_event", insertEventStartedNanos);
+            }
         } catch (DuplicateKeyException e) {
+            long findExistingStartedNanos = System.nanoTime();
             ExistingEvent existing = findByEventId(jdbc, command.eventId());
+            if (recordSubmissionAppend) {
+                submissionAppendMetrics.record("find_existing_event", findExistingStartedNanos);
+            }
             if (existing != null) {
                 return existingAppendResult(command, existing, payloadCanonical, metadataCanonical);
             }
             throw e;
         }
+        long updateHeadStartedNanos = System.nanoTime();
         updateHead(jdbc, command, head, nextVersion, hash);
+        if (recordSubmissionAppend) {
+            submissionAppendMetrics.record("update_head_and_matching_state", updateHeadStartedNanos);
+        }
+        long insertOutboxStartedNanos = System.nanoTime();
         insertOutboxIfPresent(jdbc, command, payloadCanonical);
+        if (recordSubmissionAppend) {
+            submissionAppendMetrics.record("insert_outbox", insertOutboxStartedNanos);
+        }
 
         return new OrderEventAppendResult(
                 command.aggregateId(),
@@ -1652,5 +1843,14 @@ public class OrderEventAppender {
             LocalDateTime occurredAt,
             long globalPosition,
             String hash) {
+    }
+
+    private record InitialSubmissionAppendCounts(
+            int insertedHead,
+            int insertedEvent,
+            long globalPosition,
+            int updatedHead,
+            int upsertedMatchingState,
+            int insertedOutbox) {
     }
 }
