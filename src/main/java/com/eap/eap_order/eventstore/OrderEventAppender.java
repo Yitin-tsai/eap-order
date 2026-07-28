@@ -148,10 +148,43 @@ public class OrderEventAppender {
         if (commands == null || commands.isEmpty()) {
             return;
         }
+        if (isAssetReservationConfirmedBatch(commands)) {
+            appendAssetReservationConfirmedBatch(commands);
+            return;
+        }
         consumerTransactionTemplate.executeWithoutResult(status -> {
             for (OrderEventAppendCommand command : commands) {
                 appendInTransaction(command, consumerJdbc);
             }
+        });
+    }
+
+    private boolean isAssetReservationConfirmedBatch(List<OrderEventAppendCommand> commands) {
+        Set<UUID> aggregateIds = new HashSet<>(commands.size());
+        for (OrderEventAppendCommand command : commands) {
+            if (command.expectedVersion() != 1
+                    || command.integrationEvent() != null
+                    || !(command.payload() instanceof OrderAssetReservationConfirmedV1)
+                    || !"OrderAssetReservationConfirmedV1".equals(command.eventType())
+                    || !aggregateIds.add(command.aggregateId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void appendAssetReservationConfirmedBatch(List<OrderEventAppendCommand> commands) {
+        consumerTransactionTemplate.executeWithoutResult(status -> {
+            Map<UUID, StreamHead> heads = lockHeads(consumerJdbc, commands.stream()
+                    .map(OrderEventAppendCommand::aggregateId)
+                    .toList());
+            if (heads.size() != commands.size() || heads.values().stream().anyMatch(head -> head.currentVersion() != 1)) {
+                for (OrderEventAppendCommand command : commands) {
+                    appendInTransaction(command, consumerJdbc);
+                }
+                return;
+            }
+            appendAssetReservationConfirmedBatchWithLockedHeads(commands, heads);
         });
     }
 
@@ -670,6 +703,13 @@ public class OrderEventAppender {
         }
     }
 
+    private void assertBatchCount(String label, int expected, int actual) {
+        if (actual != expected) {
+            throw new IllegalStateException("Expected " + expected + " " + label
+                    + " batch rows, actual=" + actual);
+        }
+    }
+
     private OrderEventAppendResult appendInTransactionWithLockedHead(
             OrderEventAppendCommand command,
             NamedParameterJdbcTemplate jdbc,
@@ -776,6 +816,160 @@ public class OrderEventAppender {
             throw new IllegalStateException("Order stream head not found after creation: " + aggregateId);
         }
         return rows.get(0);
+    }
+
+    private Map<UUID, StreamHead> lockHeads(NamedParameterJdbcTemplate jdbc, List<UUID> aggregateIds) {
+        if (aggregateIds.isEmpty()) {
+            return Map.of();
+        }
+        Map<UUID, StreamHead> heads = new HashMap<>(aggregateIds.size());
+        jdbc.query("""
+                SELECT aggregate_id, current_version, last_hash, user_id, remaining_amount, status
+                FROM order_service.order_stream_heads
+                WHERE aggregate_id IN (:aggregateIds)
+                FOR UPDATE
+                """, Map.of("aggregateIds", aggregateIds), rs -> {
+            heads.put(
+                    rs.getObject("aggregate_id", UUID.class),
+                    new StreamHead(
+                            rs.getLong("current_version"),
+                            rs.getString("last_hash"),
+                            rs.getObject("user_id", UUID.class),
+                            (Integer) rs.getObject("remaining_amount"),
+                            rs.getString("status")));
+        });
+        return heads;
+    }
+
+    private void appendAssetReservationConfirmedBatchWithLockedHeads(
+            List<OrderEventAppendCommand> commands,
+            Map<UUID, StreamHead> heads) {
+        consumerJdbc.getJdbcTemplate().execute((ConnectionCallback<Void>) connection -> {
+            Array eventIds = null;
+            Array aggregateIds = null;
+            Array eventTypes = null;
+            Array payloads = null;
+            Array metadatas = null;
+            Array schemaVersions = null;
+            Array occurredAts = null;
+            Array prevHashes = null;
+            Array hashes = null;
+            Array currentVersions = null;
+            Array newVersions = null;
+            Array userIds = null;
+            Array remainingAmounts = null;
+            Array statuses = null;
+            try (PreparedStatement statement = connection.prepareStatement("""
+                    WITH input(event_id, aggregate_id, event_type, payload_canonical, metadata_canonical,
+                               schema_version, occurred_at, prev_hash, hash, current_version, new_version,
+                               user_id, remaining_amount, order_status) AS (
+                        SELECT *
+                        FROM unnest(?::uuid[], ?::uuid[], ?::varchar[], ?::text[], ?::text[],
+                                    ?::integer[], ?::timestamp[], ?::varchar[], ?::varchar[],
+                                    ?::bigint[], ?::bigint[], ?::uuid[], ?::integer[], ?::varchar[])
+                    ),
+                    inserted_events AS (
+                        INSERT INTO order_service.order_event_store
+                            (event_id, aggregate_id, aggregate_type, aggregate_version,
+                             event_type, payload_canonical, metadata_canonical, schema_version,
+                             occurred_at, prev_hash, hash)
+                        SELECT event_id, aggregate_id, 'Order', new_version,
+                               event_type, payload_canonical, metadata_canonical, schema_version,
+                               occurred_at, prev_hash, hash
+                        FROM input
+                        ON CONFLICT (event_id) DO NOTHING
+                        RETURNING aggregate_id
+                    ),
+                    updated_heads AS (
+                        UPDATE order_service.order_stream_heads head
+                        SET current_version = input.new_version,
+                            last_event_id = input.event_id,
+                            last_hash = input.hash,
+                            user_id = input.user_id,
+                            remaining_amount = input.remaining_amount,
+                            status = input.order_status,
+                            updated_at = CURRENT_TIMESTAMP
+                        FROM input
+                        WHERE head.aggregate_id = input.aggregate_id
+                          AND head.current_version = input.current_version
+                        RETURNING head.aggregate_id
+                    ),
+                    upserted_matching_state AS (
+                        INSERT INTO order_service.order_matching_state
+                            (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
+                        SELECT aggregate_id, user_id, remaining_amount, 0, order_status, CURRENT_TIMESTAMP
+                        FROM input
+                        ON CONFLICT (order_id) DO UPDATE
+                        SET user_id = EXCLUDED.user_id,
+                            remaining_amount = EXCLUDED.remaining_amount,
+                            status = EXCLUDED.status,
+                            updated_at = CURRENT_TIMESTAMP
+                        RETURNING order_id
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM inserted_events) AS inserted_events,
+                        (SELECT COUNT(*) FROM updated_heads) AS updated_heads,
+                        (SELECT COUNT(*) FROM upserted_matching_state) AS upserted_matching_state
+                    """)) {
+                AssetReservationConfirmedBatchArrays arrays =
+                        assetReservationConfirmedBatchArrays(commands, heads);
+                eventIds = connection.createArrayOf("uuid", arrays.eventIds());
+                aggregateIds = connection.createArrayOf("uuid", arrays.aggregateIds());
+                eventTypes = connection.createArrayOf("varchar", arrays.eventTypes());
+                payloads = connection.createArrayOf("text", arrays.payloads());
+                metadatas = connection.createArrayOf("text", arrays.metadatas());
+                schemaVersions = connection.createArrayOf("integer", arrays.schemaVersions());
+                occurredAts = connection.createArrayOf("timestamp", arrays.occurredAts());
+                prevHashes = connection.createArrayOf("varchar", arrays.prevHashes());
+                hashes = connection.createArrayOf("varchar", arrays.hashes());
+                currentVersions = connection.createArrayOf("bigint", arrays.currentVersions());
+                newVersions = connection.createArrayOf("bigint", arrays.newVersions());
+                userIds = connection.createArrayOf("uuid", arrays.userIds());
+                remainingAmounts = connection.createArrayOf("integer", arrays.remainingAmounts());
+                statuses = connection.createArrayOf("varchar", arrays.statuses());
+                statement.setArray(1, eventIds);
+                statement.setArray(2, aggregateIds);
+                statement.setArray(3, eventTypes);
+                statement.setArray(4, payloads);
+                statement.setArray(5, metadatas);
+                statement.setArray(6, schemaVersions);
+                statement.setArray(7, occurredAts);
+                statement.setArray(8, prevHashes);
+                statement.setArray(9, hashes);
+                statement.setArray(10, currentVersions);
+                statement.setArray(11, newVersions);
+                statement.setArray(12, userIds);
+                statement.setArray(13, remainingAmounts);
+                statement.setArray(14, statuses);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    if (!resultSet.next()) {
+                        throw new IllegalStateException("Asset reservation batch append did not return counts");
+                    }
+                    assertBatchCount("asset reservation event insert", commands.size(),
+                            resultSet.getInt("inserted_events"));
+                    assertBatchCount("asset reservation head update", commands.size(),
+                            resultSet.getInt("updated_heads"));
+                    assertBatchCount("asset reservation matching-state upsert", commands.size(),
+                            resultSet.getInt("upserted_matching_state"));
+                }
+                return null;
+            } finally {
+                freeQuietly(eventIds);
+                freeQuietly(aggregateIds);
+                freeQuietly(eventTypes);
+                freeQuietly(payloads);
+                freeQuietly(metadatas);
+                freeQuietly(schemaVersions);
+                freeQuietly(occurredAts);
+                freeQuietly(prevHashes);
+                freeQuietly(hashes);
+                freeQuietly(currentVersions);
+                freeQuietly(newVersions);
+                freeQuietly(userIds);
+                freeQuietly(remainingAmounts);
+                freeQuietly(statuses);
+            }
+        });
     }
 
     private ExistingEvent findByEventId(NamedParameterJdbcTemplate jdbc, UUID eventId) {
@@ -923,6 +1117,71 @@ public class OrderEventAppender {
                 sellerRemainingAmounts,
                 sellerMatchedAmounts,
                 sellerStatuses);
+    }
+
+    private AssetReservationConfirmedBatchArrays assetReservationConfirmedBatchArrays(
+            List<OrderEventAppendCommand> commands,
+            Map<UUID, StreamHead> heads) {
+        int size = commands.size();
+        UUID[] eventIds = new UUID[size];
+        UUID[] aggregateIds = new UUID[size];
+        String[] eventTypes = new String[size];
+        String[] payloads = new String[size];
+        String[] metadatas = new String[size];
+        Integer[] schemaVersions = new Integer[size];
+        Timestamp[] occurredAts = new Timestamp[size];
+        String[] prevHashes = new String[size];
+        String[] hashes = new String[size];
+        Long[] currentVersions = new Long[size];
+        Long[] newVersions = new Long[size];
+        UUID[] userIds = new UUID[size];
+        Integer[] remainingAmounts = new Integer[size];
+        String[] statuses = new String[size];
+
+        for (int i = 0; i < size; i++) {
+            OrderEventAppendCommand command = commands.get(i);
+            StreamHead head = heads.get(command.aggregateId());
+            if (head == null) {
+                throw new IllegalStateException("Order stream head not found for batch append: "
+                        + command.aggregateId());
+            }
+            CommandState nextState = nextCommandState(head, command);
+            String payloadCanonical = serialize(command.payload());
+            String metadataCanonical = serialize(command.metadata());
+            long nextVersion = head.currentVersion() + 1;
+            String hash = computeHash(command, nextVersion, payloadCanonical, metadataCanonical, head.lastHash());
+
+            eventIds[i] = command.eventId();
+            aggregateIds[i] = command.aggregateId();
+            eventTypes[i] = command.eventType();
+            payloads[i] = payloadCanonical;
+            metadatas[i] = metadataCanonical;
+            schemaVersions[i] = command.schemaVersion();
+            occurredAts[i] = Timestamp.valueOf(command.occurredAt());
+            prevHashes[i] = head.lastHash();
+            hashes[i] = hash;
+            currentVersions[i] = head.currentVersion();
+            newVersions[i] = nextVersion;
+            userIds[i] = nextState.userId();
+            remainingAmounts[i] = nextState.remainingAmount();
+            statuses[i] = nextState.status();
+        }
+
+        return new AssetReservationConfirmedBatchArrays(
+                eventIds,
+                aggregateIds,
+                eventTypes,
+                payloads,
+                metadatas,
+                schemaVersions,
+                occurredAts,
+                prevHashes,
+                hashes,
+                currentVersions,
+                newVersions,
+                userIds,
+                remainingAmounts,
+                statuses);
     }
 
     private void freeQuietly(Array array) {
@@ -1259,6 +1518,23 @@ public class OrderEventAppender {
             Integer[] sellerRemainingAmounts,
             Integer[] sellerMatchedAmounts,
             String[] sellerStatuses) {
+    }
+
+    private record AssetReservationConfirmedBatchArrays(
+            UUID[] eventIds,
+            UUID[] aggregateIds,
+            String[] eventTypes,
+            String[] payloads,
+            String[] metadatas,
+            Integer[] schemaVersions,
+            Timestamp[] occurredAts,
+            String[] prevHashes,
+            String[] hashes,
+            Long[] currentVersions,
+            Long[] newVersions,
+            UUID[] userIds,
+            Integer[] remainingAmounts,
+            String[] statuses) {
     }
 
     private record MatchingState(

@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -30,6 +31,9 @@ public class OrderStatusUpdateListener {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private OrderAssetReservationMetrics metrics;
+
     /**
      * 監聽 Wallet 資產保留成功的 integration event，轉成 OrderAssetReservationConfirmedV1 domain event。
      */
@@ -41,17 +45,24 @@ public class OrderStatusUpdateListener {
         if (messages == null || messages.isEmpty()) {
             return;
         }
+        long listenerStartedAt = System.nanoTime();
         List<OrderConfirmedEvent> events;
         try {
+            long deserializeStartedAt = System.nanoTime();
             events = deserializeOrderConfirmed(messages);
+            metrics.recordDeserialize(Duration.ofNanos(System.nanoTime() - deserializeStartedAt));
         } catch (Exception e) {
             log.error("Failed to deserialize OrderConfirmedEvent batch: size={}", messages.size(), e);
             nack(messages, channel, false);
+            metrics.recordListener(Duration.ofNanos(System.nanoTime() - listenerStartedAt));
             return;
         }
 
         try {
+            long confirmAllStartedAt = System.nanoTime();
             orderEventSourcingService.confirmAll(events);
+            metrics.recordConfirmAll(Duration.ofNanos(System.nanoTime() - confirmAllStartedAt));
+            long statusUpdateStartedAt = System.nanoTime();
             for (OrderConfirmedEvent event : events) {
                 log.info("收到 Wallet 資產保留成功事件，更新訂單狀態: {}", event.getOrderId());
                 orderStatusController.updateOrderStatus(
@@ -60,12 +71,20 @@ public class OrderStatusUpdateListener {
                     "餘額檢查通過，已進入撮合佇列"
                 );
             }
+            metrics.recordStatusUpdate(Duration.ofNanos(System.nanoTime() - statusUpdateStartedAt));
         } catch (Exception e) {
             log.warn("Failed to apply OrderConfirmedEvent batch to Order state: size={}", events.size(), e);
             nack(messages, channel, true);
+            metrics.recordListener(Duration.ofNanos(System.nanoTime() - listenerStartedAt));
             return;
         }
-        ack(messages, channel);
+        long ackStartedAt = System.nanoTime();
+        try {
+            ack(messages, channel);
+        } finally {
+            metrics.recordAck(Duration.ofNanos(System.nanoTime() - ackStartedAt));
+            metrics.recordListener(Duration.ofNanos(System.nanoTime() - listenerStartedAt));
+        }
     }
 
     /**
