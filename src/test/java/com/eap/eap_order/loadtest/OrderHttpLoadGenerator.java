@@ -47,6 +47,7 @@ public class OrderHttpLoadGenerator {
 
     private static final String DEFAULT_ORDER_URL = "http://localhost:8080/eap-order";
     private static final String DEFAULT_WALLET_URL = "http://localhost:8081/eap-wallet";
+    private static final String DEFAULT_MATCH_ENGINE_URL = "http://localhost:8082/match-engine";
     private static final String DEFAULT_ORDER_JDBC_URL = "jdbc:postgresql://localhost:15432/eap_order_db";
     private static final String DEFAULT_WALLET_JDBC_URL = "jdbc:postgresql://localhost:15433/eap_wallet_db";
     private static final String DEFAULT_RABBIT_MANAGEMENT_URL = "http://localhost:15672";
@@ -166,6 +167,15 @@ public class OrderHttpLoadGenerator {
         AdmissionSnapshot admission = config.orderAdmissionGate()
                 ? waitForOrderAdmission(config, httpClient, objectMapper, orderIds, startedAt)
                 : AdmissionSnapshot.disabled(elapsedSeconds);
+        PrometheusTimerSnapshot matchListener = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, "match_engine_order_confirmed_listener_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot matchTryMatch = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, "match_engine_try_match_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot matchReserveRedisEval = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, "match_engine_reserve_order_phase_duration", "phase=\"redis_eval\"")
+                : PrometheusTimerSnapshot.empty();
         List<String> invalidReasons = invalidReasons(config, accepted.get(), tooManyRequests.get(),
                 unavailable.get(), otherFailures.get(), admission);
 
@@ -207,6 +217,15 @@ public class OrderHttpLoadGenerator {
                 admission.orderbookAdmissionCount() / Math.max(admission.elapsedSeconds(), 0.001));
         System.out.printf("  \"finalQueueBacklog\": %d,%n", admission.finalQueueBacklog());
         System.out.printf("  \"queueMetricsReadFailures\": %d,%n", admission.queueMetricsReadFailures());
+        System.out.printf("  \"matchEngineOrderConfirmedListenerCount\": %.0f,%n", matchListener.count());
+        System.out.printf("  \"matchEngineOrderConfirmedListenerSumSeconds\": %.6f,%n", matchListener.sumSeconds());
+        System.out.printf("  \"matchEngineOrderConfirmedListenerMeanMs\": %.3f,%n", matchListener.meanMillis());
+        System.out.printf("  \"matchEngineTryMatchCount\": %.0f,%n", matchTryMatch.count());
+        System.out.printf("  \"matchEngineTryMatchSumSeconds\": %.6f,%n", matchTryMatch.sumSeconds());
+        System.out.printf("  \"matchEngineTryMatchMeanMs\": %.3f,%n", matchTryMatch.meanMillis());
+        System.out.printf("  \"matchEngineReserveRedisEvalCount\": %.0f,%n", matchReserveRedisEval.count());
+        System.out.printf("  \"matchEngineReserveRedisEvalSumSeconds\": %.6f,%n", matchReserveRedisEval.sumSeconds());
+        System.out.printf("  \"matchEngineReserveRedisEvalMeanMs\": %.3f,%n", matchReserveRedisEval.meanMillis());
         System.out.printf("  \"validForCapacityComparison\": %s,%n", invalidReasons.isEmpty());
         System.out.printf("  \"capacityInvalidReasons\": %s%n", jsonArray(invalidReasons));
         System.out.println("}");
@@ -509,6 +528,53 @@ public class OrderHttpLoadGenerator {
                 body.path("messages_unacknowledged").asLong(0));
     }
 
+    private static PrometheusTimerSnapshot readTimerMetric(
+            Config config,
+            HttpClient httpClient,
+            String metricName,
+            String requiredLabel) {
+        String prometheusBase = metricName + "_seconds";
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(config.matchEngineUrl() + "/actuator/prometheus"))
+                    .timeout(Duration.ofSeconds(3))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                return PrometheusTimerSnapshot.empty();
+            }
+            double count = 0;
+            double sumSeconds = 0;
+            for (String line : response.body().split("\\R")) {
+                if (line.startsWith("#")) {
+                    continue;
+                }
+                if (!requiredLabel.isBlank() && !line.contains(requiredLabel)) {
+                    continue;
+                }
+                if (line.startsWith(prometheusBase + "_count")) {
+                    count += prometheusValue(line);
+                } else if (line.startsWith(prometheusBase + "_sum")) {
+                    sumSeconds += prometheusValue(line);
+                }
+            }
+            return new PrometheusTimerSnapshot(count, sumSeconds);
+        } catch (Exception e) {
+            System.err.printf("matchEngine actuator timer read failed: metric=%s, error=%s%n",
+                    metricName, e.getMessage());
+            return PrometheusTimerSnapshot.empty();
+        }
+    }
+
+    private static double prometheusValue(String line) {
+        int separator = line.lastIndexOf(' ');
+        if (separator < 0 || separator == line.length() - 1) {
+            return 0;
+        }
+        return Double.parseDouble(line.substring(separator + 1));
+    }
+
     private static String basicAuth(String user, String password) {
         return "Basic " + Base64.getEncoder().encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
     }
@@ -674,6 +740,16 @@ public class OrderHttpLoadGenerator {
     private record QueueSnapshot(long backlog, long readFailures, String nonZeroQueues) {
     }
 
+    private record PrometheusTimerSnapshot(double count, double sumSeconds) {
+        static PrometheusTimerSnapshot empty() {
+            return new PrometheusTimerSnapshot(0, 0);
+        }
+
+        double meanMillis() {
+            return count <= 0 ? 0 : (sumSeconds / count) * 1000;
+        }
+    }
+
     private record AdmissionSnapshot(
             long submissionRequestedRows,
             long orderSubmittedOutboxSentRows,
@@ -710,6 +786,7 @@ public class OrderHttpLoadGenerator {
             String marketId,
             String orderUrl,
             String walletUrl,
+            String matchEngineUrl,
             String orderJdbcUrl,
             String orderJdbcUser,
             String orderJdbcPassword,
@@ -746,6 +823,7 @@ public class OrderHttpLoadGenerator {
                     stringArg(args, "--market-id", "ENERGY-SPOT"),
                     stringArg(args, "--order-url", DEFAULT_ORDER_URL),
                     stringArg(args, "--wallet-url", DEFAULT_WALLET_URL),
+                    stringArg(args, "--match-engine-url", DEFAULT_MATCH_ENGINE_URL),
                     stringArg(args, "--order-jdbc-url", DEFAULT_ORDER_JDBC_URL),
                     stringArg(args, "--order-jdbc-user", "admin"),
                     stringArg(args, "--order-jdbc-password", "admin123"),
