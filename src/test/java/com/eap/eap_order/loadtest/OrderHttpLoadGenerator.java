@@ -185,6 +185,33 @@ public class OrderHttpLoadGenerator {
         PrometheusTimerSnapshot orderOutboxBatch = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_batch_duration", "")
                 : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOrderSubmittedProcessing = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_processing_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOrderSubmittedTransaction = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_transaction_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOrderSubmittedIdempotencyClaim = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_idempotency_claim_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOrderSubmittedWalletLookup = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_wallet_lookup_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOrderSubmittedOutboxWrite = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_outbox_write_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOutboxPublish = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_outbox_publish_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOutboxConfirm = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_outbox_confirm_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOutboxMarkSent = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_outbox_mark_sent_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOutboxBatch = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_outbox_batch_duration", "")
+                : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot matchListener = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.matchEngineUrl(), "match_engine_order_confirmed_listener_duration", "")
                 : PrometheusTimerSnapshot.empty();
@@ -254,6 +281,33 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"orderOutboxBatchCount\": %.0f,%n", orderOutboxBatch.count());
         System.out.printf("  \"orderOutboxBatchSumSeconds\": %.6f,%n", orderOutboxBatch.sumSeconds());
         System.out.printf("  \"orderOutboxBatchMeanMs\": %.3f,%n", orderOutboxBatch.meanMillis());
+        System.out.printf("  \"walletOrderSubmittedProcessingCount\": %.0f,%n", walletOrderSubmittedProcessing.count());
+        System.out.printf("  \"walletOrderSubmittedProcessingSumSeconds\": %.6f,%n", walletOrderSubmittedProcessing.sumSeconds());
+        System.out.printf("  \"walletOrderSubmittedProcessingMeanMs\": %.3f,%n", walletOrderSubmittedProcessing.meanMillis());
+        System.out.printf("  \"walletOrderSubmittedTransactionCount\": %.0f,%n", walletOrderSubmittedTransaction.count());
+        System.out.printf("  \"walletOrderSubmittedTransactionSumSeconds\": %.6f,%n", walletOrderSubmittedTransaction.sumSeconds());
+        System.out.printf("  \"walletOrderSubmittedTransactionMeanMs\": %.3f,%n", walletOrderSubmittedTransaction.meanMillis());
+        System.out.printf("  \"walletOrderSubmittedIdempotencyClaimCount\": %.0f,%n", walletOrderSubmittedIdempotencyClaim.count());
+        System.out.printf("  \"walletOrderSubmittedIdempotencyClaimSumSeconds\": %.6f,%n", walletOrderSubmittedIdempotencyClaim.sumSeconds());
+        System.out.printf("  \"walletOrderSubmittedIdempotencyClaimMeanMs\": %.3f,%n", walletOrderSubmittedIdempotencyClaim.meanMillis());
+        System.out.printf("  \"walletOrderSubmittedWalletLookupCount\": %.0f,%n", walletOrderSubmittedWalletLookup.count());
+        System.out.printf("  \"walletOrderSubmittedWalletLookupSumSeconds\": %.6f,%n", walletOrderSubmittedWalletLookup.sumSeconds());
+        System.out.printf("  \"walletOrderSubmittedWalletLookupMeanMs\": %.3f,%n", walletOrderSubmittedWalletLookup.meanMillis());
+        System.out.printf("  \"walletOrderSubmittedOutboxWriteCount\": %.0f,%n", walletOrderSubmittedOutboxWrite.count());
+        System.out.printf("  \"walletOrderSubmittedOutboxWriteSumSeconds\": %.6f,%n", walletOrderSubmittedOutboxWrite.sumSeconds());
+        System.out.printf("  \"walletOrderSubmittedOutboxWriteMeanMs\": %.3f,%n", walletOrderSubmittedOutboxWrite.meanMillis());
+        System.out.printf("  \"walletOutboxPublishCount\": %.0f,%n", walletOutboxPublish.count());
+        System.out.printf("  \"walletOutboxPublishSumSeconds\": %.6f,%n", walletOutboxPublish.sumSeconds());
+        System.out.printf("  \"walletOutboxPublishMeanMs\": %.3f,%n", walletOutboxPublish.meanMillis());
+        System.out.printf("  \"walletOutboxConfirmCount\": %.0f,%n", walletOutboxConfirm.count());
+        System.out.printf("  \"walletOutboxConfirmSumSeconds\": %.6f,%n", walletOutboxConfirm.sumSeconds());
+        System.out.printf("  \"walletOutboxConfirmMeanMs\": %.3f,%n", walletOutboxConfirm.meanMillis());
+        System.out.printf("  \"walletOutboxMarkSentCount\": %.0f,%n", walletOutboxMarkSent.count());
+        System.out.printf("  \"walletOutboxMarkSentSumSeconds\": %.6f,%n", walletOutboxMarkSent.sumSeconds());
+        System.out.printf("  \"walletOutboxMarkSentMeanMs\": %.3f,%n", walletOutboxMarkSent.meanMillis());
+        System.out.printf("  \"walletOutboxBatchCount\": %.0f,%n", walletOutboxBatch.count());
+        System.out.printf("  \"walletOutboxBatchSumSeconds\": %.6f,%n", walletOutboxBatch.sumSeconds());
+        System.out.printf("  \"walletOutboxBatchMeanMs\": %.3f,%n", walletOutboxBatch.meanMillis());
         System.out.printf("  \"matchEngineOrderConfirmedListenerCount\": %.0f,%n", matchListener.count());
         System.out.printf("  \"matchEngineOrderConfirmedListenerSumSeconds\": %.6f,%n", matchListener.sumSeconds());
         System.out.printf("  \"matchEngineOrderConfirmedListenerMeanMs\": %.3f,%n", matchListener.meanMillis());
