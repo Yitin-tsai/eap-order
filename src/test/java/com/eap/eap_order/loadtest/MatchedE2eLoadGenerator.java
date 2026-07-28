@@ -37,6 +37,9 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -133,13 +136,14 @@ public class MatchedE2eLoadGenerator {
                 switch (config.phase()) {
                     case "seed" -> seed(config, pairs, orderJdbc, walletJdbc, matchJdbc, eventSourcingService, rabbitAdmin, redisTemplate);
                     case "project" -> projectSeededOrders(config, orderJdbc, ordersCurrentProjector);
+                    case "publish-only" -> publishOnly(config, pairs, objectMapper, rabbitAdmin);
                     case "run" -> run(config, pairs, orderJdbc, walletJdbc, matchJdbc, objectMapper, rabbitAdmin, redisTemplate);
                     case "all" -> {
                         seed(config, pairs, orderJdbc, walletJdbc, matchJdbc, eventSourcingService, rabbitAdmin, redisTemplate);
                         projectSeededOrders(config, orderJdbc, ordersCurrentProjector);
                         run(config, pairs, orderJdbc, walletJdbc, matchJdbc, objectMapper, rabbitAdmin, redisTemplate);
                     }
-                    default -> throw new IllegalArgumentException("--phase must be seed, project, run, or all");
+                    default -> throw new IllegalArgumentException("--phase must be seed, project, publish-only, run, or all");
                 }
             } finally {
                 redisConnectionFactory.destroy();
@@ -470,6 +474,24 @@ public class MatchedE2eLoadGenerator {
         return publishToMatchEngine(config, objectMapper, pairs, false, config.targetTps());
     }
 
+    private static void publishOnly(
+            Config config,
+            List<Pair> pairs,
+            ObjectMapper objectMapper,
+            RabbitAdmin rabbitAdmin) throws Exception {
+        purgeQueues(rabbitAdmin);
+        PublishResult publish = publishBuyToMatchEngine(config, objectMapper, pairs);
+        QueueDepth queueDepth = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+        printPublishOnlyResult(config, publish, queueDepth);
+        purgeQueues(rabbitAdmin);
+
+        require(publish.failures() == 0, "Publish-only probe should have no client publish failures");
+        require(publish.published() == config.events(), "Publish-only probe should be broker-acked for every event");
+        require(publish.brokerNacked() == 0, "Publish-only probe should have no broker nacks");
+        require(publish.returned() == 0, "Publish-only probe should have no returned messages");
+        require(publish.confirmTimedOut() == 0, "Publish-only probe should have no confirm timeouts");
+    }
+
     private static PublishResult publishToMatchEngine(
             Config config,
             ObjectMapper objectMapper,
@@ -492,12 +514,11 @@ public class MatchedE2eLoadGenerator {
         AtomicLong lastSendCompletedNanos = new AtomicLong();
         CountDownLatch done = new CountDownLatch(pairs.size());
         Semaphore inFlight = new Semaphore(config.publisherMaxInFlight());
-        ConcurrentNavigableMap<Long, Long> outstandingPublishes = new ConcurrentSkipListMap<>();
+        AtomicInteger nextPairIndex = new AtomicInteger();
 
         long started = System.nanoTime();
         lastSendCompletedNanos.set(started);
         long intervalNanos = targetTps > 0 ? Math.max(1L, 1_000_000_000L / targetTps) : 0L;
-        long scheduledIndex = 0;
 
         com.rabbitmq.client.ConnectionFactory factory = new com.rabbitmq.client.ConnectionFactory();
         factory.setHost(config.rabbitHost());
@@ -511,8 +532,114 @@ public class MatchedE2eLoadGenerator {
                 .headers(Map.of("__TypeId__", OrderConfirmedEvent.class.getName()))
                 .build();
 
-        try (Connection connection = factory.newConnection("matched-e2e-load-generator");
-             Channel channel = connection.createChannel()) {
+        List<Connection> connections = new ArrayList<>();
+        try {
+            int workers = Math.max(1, config.publishers());
+            int connectionCount = Math.max(1, Math.min(workers, config.publisherConnectionCacheSize()));
+            for (int i = 0; i < connectionCount; i++) {
+                connections.add(factory.newConnection("matched-e2e-load-generator-" + i));
+            }
+            ExecutorService executor = Executors.newFixedThreadPool(workers);
+            List<Future<?>> futures = new ArrayList<>(workers);
+            for (int worker = 0; worker < workers; worker++) {
+                Connection workerConnection = connections.get(worker % connectionCount);
+                futures.add(executor.submit(() -> publishWorker(
+                        config,
+                        objectMapper,
+                        pairs,
+                        sell,
+                        intervalNanos,
+                        started,
+                        properties,
+                        workerConnection,
+                        published,
+                        attempted,
+                        brokerNacked,
+                        returned,
+                        failures,
+                        acquireWaitNanos,
+                        sendNanos,
+                        confirmWaitNanos,
+                        maxAcquireWaitNanos,
+                        maxSendNanos,
+                        maxConfirmWaitNanos,
+                        maxScheduleLagNanos,
+                        lastSendCompletedNanos,
+                        done,
+                        inFlight,
+                        nextPairIndex,
+                        config.publisherConfirmTimeoutMs())));
+            }
+            executor.shutdown();
+            for (Future<?> future : futures) {
+                future.get();
+            }
+            boolean confirmed = done.await(config.publisherConfirmTimeoutMs(), TimeUnit.MILLISECONDS);
+            if (!confirmed) {
+                int timedOut = pairs.size() - published.get() - brokerNacked.get() - failures.get();
+                confirmTimedOut.addAndGet(timedOut);
+                if (timedOut > 0) {
+                    System.err.printf("publish confirm timed out: sell=%s, timeoutMs=%d, unconfirmed=%d%n",
+                            sell, config.publisherConfirmTimeoutMs(), timedOut);
+                }
+            }
+        } finally {
+            for (Connection connection : connections) {
+                try {
+                    connection.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        double sendWindowSeconds = (lastSendCompletedNanos.get() - started) / 1_000_000_000.0;
+        return new PublishResult(
+                published.get(),
+                attempted.get(),
+                brokerNacked.get(),
+                returned.get(),
+                confirmTimedOut.get(),
+                failures.get(),
+                elapsedSeconds,
+                targetTps,
+                acquireWaitNanos.sum() / 1_000_000_000.0,
+                maxAcquireWaitNanos.get() / 1_000_000.0,
+                sendNanos.sum() / 1_000_000_000.0,
+                maxSendNanos.get() / 1_000_000.0,
+                confirmWaitNanos.sum() / 1_000_000_000.0,
+                maxConfirmWaitNanos.get() / 1_000_000.0,
+                sendWindowSeconds,
+                maxScheduleLagNanos.get() / 1_000_000.0);
+    }
+
+    private static void publishWorker(
+            Config config,
+            ObjectMapper objectMapper,
+            List<Pair> pairs,
+            boolean sell,
+            long intervalNanos,
+            long started,
+            AMQP.BasicProperties properties,
+            Connection connection,
+            AtomicInteger published,
+            AtomicInteger attempted,
+            AtomicInteger brokerNacked,
+            AtomicInteger returned,
+            AtomicInteger failures,
+            LongAdder acquireWaitNanos,
+            LongAdder sendNanos,
+            LongAdder confirmWaitNanos,
+            AtomicLong maxAcquireWaitNanos,
+            AtomicLong maxSendNanos,
+            AtomicLong maxConfirmWaitNanos,
+            AtomicLong maxScheduleLagNanos,
+            AtomicLong lastSendCompletedNanos,
+            CountDownLatch done,
+            Semaphore inFlight,
+            AtomicInteger nextPairIndex,
+            int confirmTimeoutMs) {
+        ConcurrentNavigableMap<Long, Long> outstandingPublishes = new ConcurrentSkipListMap<>();
+        try (Channel channel = connection.createChannel()) {
             channel.confirmSelect();
             channel.addReturnListener((replyCode, replyText, exchange, routingKey, props, body) ->
                     returned.incrementAndGet());
@@ -542,12 +669,16 @@ public class MatchedE2eLoadGenerator {
                             inFlight,
                             sell));
 
-            for (Pair pair : pairs) {
+            while (true) {
+                int pairIndex = nextPairIndex.getAndIncrement();
+                if (pairIndex >= pairs.size()) {
+                    break;
+                }
+                Pair pair = pairs.get(pairIndex);
                 if (intervalNanos > 0) {
-                    long scheduledNanos = started + intervalNanos * scheduledIndex;
+                    long scheduledNanos = started + intervalNanos * pairIndex;
                     sleepUntil(scheduledNanos);
                     updateMax(maxScheduleLagNanos, Math.max(0, System.nanoTime() - scheduledNanos));
-                    scheduledIndex++;
                 }
                 long acquireStarted = System.nanoTime();
                 inFlight.acquire();
@@ -564,12 +695,12 @@ public class MatchedE2eLoadGenerator {
                     attempted.incrementAndGet();
                     channel.basicPublish("", MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, true, properties, body);
                     long sendElapsed = System.nanoTime() - sendStarted;
-                    lastSendCompletedNanos.set(System.nanoTime());
+                    updateMax(lastSendCompletedNanos, System.nanoTime());
                     sendNanos.add(sendElapsed);
                     updateMax(maxSendNanos, sendElapsed);
                 } catch (Exception e) {
                     long sendElapsed = System.nanoTime() - sendStarted;
-                    lastSendCompletedNanos.set(System.nanoTime());
+                    updateMax(lastSendCompletedNanos, System.nanoTime());
                     sendNanos.add(sendElapsed);
                     updateMax(maxSendNanos, sendElapsed);
                     failures.incrementAndGet();
@@ -583,37 +714,19 @@ public class MatchedE2eLoadGenerator {
                     done.countDown();
                 }
             }
-
-            boolean confirmed = done.await(config.publisherConfirmTimeoutMs(), TimeUnit.MILLISECONDS);
-            if (!confirmed) {
-                int timedOut = outstandingPublishes.size();
-                confirmTimedOut.addAndGet(timedOut);
-                if (timedOut > 0) {
-                    System.err.printf("publish confirm timed out: sell=%s, timeoutMs=%d, outstanding=%d%n",
-                            sell, config.publisherConfirmTimeoutMs(), timedOut);
-                    outstandingPublishes.clear();
-                }
-            }
+            waitForOutstandingPublishes(outstandingPublishes, confirmTimeoutMs);
+        } catch (Exception e) {
+            throw new RuntimeException("publisher worker failed", e);
         }
-        double elapsedSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
-        double sendWindowSeconds = (lastSendCompletedNanos.get() - started) / 1_000_000_000.0;
-        return new PublishResult(
-                published.get(),
-                attempted.get(),
-                brokerNacked.get(),
-                returned.get(),
-                confirmTimedOut.get(),
-                failures.get(),
-                elapsedSeconds,
-                targetTps,
-                acquireWaitNanos.sum() / 1_000_000_000.0,
-                maxAcquireWaitNanos.get() / 1_000_000.0,
-                sendNanos.sum() / 1_000_000_000.0,
-                maxSendNanos.get() / 1_000_000.0,
-                confirmWaitNanos.sum() / 1_000_000_000.0,
-                maxConfirmWaitNanos.get() / 1_000_000.0,
-                sendWindowSeconds,
-                maxScheduleLagNanos.get() / 1_000_000.0);
+    }
+
+    private static void waitForOutstandingPublishes(
+            ConcurrentNavigableMap<Long, Long> outstandingPublishes,
+            int confirmTimeoutMs) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(confirmTimeoutMs);
+        while (!outstandingPublishes.isEmpty() && System.nanoTime() < deadlineNanos) {
+            TimeUnit.MILLISECONDS.sleep(1);
+        }
     }
 
     private static void completeConfirmedPublishes(
@@ -1505,7 +1618,7 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"matches\": %d,%n", config.events());
         System.out.printf("  \"publishers\": %d,%n", config.publishers());
-        System.out.printf("  \"publisherMode\": \"rabbitmq-java-client-single-channel\",%n");
+        System.out.printf("  \"publisherMode\": \"rabbitmq-java-client-multi-channel\",%n");
         System.out.printf("  \"publisherConnectionCacheSize\": %d,%n", config.publisherConnectionCacheSize());
         System.out.printf("  \"publisherChannelCacheSize\": %d,%n", config.publisherChannelCacheSize());
         System.out.printf("  \"publisherMaxInFlight\": %d,%n", config.publisherMaxInFlight());
@@ -1669,6 +1782,53 @@ public class MatchedE2eLoadGenerator {
         System.out.printf("  \"remainingSellOrders\": %d,%n", remainingSellOrders);
         System.out.printf("  \"remainingBuyOrders\": %d,%n", remainingBuyOrders);
         System.out.printf("  \"activeReservations\": %d%n", reservationCleanupWait.activeReservations());
+        System.out.println("}");
+    }
+
+    private static void printPublishOnlyResult(
+            Config config,
+            PublishResult publish,
+            QueueDepth queueDepth) {
+        double inputAttemptedOrderTps = publish.attempted() / Math.max(publish.sendWindowSeconds(), 0.001);
+        double inputBrokerAckedOrderTps = publish.published() / Math.max(publish.elapsedSeconds(), 0.001);
+        double offeredLoadRatio = config.targetTps() > 0 ? inputBrokerAckedOrderTps / config.targetTps() : 1.0;
+
+        System.out.println("{");
+        System.out.printf("  \"mode\": \"matchedE2ePublishOnly\",%n");
+        System.out.printf("  \"benchmarkSchemaVersion\": %d,%n", BENCHMARK_SCHEMA_VERSION);
+        System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
+        System.out.printf("  \"messages\": %d,%n", config.events());
+        System.out.printf("  \"publishers\": %d,%n", config.publishers());
+        System.out.printf("  \"publisherMode\": \"rabbitmq-java-client-multi-channel\",%n");
+        System.out.printf("  \"publisherConnectionCacheSize\": %d,%n", config.publisherConnectionCacheSize());
+        System.out.printf("  \"publisherChannelCacheSize\": %d,%n", config.publisherChannelCacheSize());
+        System.out.printf("  \"publisherMaxInFlight\": %d,%n", config.publisherMaxInFlight());
+        System.out.printf("  \"publisherConfirmTimeoutMs\": %d,%n", config.publisherConfirmTimeoutMs());
+        System.out.printf("  \"targetTps\": %d,%n", config.targetTps());
+        System.out.printf("  \"durationSeconds\": %d,%n", config.durationSeconds());
+        System.out.printf("  \"expectedPublishSeconds\": %.2f,%n", config.expectedBuyPublishSeconds());
+        System.out.printf("  \"publishAttempts\": %d,%n", publish.attempted());
+        System.out.printf("  \"publishBrokerAcked\": %d,%n", publish.published());
+        System.out.printf("  \"publishBrokerNacked\": %d,%n", publish.brokerNacked());
+        System.out.printf("  \"publishReturned\": %d,%n", publish.returned());
+        System.out.printf("  \"publishConfirmTimedOut\": %d,%n", publish.confirmTimedOut());
+        System.out.printf("  \"publishFailures\": %d,%n", publish.failures());
+        System.out.printf("  \"publishSeconds\": %.2f,%n", publish.elapsedSeconds());
+        System.out.printf("  \"publishAcquireWaitSeconds\": %.4f,%n", publish.acquireWaitSeconds());
+        System.out.printf("  \"publishMaxAcquireWaitMs\": %.3f,%n", publish.maxAcquireWaitMs());
+        System.out.printf("  \"publishSendSeconds\": %.4f,%n", publish.sendSeconds());
+        System.out.printf("  \"publishMaxSendMs\": %.3f,%n", publish.maxSendMs());
+        System.out.printf("  \"publishConfirmWaitSeconds\": %.4f,%n", publish.confirmWaitSeconds());
+        System.out.printf("  \"publishMaxConfirmWaitMs\": %.3f,%n", publish.maxConfirmWaitMs());
+        System.out.printf("  \"publishSendWindowSeconds\": %.4f,%n", publish.sendWindowSeconds());
+        System.out.printf("  \"publishMaxScheduleLagMs\": %.3f,%n", publish.maxScheduleLagMs());
+        System.out.printf("  \"businessInputAttemptedOrderTps\": %.2f,%n", inputAttemptedOrderTps);
+        System.out.printf("  \"businessInputBrokerAckedOrderTps\": %.2f,%n", inputBrokerAckedOrderTps);
+        System.out.printf("  \"offeredLoadRatio\": %.4f,%n", offeredLoadRatio);
+        System.out.printf("  \"matchEngineQueueReadyBeforePurge\": %d,%n", queueDepth.ready());
+        System.out.printf("  \"matchEngineQueueUnackedBeforePurge\": %d,%n", queueDepth.unacked());
+        System.out.printf("  \"matchEngineQueueTotalBeforePurge\": %d,%n", queueDepth.total());
+        System.out.printf("  \"queueMetricsReadFailures\": %d%n", QUEUE_METRICS_READ_FAILURES.get());
         System.out.println("}");
     }
 
