@@ -246,6 +246,9 @@ public class OrderHttpLoadGenerator {
         PrometheusTimerSnapshot walletOrderSubmittedOutboxWrite = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_outbox_write_duration", "")
                 : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot walletOrderSubmittedReservationCte = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_reservation_cte_duration", "")
+                : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot walletOutboxPublish = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_outbox_publish_duration", "")
                 : PrometheusTimerSnapshot.empty();
@@ -388,6 +391,9 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"walletOrderSubmittedOutboxWriteCount\": %.0f,%n", walletOrderSubmittedOutboxWrite.count());
         System.out.printf("  \"walletOrderSubmittedOutboxWriteSumSeconds\": %.6f,%n", walletOrderSubmittedOutboxWrite.sumSeconds());
         System.out.printf("  \"walletOrderSubmittedOutboxWriteMeanMs\": %.3f,%n", walletOrderSubmittedOutboxWrite.meanMillis());
+        System.out.printf("  \"walletOrderSubmittedReservationCteCount\": %.0f,%n", walletOrderSubmittedReservationCte.count());
+        System.out.printf("  \"walletOrderSubmittedReservationCteSumSeconds\": %.6f,%n", walletOrderSubmittedReservationCte.sumSeconds());
+        System.out.printf("  \"walletOrderSubmittedReservationCteMeanMs\": %.3f,%n", walletOrderSubmittedReservationCte.meanMillis());
         System.out.printf("  \"walletOutboxPublishCount\": %.0f,%n", walletOutboxPublish.count());
         System.out.printf("  \"walletOutboxPublishSumSeconds\": %.6f,%n", walletOutboxPublish.sumSeconds());
         System.out.printf("  \"walletOutboxPublishMeanMs\": %.3f,%n", walletOutboxPublish.meanMillis());
