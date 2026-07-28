@@ -167,14 +167,32 @@ public class OrderHttpLoadGenerator {
         AdmissionSnapshot admission = config.orderAdmissionGate()
                 ? waitForOrderAdmission(config, httpClient, objectMapper, orderIds, startedAt)
                 : AdmissionSnapshot.disabled(elapsedSeconds);
+        PrometheusTimerSnapshot orderOutboxSelect = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_select_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderOutboxPublishStage = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_publish_stage_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderOutboxPublishEnqueue = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_publish_enqueue_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderOutboxConfirmWall = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_confirm_wall_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderOutboxMarkSent = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_mark_sent_duration", "")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderOutboxBatch = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_batch_duration", "")
+                : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot matchListener = config.orderAdmissionGate()
-                ? readTimerMetric(config, httpClient, "match_engine_order_confirmed_listener_duration", "")
+                ? readTimerMetric(config, httpClient, config.matchEngineUrl(), "match_engine_order_confirmed_listener_duration", "")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot matchTryMatch = config.orderAdmissionGate()
-                ? readTimerMetric(config, httpClient, "match_engine_try_match_duration", "")
+                ? readTimerMetric(config, httpClient, config.matchEngineUrl(), "match_engine_try_match_duration", "")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot matchReserveRedisEval = config.orderAdmissionGate()
-                ? readTimerMetric(config, httpClient, "match_engine_reserve_order_phase_duration", "phase=\"redis_eval\"")
+                ? readTimerMetric(config, httpClient, config.matchEngineUrl(), "match_engine_reserve_order_phase_duration", "phase=\"redis_eval\"")
                 : PrometheusTimerSnapshot.empty();
         List<String> invalidReasons = invalidReasons(config, accepted.get(), tooManyRequests.get(),
                 unavailable.get(), otherFailures.get(), admission);
@@ -218,6 +236,24 @@ public class OrderHttpLoadGenerator {
                 admission.orderbookAdmissionCount() / Math.max(admission.elapsedSeconds(), 0.001));
         System.out.printf("  \"finalQueueBacklog\": %d,%n", admission.finalQueueBacklog());
         System.out.printf("  \"queueMetricsReadFailures\": %d,%n", admission.queueMetricsReadFailures());
+        System.out.printf("  \"orderOutboxSelectCount\": %.0f,%n", orderOutboxSelect.count());
+        System.out.printf("  \"orderOutboxSelectSumSeconds\": %.6f,%n", orderOutboxSelect.sumSeconds());
+        System.out.printf("  \"orderOutboxSelectMeanMs\": %.3f,%n", orderOutboxSelect.meanMillis());
+        System.out.printf("  \"orderOutboxPublishStageCount\": %.0f,%n", orderOutboxPublishStage.count());
+        System.out.printf("  \"orderOutboxPublishStageSumSeconds\": %.6f,%n", orderOutboxPublishStage.sumSeconds());
+        System.out.printf("  \"orderOutboxPublishStageMeanMs\": %.3f,%n", orderOutboxPublishStage.meanMillis());
+        System.out.printf("  \"orderOutboxPublishEnqueueCount\": %.0f,%n", orderOutboxPublishEnqueue.count());
+        System.out.printf("  \"orderOutboxPublishEnqueueSumSeconds\": %.6f,%n", orderOutboxPublishEnqueue.sumSeconds());
+        System.out.printf("  \"orderOutboxPublishEnqueueMeanMs\": %.3f,%n", orderOutboxPublishEnqueue.meanMillis());
+        System.out.printf("  \"orderOutboxConfirmWallCount\": %.0f,%n", orderOutboxConfirmWall.count());
+        System.out.printf("  \"orderOutboxConfirmWallSumSeconds\": %.6f,%n", orderOutboxConfirmWall.sumSeconds());
+        System.out.printf("  \"orderOutboxConfirmWallMeanMs\": %.3f,%n", orderOutboxConfirmWall.meanMillis());
+        System.out.printf("  \"orderOutboxMarkSentCount\": %.0f,%n", orderOutboxMarkSent.count());
+        System.out.printf("  \"orderOutboxMarkSentSumSeconds\": %.6f,%n", orderOutboxMarkSent.sumSeconds());
+        System.out.printf("  \"orderOutboxMarkSentMeanMs\": %.3f,%n", orderOutboxMarkSent.meanMillis());
+        System.out.printf("  \"orderOutboxBatchCount\": %.0f,%n", orderOutboxBatch.count());
+        System.out.printf("  \"orderOutboxBatchSumSeconds\": %.6f,%n", orderOutboxBatch.sumSeconds());
+        System.out.printf("  \"orderOutboxBatchMeanMs\": %.3f,%n", orderOutboxBatch.meanMillis());
         System.out.printf("  \"matchEngineOrderConfirmedListenerCount\": %.0f,%n", matchListener.count());
         System.out.printf("  \"matchEngineOrderConfirmedListenerSumSeconds\": %.6f,%n", matchListener.sumSeconds());
         System.out.printf("  \"matchEngineOrderConfirmedListenerMeanMs\": %.3f,%n", matchListener.meanMillis());
@@ -536,12 +572,13 @@ public class OrderHttpLoadGenerator {
     private static PrometheusTimerSnapshot readTimerMetric(
             Config config,
             HttpClient httpClient,
+            String baseUrl,
             String metricName,
             String requiredLabel) {
         String prometheusBase = metricName + "_seconds";
         try {
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(config.matchEngineUrl() + "/actuator/prometheus"))
+                    .uri(URI.create(baseUrl + "/actuator/prometheus"))
                     .timeout(Duration.ofSeconds(3))
                     .GET()
                     .build();
@@ -566,8 +603,8 @@ public class OrderHttpLoadGenerator {
             }
             return new PrometheusTimerSnapshot(count, sumSeconds);
         } catch (Exception e) {
-            System.err.printf("matchEngine actuator timer read failed: metric=%s, error=%s%n",
-                    metricName, e.getMessage());
+            System.err.printf("actuator timer read failed: baseUrl=%s, metric=%s, error=%s%n",
+                    baseUrl, metricName, e.getMessage());
             return PrometheusTimerSnapshot.empty();
         }
     }
