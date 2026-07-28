@@ -1,6 +1,7 @@
 package com.eap.eap_order.controller;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -18,6 +19,12 @@ public class OrderStatusController {
     // 只維護SSE連接，不存儲狀態資料
     private final Map<UUID, SseEmitter> orderEmitters = new ConcurrentHashMap<>();
     private final Map<UUID, String> orderStatus = new ConcurrentHashMap<>(); // 內存中的簡單狀態
+    private final boolean realtimeUpdatesEnabled;
+
+    public OrderStatusController(
+            @Value("${eap.order.status.realtime-updates-enabled:true}") boolean realtimeUpdatesEnabled) {
+        this.realtimeUpdatesEnabled = realtimeUpdatesEnabled;
+    }
 
     /**
      * 建立SSE連接來監聽特定訂單的狀態變化
@@ -74,6 +81,9 @@ public class OrderStatusController {
      * 接收來自事件監聽器的狀態更新
      */
     public void updateOrderStatus(UUID orderId, String status, String message) {
+        if (!realtimeUpdatesEnabled) {
+            return;
+        }
         orderStatus.put(orderId, status);
 
         SseEmitter emitter = orderEmitters.get(orderId);

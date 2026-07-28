@@ -66,13 +66,38 @@ public class OrderEventSourcingService {
     }
 
     public void confirm(OrderConfirmedEvent source) {
+        appender.appendFromConsumer(confirmationCommand(source));
+    }
+
+    public void confirmAll(List<OrderConfirmedEvent> sources) {
+        if (sources == null || sources.isEmpty()) {
+            return;
+        }
+        if (sources.size() == 1) {
+            confirm(sources.get(0));
+            return;
+        }
+        appender.appendFromConsumerBatch(sources.stream()
+                .map(this::confirmationCommand)
+                .toList());
+    }
+
+    private OrderEventAppendCommand confirmationCommand(OrderConfirmedEvent source) {
         LocalDateTime occurredAt = source.getCreatedAt() == null
                 ? LocalDateTime.now()
                 : source.getCreatedAt();
         OrderAssetReservationConfirmedV1 event = new OrderAssetReservationConfirmedV1(
                 source.getOrderId(), source.getUserId(), occurredAt);
-        appendFromConsumer(source.getOrderId(), 1, eventId(source.getOrderId(), "ASSET_RESERVATION_CONFIRMED"),
-                "OrderAssetReservationConfirmedV1", event, source.getUserId(), occurredAt, null);
+        return new OrderEventAppendCommand(
+                source.getOrderId(),
+                1,
+                eventId(source.getOrderId(), "ASSET_RESERVATION_CONFIRMED"),
+                "OrderAssetReservationConfirmedV1",
+                event,
+                Map.of("correlationId", source.getOrderId().toString(), "userId", source.getUserId().toString()),
+                1,
+                occurredAt,
+                null);
     }
 
     public void fail(OrderFailedEvent source) {

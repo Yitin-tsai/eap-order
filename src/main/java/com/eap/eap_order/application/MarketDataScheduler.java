@@ -2,6 +2,7 @@ package com.eap.eap_order.application;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Component;
  * 定期推送市場統計數據和訂單簿數據
  */
 @Component
+@ConditionalOnProperty(name = "eap.order.market-data-scheduler.enabled", havingValue = "true", matchIfMissing = true)
 @RequiredArgsConstructor
 @Slf4j
 public class MarketDataScheduler {

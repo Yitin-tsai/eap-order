@@ -144,6 +144,17 @@ public class OrderEventAppender {
         return consumerTransactionTemplate.execute(status -> appendInTransaction(command, consumerJdbc));
     }
 
+    public void appendFromConsumerBatch(List<OrderEventAppendCommand> commands) {
+        if (commands == null || commands.isEmpty()) {
+            return;
+        }
+        consumerTransactionTemplate.executeWithoutResult(status -> {
+            for (OrderEventAppendCommand command : commands) {
+                appendInTransaction(command, consumerJdbc);
+            }
+        });
+    }
+
     public OrderEventAppendResult appendCancellationIfCurrentStateAllows(OrderEventAppendCommand command) {
         return commandTransactionTemplate.execute(status ->
                 appendCancellationIfCurrentStateAllowsInTransaction(command));

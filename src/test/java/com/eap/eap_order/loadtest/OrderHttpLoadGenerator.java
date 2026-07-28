@@ -358,14 +358,18 @@ public class OrderHttpLoadGenerator {
                 lastNonZeroQueues = queueSnapshot.nonZeroQueues();
                 lastNonZeroQueuesObservedSeconds = elapsedSince(startedAtNanos);
             }
-            if (finalQueueBacklog == 0 && queueMetricsReadFailures == 0 && queueDrainReachedSeconds == 0) {
-                queueDrainReachedSeconds = elapsedSince(startedAtNanos);
-            }
-            if (submissionRequestedRows == config.events()
+            boolean durableFactsReached = submissionRequestedRows == config.events()
                     && orderSubmittedOutboxSentRows == config.events()
                     && walletOrderSubmissionClaimRows == config.events()
                     && assetReservationConfirmedRows == config.events()
-                    && orderbookAdmissionCount == config.events()
+                    && orderbookAdmissionCount == config.events();
+            if (durableFactsReached
+                    && finalQueueBacklog == 0
+                    && queueMetricsReadFailures == 0
+                    && queueDrainReachedSeconds == 0) {
+                queueDrainReachedSeconds = elapsedSince(startedAtNanos);
+            }
+            if (durableFactsReached
                     && finalQueueBacklog == 0
                     && queueMetricsReadFailures == 0) {
                 break;

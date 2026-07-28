@@ -51,6 +51,7 @@ public class OrderStatusUpdateListener {
         }
 
         try {
+            orderEventSourcingService.confirmAll(events);
             for (OrderConfirmedEvent event : events) {
                 log.info("收到 Wallet 資產保留成功事件，更新訂單狀態: {}", event.getOrderId());
                 orderStatusController.updateOrderStatus(
@@ -58,8 +59,6 @@ public class OrderStatusUpdateListener {
                     "WALLET_CHECK_PASSED",
                     "餘額檢查通過，已進入撮合佇列"
                 );
-
-                orderEventSourcingService.confirm(event);
             }
         } catch (Exception e) {
             log.warn("Failed to apply OrderConfirmedEvent batch to Order state: size={}", events.size(), e);
