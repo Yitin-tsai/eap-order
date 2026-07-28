@@ -352,4 +352,20 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-020" author="eap">
+        <comment>Allow Order outbox relay to claim in-flight records for bounded asynchronous publisher confirms</comment>
+        <sql>
+            ALTER TABLE order_service.order_event_outbox
+            DROP CONSTRAINT IF EXISTS ck_order_outbox_status;
+
+            ALTER TABLE order_service.order_event_outbox
+            ADD CONSTRAINT ck_order_outbox_status
+                CHECK (status IN ('PENDING', 'IN_FLIGHT', 'SENT', 'FAILED'));
+
+            CREATE INDEX IF NOT EXISTS idx_order_outbox_in_flight_timeout
+                ON order_service.order_event_outbox(updated_at)
+                WHERE status = 'IN_FLIGHT';
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

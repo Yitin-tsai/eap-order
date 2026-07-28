@@ -41,6 +41,9 @@ eap:
     batch-size: ${EAP_ORDER_OUTBOX_BATCH_SIZE:500}
     publish-concurrency: ${EAP_ORDER_OUTBOX_PUBLISH_CONCURRENCY:1}
     batch-confirm-enabled: ${EAP_ORDER_OUTBOX_BATCH_CONFIRM_ENABLED:true}
+    async-relay-enabled: ${EAP_ORDER_OUTBOX_ASYNC_RELAY_ENABLED:false}
+    async-max-in-flight-batches: ${EAP_ORDER_OUTBOX_ASYNC_MAX_IN_FLIGHT_BATCHES:4}
+    in-flight-timeout-seconds: ${EAP_ORDER_OUTBOX_IN_FLIGHT_TIMEOUT_SECONDS:30}
     poll-interval-ms: ${EAP_ORDER_OUTBOX_POLL_INTERVAL_MS:100}
   order-projection:
     enabled: true
