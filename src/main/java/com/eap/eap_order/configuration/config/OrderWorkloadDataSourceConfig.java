@@ -35,6 +35,12 @@ public class OrderWorkloadDataSourceConfig {
         return new JpaTransactionManager(entityManagerFactory);
     }
 
+    @Bean(name = "orderCommandTransactionManager")
+    public PlatformTransactionManager orderCommandTransactionManager(
+            @Qualifier("dataSource") DataSource dataSource) {
+        return new DataSourceTransactionManager(dataSource);
+    }
+
     @Primary
     @Bean(name = "jdbcTemplate")
     public JdbcTemplate jdbcTemplate(@Qualifier("dataSource") DataSource dataSource) {

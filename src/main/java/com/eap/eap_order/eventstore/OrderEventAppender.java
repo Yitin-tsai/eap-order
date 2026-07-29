@@ -123,7 +123,7 @@ public class OrderEventAppender {
     public OrderEventAppender(
             @Qualifier("namedParameterJdbcTemplate") NamedParameterJdbcTemplate commandJdbc,
             @Qualifier("orderConsumerNamedParameterJdbcTemplate") NamedParameterJdbcTemplate consumerJdbc,
-            @Qualifier("transactionManager") PlatformTransactionManager transactionManager,
+            @Qualifier("orderCommandTransactionManager") PlatformTransactionManager transactionManager,
             @Qualifier("orderConsumerTransactionManager") PlatformTransactionManager consumerTransactionManager,
             ObjectMapper objectMapper,
             OrderTradeApplyMetrics tradeApplyMetrics,
@@ -142,20 +142,37 @@ public class OrderEventAppender {
     public OrderEventAppendResult append(OrderEventAppendCommand command) {
         boolean recordSubmissionAppend = command.payload() instanceof OrderSubmissionRequestedV1;
         long startedNanos = System.nanoTime();
+        long[] callbackStartedNanos = new long[1];
+        long[] bodyCompletedNanos = new long[1];
         try {
             return commandTransactionTemplate.execute(status -> {
+                callbackStartedNanos[0] = System.nanoTime();
+                if (recordSubmissionAppend) {
+                    submissionAppendMetrics.recordNanos(
+                            "transaction_before_callback",
+                            callbackStartedNanos[0] - startedNanos);
+                }
                 long bodyStartedNanos = System.nanoTime();
                 try {
                     return appendInTransaction(command, commandJdbc, recordSubmissionAppend);
                 } finally {
+                    bodyCompletedNanos[0] = System.nanoTime();
                     if (recordSubmissionAppend) {
-                        submissionAppendMetrics.record("transaction_body", bodyStartedNanos);
+                        submissionAppendMetrics.recordNanos(
+                                "transaction_body",
+                                bodyCompletedNanos[0] - bodyStartedNanos);
                     }
                 }
             });
         } finally {
             if (recordSubmissionAppend) {
-                submissionAppendMetrics.record("transaction_total", startedNanos);
+                long completedNanos = System.nanoTime();
+                submissionAppendMetrics.recordNanos("transaction_total", completedNanos - startedNanos);
+                if (bodyCompletedNanos[0] > 0) {
+                    submissionAppendMetrics.recordNanos(
+                            "transaction_after_body",
+                            completedNanos - bodyCompletedNanos[0]);
+                }
             }
         }
     }
@@ -288,11 +305,14 @@ public class OrderEventAppender {
         if (command.expectedVersion() != 0 || !(command.payload() instanceof OrderSubmissionRequestedV1 requested)) {
             return null;
         }
+        long serializeStartedNanos = System.nanoTime();
         String payloadCanonical = serialize(command.payload());
         String metadataCanonical = serialize(command.metadata());
         String integrationPayload = command.integrationEvent().payload() == command.payload()
                 ? payloadCanonical
                 : serialize(command.integrationEvent().payload());
+        submissionAppendMetrics.record("initial_append_serialize_payload_metadata", serializeStartedNanos);
+        long hashStartedNanos = System.nanoTime();
         String hash = computeHash(
                 command,
                 1,
@@ -300,6 +320,7 @@ public class OrderEventAppender {
                 metadataCanonical,
                 GENESIS_HASH
         );
+        submissionAppendMetrics.record("initial_append_compute_hash", hashStartedNanos);
         long startedNanos = System.nanoTime();
         InitialSubmissionAppendCounts result = jdbc.queryForObject("""
                 WITH inserted_head AS (

@@ -19,8 +19,12 @@ public class OrderSubmissionAppendMetrics {
     }
 
     public void record(String phase, long startedNanos) {
+        recordNanos(phase, System.nanoTime() - startedNanos);
+    }
+
+    public void recordNanos(String phase, long durationNanos) {
         timers.computeIfAbsent(phase, this::timer)
-                .record(System.nanoTime() - startedNanos, TimeUnit.NANOSECONDS);
+                .record(Math.max(0, durationNanos), TimeUnit.NANOSECONDS);
     }
 
     private Timer timer(String phase) {
