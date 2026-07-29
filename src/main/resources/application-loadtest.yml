@@ -39,7 +39,7 @@ eap:
         minimum-idle: 1
     listeners:
       asset-reservation-confirmed:
-        concurrency: 16
+        concurrency: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_CONCURRENCY:16}
         batch-size: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_BATCH_SIZE:50}
         receive-timeout-ms: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_RECEIVE_TIMEOUT_MS:25}
       asset-reservation-failed:

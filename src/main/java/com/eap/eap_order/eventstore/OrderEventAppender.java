@@ -376,18 +376,6 @@ public class OrderEventAppender {
                     FROM inserted_head
                     RETURNING global_position
                 ),
-                upserted_matching_state AS (
-                    INSERT INTO order_service.order_matching_state
-                        (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-                    SELECT :aggregateId, :userId, :remainingAmount, 0, 'PENDING_ASSET_CHECK', CURRENT_TIMESTAMP
-                    FROM inserted_head
-                    ON CONFLICT (order_id) DO UPDATE
-                    SET user_id = EXCLUDED.user_id,
-                        remaining_amount = EXCLUDED.remaining_amount,
-                        status = EXCLUDED.status,
-                        updated_at = CURRENT_TIMESTAMP
-                    RETURNING order_id
-                ),
                 inserted_outbox AS (
                     INSERT INTO order_service.order_event_outbox
                         (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
@@ -402,7 +390,6 @@ public class OrderEventAppender {
                     (SELECT COUNT(*) FROM inserted_event) AS inserted_event,
                     (SELECT COALESCE(MAX(global_position), 0) FROM inserted_event) AS global_position,
                     (SELECT COUNT(*) FROM inserted_head) AS updated_head,
-                    (SELECT COUNT(*) FROM upserted_matching_state) AS upserted_matching_state,
                     (SELECT COUNT(*) FROM inserted_outbox) AS inserted_outbox
                 """, new MapSqlParameterSource()
                 .addValue("aggregateId", command.aggregateId())
@@ -426,7 +413,6 @@ public class OrderEventAppender {
                         rs.getInt("inserted_event"),
                         rs.getLong("global_position"),
                         rs.getInt("updated_head"),
-                        rs.getInt("upserted_matching_state"),
                         rs.getInt("inserted_outbox")));
         submissionAppendMetrics.record("initial_append_cte", startedNanos);
         if (result == null || result.insertedHead() == 0) {
@@ -434,7 +420,6 @@ public class OrderEventAppender {
         }
         if (result.insertedEvent() != 1
                 || result.updatedHead() != 1
-                || result.upsertedMatchingState() != 1
                 || result.insertedOutbox() != 1
                 || result.globalPosition() <= 0) {
             throw new IllegalStateException("Initial order submission append fast path did not converge: "
@@ -473,6 +458,9 @@ public class OrderEventAppender {
 
     private void assertCancellationAllowedInTransaction(UUID orderId, UUID actorUserId) {
         MatchingState state = lockMatchingState(commandJdbc, orderId);
+        if (state == null) {
+            state = lockStreamHeadAsMatchingState(commandJdbc, orderId);
+        }
         if (state == null) {
             throw new IllegalStateException("Order command state not found: orderId=" + orderId);
         }
@@ -662,6 +650,25 @@ public class OrderEventAppender {
                         rs.getObject("user_id", UUID.class),
                         rs.getInt("remaining_amount"),
                         rs.getInt("matched_amount"),
+                        rs.getString("status")));
+        return states.isEmpty() ? null : states.get(0);
+    }
+
+    private MatchingState lockStreamHeadAsMatchingState(
+            NamedParameterJdbcTemplate jdbc,
+            UUID orderId) {
+        List<MatchingState> states = jdbc.query("""
+                SELECT user_id, remaining_amount, status
+                FROM order_service.order_stream_heads
+                WHERE aggregate_id = :orderId
+                FOR UPDATE
+                """, new MapSqlParameterSource("orderId", orderId),
+                (rs, rowNum) -> new MatchingState(
+                        rs.getObject("user_id", UUID.class),
+                        (Integer) rs.getObject("remaining_amount") == null
+                                ? 0
+                                : rs.getInt("remaining_amount"),
+                        0,
                         rs.getString("status")));
         return states.isEmpty() ? null : states.get(0);
     }
@@ -1916,7 +1923,6 @@ public class OrderEventAppender {
             int insertedEvent,
             long globalPosition,
             int updatedHead,
-            int upsertedMatchingState,
             int insertedOutbox) {
     }
 }
