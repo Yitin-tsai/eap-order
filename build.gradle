@@ -82,6 +82,13 @@ tasks.register('orderDbCeilingProbe', JavaExec) {
     mainClass = 'com.eap.eap_order.loadtest.OrderDbCeilingProbe'
 }
 
+tasks.register('orderSubmissionDbCeilingProbe', JavaExec) {
+    group = 'verification'
+    description = 'Measure isolated Order initial-submission SQL ceiling without HTTP, RabbitMQ, or Spring overhead.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.OrderSubmissionDbCeilingProbe'
+}
+
 openApiGenerate {
     generatorName = "spring"
     inputSpec = new File("$projectDir/src/main/resources/openapi/orderService.yml").toURI().toASCIIString()
