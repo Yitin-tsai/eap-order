@@ -58,6 +58,7 @@ eap:
       poll-interval-ms: 60000
   rate-limit:
     enabled: ${EAP_RATE_LIMIT_ENABLED:true}
+    backend: ${EAP_RATE_LIMIT_BACKEND:local}
 
 logging:
   level:
