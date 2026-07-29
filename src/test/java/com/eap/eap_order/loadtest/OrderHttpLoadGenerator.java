@@ -318,15 +318,21 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"walletOrderSubmissionClaimReachedSeconds\": %.2f,%n", admission.walletOrderSubmissionClaimReachedSeconds());
         System.out.printf("  \"orderAssetReservationConfirmedRows\": %d,%n", admission.assetReservationConfirmedRows());
         System.out.printf("  \"orderAssetReservationConfirmedReachedSeconds\": %.2f,%n", admission.assetReservationConfirmedReachedSeconds());
+        System.out.printf("  \"orderAssetReservationConfirmedReachTps\": %.2f,%n",
+                admission.assetReservationConfirmedRows() / Math.max(admission.assetReservationConfirmedReachedSeconds(), 0.001));
         System.out.printf("  \"matchEngineOrderbookAdmissionCount\": %d,%n", admission.orderbookAdmissionCount());
         System.out.printf("  \"matchEngineOrderbookAdmissionReachedSeconds\": %.2f,%n", admission.orderbookAdmissionReachedSeconds());
         System.out.printf("  \"matchEngineOrderbookAdmissionTps\": %.2f,%n",
+                admission.orderbookAdmissionCount() / Math.max(admission.orderbookAdmissionReachedSeconds(), 0.001));
+        System.out.printf("  \"businessOrderbookAdmissionTps\": %.2f,%n",
                 admission.orderbookAdmissionCount() / Math.max(admission.orderbookAdmissionReachedSeconds(), 0.001));
         System.out.printf("  \"finalQueueDrainReachedSeconds\": %.2f,%n", admission.queueDrainReachedSeconds());
         System.out.printf("  \"lastNonZeroQueues\": \"%s\",%n", json(admission.lastNonZeroQueues()));
         System.out.printf("  \"lastNonZeroQueuesObservedSeconds\": %.2f,%n", admission.lastNonZeroQueuesObservedSeconds());
         printQueueDiagnostics(admission.queueStats());
         System.out.printf("  \"orderAdmissionGateElapsedSeconds\": %.2f,%n", admission.elapsedSeconds());
+        System.out.printf("  \"businessOrderAdmissionConvergenceTps\": %.2f,%n",
+                admission.orderbookAdmissionCount() / Math.max(admission.elapsedSeconds(), 0.001));
         System.out.printf("  \"businessOrderAdmissionTps\": %.2f,%n",
                 admission.orderbookAdmissionCount() / Math.max(admission.elapsedSeconds(), 0.001));
         System.out.printf("  \"finalQueueBacklog\": %d,%n", admission.finalQueueBacklog());
