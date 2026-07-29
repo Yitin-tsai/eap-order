@@ -186,6 +186,12 @@ public class OrderHttpLoadGenerator {
         PrometheusTimerSnapshot orderOutboxBatch = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_outbox_batch_duration", "")
                 : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderCommandConnectionAcquire = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "hikaricp_connections_acquire", "pool=\"OrderCommandPool\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderCommandConnectionUsage = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "hikaricp_connections_usage", "pool=\"OrderCommandPool\"")
+                : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderSubmissionAppendTransactionTotal = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"transaction_total\"")
                 : PrometheusTimerSnapshot.empty();
@@ -343,6 +349,12 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"orderOutboxBatchCount\": %.0f,%n", orderOutboxBatch.count());
         System.out.printf("  \"orderOutboxBatchSumSeconds\": %.6f,%n", orderOutboxBatch.sumSeconds());
         System.out.printf("  \"orderOutboxBatchMeanMs\": %.3f,%n", orderOutboxBatch.meanMillis());
+        System.out.printf("  \"orderCommandConnectionAcquireCount\": %.0f,%n", orderCommandConnectionAcquire.count());
+        System.out.printf("  \"orderCommandConnectionAcquireSumSeconds\": %.6f,%n", orderCommandConnectionAcquire.sumSeconds());
+        System.out.printf("  \"orderCommandConnectionAcquireMeanMs\": %.3f,%n", orderCommandConnectionAcquire.meanMillis());
+        System.out.printf("  \"orderCommandConnectionUsageCount\": %.0f,%n", orderCommandConnectionUsage.count());
+        System.out.printf("  \"orderCommandConnectionUsageSumSeconds\": %.6f,%n", orderCommandConnectionUsage.sumSeconds());
+        System.out.printf("  \"orderCommandConnectionUsageMeanMs\": %.3f,%n", orderCommandConnectionUsage.meanMillis());
         System.out.printf("  \"orderSubmissionAppendTransactionTotalCount\": %.0f,%n", orderSubmissionAppendTransactionTotal.count());
         System.out.printf("  \"orderSubmissionAppendTransactionTotalSumSeconds\": %.6f,%n", orderSubmissionAppendTransactionTotal.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendTransactionTotalMeanMs\": %.3f,%n", orderSubmissionAppendTransactionTotal.meanMillis());
