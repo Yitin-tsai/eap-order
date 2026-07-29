@@ -328,10 +328,12 @@ public class OrderHttpLoadGenerator {
                 ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_transaction_after_body_duration", "")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot walletConnectionAcquire = config.orderAdmissionGate()
-                ? readTimerMetric(config, httpClient, config.walletUrl(), "hikaricp_connections_acquire", "pool=\"HikariPool-1\"")
+                ? readTimerMetricFirstMatch(config, httpClient, config.walletUrl(), "hikaricp_connections_acquire",
+                        List.of("pool=\"WalletCommandPool\"", "pool=\"HikariPool-1\""))
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot walletConnectionUsage = config.orderAdmissionGate()
-                ? readTimerMetric(config, httpClient, config.walletUrl(), "hikaricp_connections_usage", "pool=\"HikariPool-1\"")
+                ? readTimerMetricFirstMatch(config, httpClient, config.walletUrl(), "hikaricp_connections_usage",
+                        List.of("pool=\"WalletCommandPool\"", "pool=\"HikariPool-1\""))
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot walletOrderSubmittedIdempotencyClaim = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_order_submitted_idempotency_claim_duration", "")
@@ -1037,6 +1039,21 @@ public class OrderHttpLoadGenerator {
                     baseUrl, metricName, e.getMessage());
             return PrometheusTimerSnapshot.empty();
         }
+    }
+
+    private static PrometheusTimerSnapshot readTimerMetricFirstMatch(
+            Config config,
+            HttpClient httpClient,
+            String baseUrl,
+            String metricName,
+            List<String> requiredLabels) {
+        for (String requiredLabel : requiredLabels) {
+            PrometheusTimerSnapshot snapshot = readTimerMetric(config, httpClient, baseUrl, metricName, requiredLabel);
+            if (snapshot.count() > 0) {
+                return snapshot;
+            }
+        }
+        return PrometheusTimerSnapshot.empty();
     }
 
     private static PrometheusTimerSnapshot readSummaryMetric(
