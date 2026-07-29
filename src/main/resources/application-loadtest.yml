@@ -17,6 +17,8 @@ eap:
       enabled: false
     status:
       realtime-updates-enabled: false
+    market-sequence:
+      allocation-block-size: ${EAP_ORDER_MARKET_SEQUENCE_ALLOCATION_BLOCK_SIZE:1}
     datasource:
       consumer:
         maximum-pool-size: 20
@@ -54,6 +56,8 @@ eap:
       enabled: false
       batch-size: 100
       poll-interval-ms: 60000
+  rate-limit:
+    enabled: ${EAP_RATE_LIMIT_ENABLED:true}
 
 logging:
   level:

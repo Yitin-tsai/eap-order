@@ -1,12 +1,15 @@
 package com.eap.eap_order.configuration.ratelimit;
 
+import com.eap.eap_order.application.OrderSubmissionMetrics;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.Collections;
+import java.time.Duration;
 
 @Service
 @RequiredArgsConstructor
@@ -14,6 +17,9 @@ import java.util.Collections;
 public class RateLimitService {
 
     private final StringRedisTemplate redisTemplate;
+    private final OrderSubmissionMetrics metrics;
+    @Value("${eap.rate-limit.enabled:true}")
+    private boolean enabled;
 
     private static final String LUA_SCRIPT = """
             local key = KEYS[1]
@@ -47,6 +53,18 @@ public class RateLimitService {
      * @return true if rate limit is exceeded
      */
     public boolean isRateLimited(String userId, int limit, int windowSeconds) {
+        long startedNanos = System.nanoTime();
+        try {
+            return isRateLimitedInternal(userId, limit, windowSeconds);
+        } finally {
+            metrics.recordRateLimitCheck(Duration.ofNanos(System.nanoTime() - startedNanos));
+        }
+    }
+
+    private boolean isRateLimitedInternal(String userId, int limit, int windowSeconds) {
+        if (!enabled) {
+            return false;
+        }
         String key = "rate_limit:" + userId;
         long now = System.currentTimeMillis();
 

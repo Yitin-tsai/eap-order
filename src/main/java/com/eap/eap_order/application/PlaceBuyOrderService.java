@@ -8,6 +8,7 @@ import com.eap.eap_order.configuration.backpressure.WalletQueueBackpressureGuard
 
 import lombok.extern.slf4j.Slf4j;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -27,29 +28,46 @@ public class PlaceBuyOrderService {
     @Autowired
     private WalletQueueBackpressureGuard backpressureGuard;
 
+    @Autowired
+    private OrderSubmissionMetrics metrics;
+
     public OrderSubmissionResult execute(PlaceBuyOrderReq request) {
-        backpressureGuard.checkCanAcceptOrder();
-        String marketId = MarketSequenceService.DEFAULT_MARKET_ID;
-        Long marketSequence = marketSequenceService.nextSequence(marketId);
-        UUID orderId = request.getOrderId() != null ? request.getOrderId() : UUID.randomUUID();
+        long totalStartedNanos = System.nanoTime();
+        try {
+            long backpressureStartedNanos = System.nanoTime();
+            backpressureGuard.checkCanAcceptOrder();
+            metrics.recordBackpressure(Duration.ofNanos(System.nanoTime() - backpressureStartedNanos));
 
-        OrderSubmittedEvent event =
-            OrderSubmittedEvent.builder()
-                .orderId(orderId)
-                .userId(request.getBidder())
-                .marketId(marketId)
-                .marketSequence(marketSequence)
-                .price(request.getBidPrice())
-                .amount(request.getAmount())
-                .orderType(OrderType.BUY.name())
-                .createdAt(LocalDateTime.now())
-                .build();
-        log.info("Creating buy order: {}", event);
+            String marketId = MarketSequenceService.DEFAULT_MARKET_ID;
+            long sequenceStartedNanos = System.nanoTime();
+            Long marketSequence = marketSequenceService.nextSequence(marketId);
+            metrics.recordMarketSequence(Duration.ofNanos(System.nanoTime() - sequenceStartedNanos));
 
-        // Event Store + integration outbox are committed atomically.
-        orderEventSourcingService.request(event);
-        log.info("Buy order accepted into Event Store: {}", event);
+            long buildEventStartedNanos = System.nanoTime();
+            UUID orderId = request.getOrderId() != null ? request.getOrderId() : UUID.randomUUID();
+            OrderSubmittedEvent event =
+                OrderSubmittedEvent.builder()
+                    .orderId(orderId)
+                    .userId(request.getBidder())
+                    .marketId(marketId)
+                    .marketSequence(marketSequence)
+                    .price(request.getBidPrice())
+                    .amount(request.getAmount())
+                    .orderType(OrderType.BUY.name())
+                    .createdAt(LocalDateTime.now())
+                    .build();
+            metrics.recordBuildEvent(Duration.ofNanos(System.nanoTime() - buildEventStartedNanos));
+            log.info("Creating buy order: {}", event);
 
-        return new OrderSubmissionResult(orderId, marketId, marketSequence);
+            // Event Store + integration outbox are committed atomically.
+            long requestStartedNanos = System.nanoTime();
+            orderEventSourcingService.request(event);
+            metrics.recordEventStoreRequest(Duration.ofNanos(System.nanoTime() - requestStartedNanos));
+            log.info("Buy order accepted into Event Store: {}", event);
+
+            return new OrderSubmissionResult(orderId, marketId, marketSequence);
+        } finally {
+            metrics.recordTotal(Duration.ofNanos(System.nanoTime() - totalStartedNanos));
+        }
     }
 }

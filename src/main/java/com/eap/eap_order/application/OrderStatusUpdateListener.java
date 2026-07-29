@@ -46,6 +46,7 @@ public class OrderStatusUpdateListener {
             return;
         }
         long listenerStartedAt = System.nanoTime();
+        metrics.recordBatchSize(messages.size());
         List<OrderConfirmedEvent> events;
         try {
             long deserializeStartedAt = System.nanoTime();

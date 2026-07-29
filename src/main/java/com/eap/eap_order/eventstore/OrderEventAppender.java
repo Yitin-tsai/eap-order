@@ -119,6 +119,7 @@ public class OrderEventAppender {
     private final ObjectMapper canonicalObjectMapper;
     private final OrderTradeApplyMetrics tradeApplyMetrics;
     private final OrderSubmissionAppendMetrics submissionAppendMetrics;
+    private final OrderAssetReservationAppendMetrics assetReservationAppendMetrics;
 
     public OrderEventAppender(
             @Qualifier("namedParameterJdbcTemplate") NamedParameterJdbcTemplate commandJdbc,
@@ -127,13 +128,15 @@ public class OrderEventAppender {
             @Qualifier("orderConsumerTransactionManager") PlatformTransactionManager consumerTransactionManager,
             ObjectMapper objectMapper,
             OrderTradeApplyMetrics tradeApplyMetrics,
-            OrderSubmissionAppendMetrics submissionAppendMetrics) {
+            OrderSubmissionAppendMetrics submissionAppendMetrics,
+            OrderAssetReservationAppendMetrics assetReservationAppendMetrics) {
         this.commandJdbc = commandJdbc;
         this.consumerJdbc = consumerJdbc;
         this.commandTransactionTemplate = new TransactionTemplate(transactionManager);
         this.consumerTransactionTemplate = new TransactionTemplate(consumerTransactionManager);
         this.tradeApplyMetrics = tradeApplyMetrics;
         this.submissionAppendMetrics = submissionAppendMetrics;
+        this.assetReservationAppendMetrics = assetReservationAppendMetrics;
         this.canonicalObjectMapper = objectMapper.copy()
                 .configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true)
                 .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
@@ -211,18 +214,48 @@ public class OrderEventAppender {
     }
 
     private void appendAssetReservationConfirmedBatch(List<OrderEventAppendCommand> commands) {
-        consumerTransactionTemplate.executeWithoutResult(status -> {
-            Map<UUID, StreamHead> heads = lockHeads(consumerJdbc, commands.stream()
-                    .map(OrderEventAppendCommand::aggregateId)
-                    .toList());
-            if (heads.size() != commands.size() || heads.values().stream().anyMatch(head -> head.currentVersion() != 1)) {
-                for (OrderEventAppendCommand command : commands) {
-                    appendInTransaction(command, consumerJdbc);
+        long startedNanos = System.nanoTime();
+        long[] callbackStartedNanos = new long[1];
+        long[] bodyCompletedNanos = new long[1];
+        try {
+            consumerTransactionTemplate.executeWithoutResult(status -> {
+                callbackStartedNanos[0] = System.nanoTime();
+                assetReservationAppendMetrics.recordNanos(
+                        "transaction_before_callback",
+                        callbackStartedNanos[0] - startedNanos);
+                long bodyStartedNanos = System.nanoTime();
+                try {
+                    long lockStartedNanos = System.nanoTime();
+                    Map<UUID, StreamHead> heads = lockHeads(consumerJdbc, commands.stream()
+                            .map(OrderEventAppendCommand::aggregateId)
+                            .toList());
+                    assetReservationAppendMetrics.record("lock_heads", lockStartedNanos);
+                    if (heads.size() != commands.size()
+                            || heads.values().stream().anyMatch(head -> head.currentVersion() != 1)) {
+                        long fallbackStartedNanos = System.nanoTime();
+                        for (OrderEventAppendCommand command : commands) {
+                            appendInTransaction(command, consumerJdbc);
+                        }
+                        assetReservationAppendMetrics.record("fallback_individual_append", fallbackStartedNanos);
+                        return;
+                    }
+                    appendAssetReservationConfirmedBatchWithLockedHeads(commands, heads);
+                } finally {
+                    bodyCompletedNanos[0] = System.nanoTime();
+                    assetReservationAppendMetrics.recordNanos(
+                            "transaction_body",
+                            bodyCompletedNanos[0] - bodyStartedNanos);
                 }
-                return;
+            });
+        } finally {
+            long completedNanos = System.nanoTime();
+            assetReservationAppendMetrics.recordNanos("transaction_total", completedNanos - startedNanos);
+            if (bodyCompletedNanos[0] > 0) {
+                assetReservationAppendMetrics.recordNanos(
+                        "transaction_after_body",
+                        completedNanos - bodyCompletedNanos[0]);
             }
-            appendAssetReservationConfirmedBatchWithLockedHeads(commands, heads);
-        });
+        }
     }
 
     public OrderEventAppendResult appendCancellationIfCurrentStateAllows(OrderEventAppendCommand command) {
@@ -1056,6 +1089,7 @@ public class OrderEventAppender {
     private void appendAssetReservationConfirmedBatchWithLockedHeads(
             List<OrderEventAppendCommand> commands,
             Map<UUID, StreamHead> heads) {
+        long callbackStartedNanos = System.nanoTime();
         consumerJdbc.getJdbcTemplate().execute((ConnectionCallback<Void>) connection -> {
             Array eventIds = null;
             Array aggregateIds = null;
@@ -1071,6 +1105,7 @@ public class OrderEventAppender {
             Array userIds = null;
             Array remainingAmounts = null;
             Array statuses = null;
+            long statementStartedNanos = System.nanoTime();
             try (PreparedStatement statement = connection.prepareStatement("""
                     WITH input(event_id, aggregate_id, event_type, payload_canonical, metadata_canonical,
                                schema_version, occurred_at, prev_hash, hash, current_version, new_version,
@@ -1123,8 +1158,12 @@ public class OrderEventAppender {
                         (SELECT COUNT(*) FROM updated_heads) AS updated_heads,
                         (SELECT COUNT(*) FROM upserted_matching_state) AS upserted_matching_state
                     """)) {
+                assetReservationAppendMetrics.record("prepare_statement", statementStartedNanos);
+                long prepareArraysStartedNanos = System.nanoTime();
                 AssetReservationConfirmedBatchArrays arrays =
                         assetReservationConfirmedBatchArrays(commands, heads);
+                assetReservationAppendMetrics.record("prepare_batch_arrays", prepareArraysStartedNanos);
+                long createSqlArraysStartedNanos = System.nanoTime();
                 eventIds = connection.createArrayOf("uuid", arrays.eventIds());
                 aggregateIds = connection.createArrayOf("uuid", arrays.aggregateIds());
                 eventTypes = connection.createArrayOf("varchar", arrays.eventTypes());
@@ -1139,6 +1178,8 @@ public class OrderEventAppender {
                 userIds = connection.createArrayOf("uuid", arrays.userIds());
                 remainingAmounts = connection.createArrayOf("integer", arrays.remainingAmounts());
                 statuses = connection.createArrayOf("varchar", arrays.statuses());
+                assetReservationAppendMetrics.record("create_sql_arrays", createSqlArraysStartedNanos);
+                long bindArraysStartedNanos = System.nanoTime();
                 statement.setArray(1, eventIds);
                 statement.setArray(2, aggregateIds);
                 statement.setArray(3, eventTypes);
@@ -1153,7 +1194,10 @@ public class OrderEventAppender {
                 statement.setArray(12, userIds);
                 statement.setArray(13, remainingAmounts);
                 statement.setArray(14, statuses);
+                assetReservationAppendMetrics.record("bind_sql_arrays", bindArraysStartedNanos);
+                long executeStartedNanos = System.nanoTime();
                 try (ResultSet resultSet = statement.executeQuery()) {
+                    assetReservationAppendMetrics.record("execute_cte", executeStartedNanos);
                     if (!resultSet.next()) {
                         throw new IllegalStateException("Asset reservation batch append did not return counts");
                     }
@@ -1180,6 +1224,7 @@ public class OrderEventAppender {
                 freeQuietly(userIds);
                 freeQuietly(remainingAmounts);
                 freeQuietly(statuses);
+                assetReservationAppendMetrics.record("connection_callback", callbackStartedNanos);
             }
         });
     }
