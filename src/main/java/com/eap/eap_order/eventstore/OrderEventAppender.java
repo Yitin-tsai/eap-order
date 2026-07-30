@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -120,6 +121,7 @@ public class OrderEventAppender {
     private final OrderTradeApplyMetrics tradeApplyMetrics;
     private final OrderSubmissionAppendMetrics submissionAppendMetrics;
     private final OrderAssetReservationAppendMetrics assetReservationAppendMetrics;
+    private final SubmissionWriteMode submissionWriteMode;
 
     public OrderEventAppender(
             @Qualifier("namedParameterJdbcTemplate") NamedParameterJdbcTemplate commandJdbc,
@@ -129,7 +131,8 @@ public class OrderEventAppender {
             ObjectMapper objectMapper,
             OrderTradeApplyMetrics tradeApplyMetrics,
             OrderSubmissionAppendMetrics submissionAppendMetrics,
-            OrderAssetReservationAppendMetrics assetReservationAppendMetrics) {
+            OrderAssetReservationAppendMetrics assetReservationAppendMetrics,
+            @Value("${eap.order.submission.write-mode:current_order_path}") String submissionWriteMode) {
         this.commandJdbc = commandJdbc;
         this.consumerJdbc = consumerJdbc;
         this.commandTransactionTemplate = new TransactionTemplate(transactionManager);
@@ -137,6 +140,7 @@ public class OrderEventAppender {
         this.tradeApplyMetrics = tradeApplyMetrics;
         this.submissionAppendMetrics = submissionAppendMetrics;
         this.assetReservationAppendMetrics = assetReservationAppendMetrics;
+        this.submissionWriteMode = SubmissionWriteMode.parse(submissionWriteMode);
         this.canonicalObjectMapper = objectMapper.copy()
                 .configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true)
                 .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
@@ -338,6 +342,9 @@ public class OrderEventAppender {
         if (command.expectedVersion() != 0 || !(command.payload() instanceof OrderSubmissionRequestedV1 requested)) {
             return null;
         }
+        if (submissionWriteMode == SubmissionWriteMode.EVENT_STORE_INTAKE) {
+            return appendInitialSubmissionEventStoreOnly(command);
+        }
         long serializeStartedNanos = System.nanoTime();
         String payloadCanonical = serialize(command.payload());
         String metadataCanonical = serialize(command.metadata());
@@ -432,6 +439,75 @@ public class OrderEventAppender {
                 result.globalPosition(),
                 hash,
                 false
+        );
+    }
+
+    private OrderEventAppendResult appendInitialSubmissionEventStoreOnly(OrderEventAppendCommand command) {
+        long serializeStartedNanos = System.nanoTime();
+        String payloadCanonical = serialize(command.payload());
+        String metadataCanonical = serialize(command.metadata());
+        submissionAppendMetrics.record("event_store_intake_serialize_payload_metadata", serializeStartedNanos);
+        long hashStartedNanos = System.nanoTime();
+        String hash = computeHash(
+                command,
+                1,
+                payloadCanonical,
+                metadataCanonical,
+                GENESIS_HASH
+        );
+        submissionAppendMetrics.record("event_store_intake_compute_hash", hashStartedNanos);
+        long startedNanos = System.nanoTime();
+        EventStoreOnlyAppendResult result = commandJdbc.queryForObject("""
+                WITH inserted_event AS (
+                    INSERT INTO order_service.order_event_store
+                        (event_id, aggregate_id, aggregate_type, aggregate_version,
+                         event_type, payload_canonical, metadata_canonical, schema_version,
+                         occurred_at, prev_hash, hash)
+                    VALUES (:eventId, :aggregateId, :aggregateType, 1,
+                            :eventType, :payload, :metadata, :schemaVersion,
+                            :occurredAt, :genesisHash, :hash)
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING global_position
+                ),
+                existing_event AS (
+                    SELECT global_position
+                    FROM order_service.order_event_store
+                    WHERE event_id = :eventId
+                      AND aggregate_id = :aggregateId
+                      AND aggregate_version = 1
+                      AND event_type = :eventType
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM inserted_event) AS inserted_event,
+                    (SELECT COALESCE(MAX(global_position), 0) FROM inserted_event) AS inserted_global_position,
+                    (SELECT COALESCE(MAX(global_position), 0) FROM existing_event) AS existing_global_position
+                """, new MapSqlParameterSource()
+                .addValue("eventId", command.eventId())
+                .addValue("aggregateId", command.aggregateId())
+                .addValue("aggregateType", AGGREGATE_TYPE)
+                .addValue("eventType", command.eventType())
+                .addValue("payload", payloadCanonical)
+                .addValue("metadata", metadataCanonical)
+                .addValue("schemaVersion", command.schemaVersion())
+                .addValue("occurredAt", command.occurredAt())
+                .addValue("genesisHash", GENESIS_HASH)
+                .addValue("hash", hash),
+                (rs, rowNum) -> new EventStoreOnlyAppendResult(
+                        rs.getInt("inserted_event"),
+                        rs.getLong("inserted_global_position"),
+                        rs.getLong("existing_global_position")));
+        submissionAppendMetrics.record("event_store_intake_insert_event", startedNanos);
+        if (result == null || result.globalPosition() <= 0) {
+            throw new IllegalStateException("Order submission event-store intake did not converge: eventId="
+                    + command.eventId());
+        }
+        return new OrderEventAppendResult(
+                command.aggregateId(),
+                command.eventId(),
+                1,
+                result.globalPosition(),
+                hash,
+                result.insertedEvent() == 0
         );
     }
 
@@ -1924,5 +2000,27 @@ public class OrderEventAppender {
             long globalPosition,
             int updatedHead,
             int insertedOutbox) {
+    }
+
+    private record EventStoreOnlyAppendResult(
+            int insertedEvent,
+            long insertedGlobalPosition,
+            long existingGlobalPosition) {
+
+        long globalPosition() {
+            return insertedGlobalPosition > 0 ? insertedGlobalPosition : existingGlobalPosition;
+        }
+    }
+
+    private enum SubmissionWriteMode {
+        CURRENT_ORDER_PATH,
+        EVENT_STORE_INTAKE;
+
+        private static SubmissionWriteMode parse(String value) {
+            if (value == null || value.isBlank()) {
+                return CURRENT_ORDER_PATH;
+            }
+            return SubmissionWriteMode.valueOf(value.trim().toUpperCase());
+        }
     }
 }

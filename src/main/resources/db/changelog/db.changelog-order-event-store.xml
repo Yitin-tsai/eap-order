@@ -368,4 +368,20 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-021" author="eap">
+        <comment>Allow Order event-store intake rows before command-state projection for experimental checkpoint relay</comment>
+        <sql>
+            ALTER TABLE order_service.order_event_store
+            DROP CONSTRAINT IF EXISTS fk_order_event_stream;
+
+            CREATE TABLE IF NOT EXISTS order_service.order_event_store_relay_checkpoints (
+                relay_name VARCHAR(100) PRIMARY KEY,
+                last_global_position BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_event_store_relay_checkpoint_position
+                    CHECK (last_global_position &gt;= 0)
+            );
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

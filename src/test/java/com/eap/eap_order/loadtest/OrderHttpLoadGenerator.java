@@ -52,6 +52,7 @@ public class OrderHttpLoadGenerator {
     private static final String DEFAULT_ORDER_JDBC_URL = "jdbc:postgresql://localhost:15432/eap_order_db";
     private static final String DEFAULT_WALLET_JDBC_URL = "jdbc:postgresql://localhost:15433/eap_wallet_db";
     private static final String DEFAULT_RABBIT_MANAGEMENT_URL = "http://localhost:15672";
+    private static final String ORDER_SUBMITTED_EVENT_STORE_RELAY = "order_submitted_event_store_relay";
     private static final List<String> ORDER_ADMISSION_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
             ORDER_ORDER_CONFIRMED_QUEUE,
@@ -90,7 +91,7 @@ public class OrderHttpLoadGenerator {
             orderIds.add(deterministicOrderId(config.runId(), i));
         }
         CountDownLatch done = new CountDownLatch(config.events());
-        Semaphore inFlight = new Semaphore(config.workers() * 2);
+        Semaphore inFlight = new Semaphore(config.maxInFlight());
         long startedAt = System.nanoTime();
         ScheduledExecutorService progressReporter = Executors.newSingleThreadScheduledExecutor();
         progressReporter.scheduleAtFixedRate(() -> {
@@ -108,8 +109,8 @@ public class OrderHttpLoadGenerator {
         }, 30, 30, TimeUnit.SECONDS);
 
         System.out.printf(
-                "sending %d HTTP orders, targetTps=%d, workers=%d, side=%s, mode=%s%n",
-                config.events(), config.tps(), config.workers(), config.side(), config.mode());
+                "sending %d HTTP orders, targetTps=%d, workers=%d, maxInFlight=%d, side=%s, mode=%s%n",
+                config.events(), config.tps(), config.workers(), config.maxInFlight(), config.side(), config.mode());
 
         for (int i = 0; i < config.events(); i++) {
             int index = i;
@@ -204,6 +205,18 @@ public class OrderHttpLoadGenerator {
         PrometheusTimerSnapshot orderSubmissionTotal = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"total\"")
                 : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionControllerBuyTotal = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"controller_buy_total\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionControllerSellTotal = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"controller_sell_total\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionControllerAfterService = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"controller_after_service\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionPreEventStore = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"pre_event_store\"")
+                : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderSubmissionBackpressure = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"backpressure_check\"")
                 : PrometheusTimerSnapshot.empty();
@@ -215,6 +228,12 @@ public class OrderHttpLoadGenerator {
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderSubmissionEventStoreRequest = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"event_store_request\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionRateLimitAspect = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"rate_limit_aspect\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionRateLimitKeyExtraction = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"rate_limit_key_extraction\"")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderSubmissionRateLimitCheck = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_phase_duration", "phase=\"rate_limit_check\"")
@@ -260,6 +279,15 @@ public class OrderHttpLoadGenerator {
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderSubmissionAppendInitialAppendComputeHash = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"initial_append_compute_hash\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendEventStoreIntakeSerialize = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"event_store_intake_serialize_payload_metadata\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendEventStoreIntakeComputeHash = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"event_store_intake_compute_hash\"")
+                : PrometheusTimerSnapshot.empty();
+        PrometheusTimerSnapshot orderSubmissionAppendEventStoreIntakeInsertEvent = config.orderAdmissionGate()
+                ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_submission_append_duration", "phase=\"event_store_intake_insert_event\"")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot orderAssetReservationListener = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.orderUrl(), "eap_order_asset_reservation_confirmed_listener_duration", "")
@@ -379,6 +407,11 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"side\": \"%s\",%n", json(config.side()));
         System.out.printf("  \"users\": %d,%n", config.users());
         System.out.printf("  \"targetTps\": %d,%n", config.tps());
+        System.out.printf("  \"orderSubmissionWriteMode\": \"%s\",%n", json(config.orderSubmissionWriteMode()));
+        System.out.printf("  \"orderSubmissionHeadProjectorEnabled\": %s,%n",
+                config.orderSubmissionHeadProjectorEnabled());
+        System.out.printf("  \"orderSubmissionEventStoreRelayEnabled\": %s,%n",
+                config.orderSubmissionEventStoreRelayEnabled());
         System.out.printf("  \"resetData\": %s,%n", config.resetData());
         System.out.printf("  \"flushRedisOnReset\": %s,%n", config.flushRedisOnReset());
         System.out.printf("  \"httpAccepted\": %d,%n", accepted.get());
@@ -394,12 +427,19 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"orderSubmissionRequestedReachedSeconds\": %.2f,%n", admission.submissionRequestedReachedSeconds());
         System.out.printf("  \"orderSubmittedOutboxSentRows\": %d,%n", admission.orderSubmittedOutboxSentRows());
         System.out.printf("  \"orderSubmittedOutboxSentReachedSeconds\": %.2f,%n", admission.orderSubmittedOutboxSentReachedSeconds());
+        System.out.printf("  \"orderSubmittedCheckpointPublishedRows\": %d,%n",
+                admission.orderSubmittedCheckpointPublishedRows());
+        System.out.printf("  \"orderSubmittedCheckpointPublishedReachedSeconds\": %.2f,%n",
+                admission.orderSubmittedCheckpointPublishedReachedSeconds());
+        System.out.printf("  \"orderSubmittedPublicationRows\": %d,%n", admission.orderSubmittedPublicationRows());
+        System.out.printf("  \"orderSubmittedPublicationReachedSeconds\": %.2f,%n",
+                admission.orderSubmittedPublicationReachedSeconds());
         System.out.printf("  \"orderSubmittedRelayWallSeconds\": %.2f,%n",
-                positiveDelta(admission.orderSubmittedOutboxSentReachedSeconds(), admission.submissionRequestedReachedSeconds()));
+                positiveDelta(admission.orderSubmittedPublicationReachedSeconds(), admission.submissionRequestedReachedSeconds()));
         System.out.printf("  \"walletOrderSubmissionClaimRows\": %d,%n", admission.walletOrderSubmissionClaimRows());
         System.out.printf("  \"walletOrderSubmissionClaimReachedSeconds\": %.2f,%n", admission.walletOrderSubmissionClaimReachedSeconds());
         System.out.printf("  \"walletOrderSubmissionClaimLagSeconds\": %.2f,%n",
-                positiveDelta(admission.walletOrderSubmissionClaimReachedSeconds(), admission.orderSubmittedOutboxSentReachedSeconds()));
+                positiveDelta(admission.walletOrderSubmissionClaimReachedSeconds(), admission.orderSubmittedPublicationReachedSeconds()));
         System.out.printf("  \"orderAssetReservationConfirmedRows\": %d,%n", admission.assetReservationConfirmedRows());
         System.out.printf("  \"orderAssetReservationConfirmedReachedSeconds\": %.2f,%n", admission.assetReservationConfirmedReachedSeconds());
         System.out.printf("  \"orderAssetReservationConfirmedReachTps\": %.2f,%n",
@@ -456,27 +496,59 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"orderCommandConnectionAcquireCount\": %.0f,%n", orderCommandConnectionAcquire.count());
         System.out.printf("  \"orderCommandConnectionAcquireSumSeconds\": %.6f,%n", orderCommandConnectionAcquire.sumSeconds());
         System.out.printf("  \"orderCommandConnectionAcquireMeanMs\": %.3f,%n", orderCommandConnectionAcquire.meanMillis());
+        System.out.printf("  \"orderCommandConnectionAcquireMaxMs\": %.3f,%n", orderCommandConnectionAcquire.maxMillis());
         System.out.printf("  \"orderCommandConnectionUsageCount\": %.0f,%n", orderCommandConnectionUsage.count());
         System.out.printf("  \"orderCommandConnectionUsageSumSeconds\": %.6f,%n", orderCommandConnectionUsage.sumSeconds());
         System.out.printf("  \"orderCommandConnectionUsageMeanMs\": %.3f,%n", orderCommandConnectionUsage.meanMillis());
+        System.out.printf("  \"orderCommandConnectionUsageMaxMs\": %.3f,%n", orderCommandConnectionUsage.maxMillis());
         printTimerSnapshot("orderSubmissionTotal", orderSubmissionTotal);
+        printTimerSnapshot("orderSubmissionControllerBuyTotal", orderSubmissionControllerBuyTotal);
+        printTimerSnapshot("orderSubmissionControllerSellTotal", orderSubmissionControllerSellTotal);
+        printTimerSnapshot("orderSubmissionControllerAfterService", orderSubmissionControllerAfterService);
+        printTimerSnapshot("orderSubmissionPreEventStore", orderSubmissionPreEventStore);
         printTimerSnapshot("orderSubmissionBackpressure", orderSubmissionBackpressure);
         printTimerSnapshot("orderSubmissionMarketSequence", orderSubmissionMarketSequence);
         printTimerSnapshot("orderSubmissionBuildEvent", orderSubmissionBuildEvent);
         printTimerSnapshot("orderSubmissionEventStoreRequest", orderSubmissionEventStoreRequest);
+        printTimerSnapshot("orderSubmissionRateLimitAspect", orderSubmissionRateLimitAspect);
+        printTimerSnapshot("orderSubmissionRateLimitKeyExtraction", orderSubmissionRateLimitKeyExtraction);
         printTimerSnapshot("orderSubmissionRateLimitCheck", orderSubmissionRateLimitCheck);
+        printDerivedMeanMillis("orderSubmissionServiceUnattributedMeanMs",
+                orderSubmissionTotal,
+                orderSubmissionPreEventStore,
+                orderSubmissionEventStoreRequest);
+        printDerivedMeanMillis("orderSubmissionPreEventStoreUnattributedMeanMs",
+                orderSubmissionPreEventStore,
+                orderSubmissionBackpressure,
+                orderSubmissionMarketSequence,
+                orderSubmissionBuildEvent);
+        printDerivedMeanMillis("orderSubmissionEventStoreEnvelopeGapMeanMs",
+                orderSubmissionEventStoreRequest,
+                orderSubmissionAppendTransactionTotal);
+        printDerivedMeanMillis("orderSubmissionAppendTransactionUnattributedMeanMs",
+                orderSubmissionAppendTransactionTotal,
+                orderSubmissionAppendTransactionBeforeCallback,
+                orderSubmissionAppendTransactionBody,
+                orderSubmissionAppendTransactionAfterBody);
+        printDerivedMeanMillis("orderSubmissionAppendDbPoolGapMeanMs",
+                orderSubmissionAppendTransactionBeforeCallback,
+                orderCommandConnectionAcquire);
         System.out.printf("  \"orderSubmissionAppendTransactionTotalCount\": %.0f,%n", orderSubmissionAppendTransactionTotal.count());
         System.out.printf("  \"orderSubmissionAppendTransactionTotalSumSeconds\": %.6f,%n", orderSubmissionAppendTransactionTotal.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendTransactionTotalMeanMs\": %.3f,%n", orderSubmissionAppendTransactionTotal.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendTransactionTotalMaxMs\": %.3f,%n", orderSubmissionAppendTransactionTotal.maxMillis());
         System.out.printf("  \"orderSubmissionAppendTransactionBodyCount\": %.0f,%n", orderSubmissionAppendTransactionBody.count());
         System.out.printf("  \"orderSubmissionAppendTransactionBodySumSeconds\": %.6f,%n", orderSubmissionAppendTransactionBody.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendTransactionBodyMeanMs\": %.3f,%n", orderSubmissionAppendTransactionBody.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendTransactionBodyMaxMs\": %.3f,%n", orderSubmissionAppendTransactionBody.maxMillis());
         System.out.printf("  \"orderSubmissionAppendTransactionBeforeCallbackCount\": %.0f,%n", orderSubmissionAppendTransactionBeforeCallback.count());
         System.out.printf("  \"orderSubmissionAppendTransactionBeforeCallbackSumSeconds\": %.6f,%n", orderSubmissionAppendTransactionBeforeCallback.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendTransactionBeforeCallbackMeanMs\": %.3f,%n", orderSubmissionAppendTransactionBeforeCallback.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendTransactionBeforeCallbackMaxMs\": %.3f,%n", orderSubmissionAppendTransactionBeforeCallback.maxMillis());
         System.out.printf("  \"orderSubmissionAppendTransactionAfterBodyCount\": %.0f,%n", orderSubmissionAppendTransactionAfterBody.count());
         System.out.printf("  \"orderSubmissionAppendTransactionAfterBodySumSeconds\": %.6f,%n", orderSubmissionAppendTransactionAfterBody.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendTransactionAfterBodyMeanMs\": %.3f,%n", orderSubmissionAppendTransactionAfterBody.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendTransactionAfterBodyMaxMs\": %.3f,%n", orderSubmissionAppendTransactionAfterBody.maxMillis());
         System.out.printf("  \"orderSubmissionAppendCreateHeadCount\": %.0f,%n", orderSubmissionAppendCreateHead.count());
         System.out.printf("  \"orderSubmissionAppendCreateHeadSumSeconds\": %.6f,%n", orderSubmissionAppendCreateHead.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendCreateHeadMeanMs\": %.3f,%n", orderSubmissionAppendCreateHead.meanMillis());
@@ -501,12 +573,18 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"orderSubmissionAppendInitialAppendCteCount\": %.0f,%n", orderSubmissionAppendInitialAppendCte.count());
         System.out.printf("  \"orderSubmissionAppendInitialAppendCteSumSeconds\": %.6f,%n", orderSubmissionAppendInitialAppendCte.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendInitialAppendCteMeanMs\": %.3f,%n", orderSubmissionAppendInitialAppendCte.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendInitialAppendCteMaxMs\": %.3f,%n", orderSubmissionAppendInitialAppendCte.maxMillis());
         System.out.printf("  \"orderSubmissionAppendInitialAppendSerializeCount\": %.0f,%n", orderSubmissionAppendInitialAppendSerialize.count());
         System.out.printf("  \"orderSubmissionAppendInitialAppendSerializeSumSeconds\": %.6f,%n", orderSubmissionAppendInitialAppendSerialize.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendInitialAppendSerializeMeanMs\": %.3f,%n", orderSubmissionAppendInitialAppendSerialize.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendInitialAppendSerializeMaxMs\": %.3f,%n", orderSubmissionAppendInitialAppendSerialize.maxMillis());
         System.out.printf("  \"orderSubmissionAppendInitialAppendComputeHashCount\": %.0f,%n", orderSubmissionAppendInitialAppendComputeHash.count());
         System.out.printf("  \"orderSubmissionAppendInitialAppendComputeHashSumSeconds\": %.6f,%n", orderSubmissionAppendInitialAppendComputeHash.sumSeconds());
         System.out.printf("  \"orderSubmissionAppendInitialAppendComputeHashMeanMs\": %.3f,%n", orderSubmissionAppendInitialAppendComputeHash.meanMillis());
+        System.out.printf("  \"orderSubmissionAppendInitialAppendComputeHashMaxMs\": %.3f,%n", orderSubmissionAppendInitialAppendComputeHash.maxMillis());
+        printTimerSnapshot("orderSubmissionAppendEventStoreIntakeSerialize", orderSubmissionAppendEventStoreIntakeSerialize);
+        printTimerSnapshot("orderSubmissionAppendEventStoreIntakeComputeHash", orderSubmissionAppendEventStoreIntakeComputeHash);
+        printTimerSnapshot("orderSubmissionAppendEventStoreIntakeInsertEvent", orderSubmissionAppendEventStoreIntakeInsertEvent);
         System.out.printf("  \"orderAssetReservationConfirmedListenerCount\": %.0f,%n", orderAssetReservationListener.count());
         System.out.printf("  \"orderAssetReservationConfirmedListenerSumSeconds\": %.6f,%n", orderAssetReservationListener.sumSeconds());
         System.out.printf("  \"orderAssetReservationConfirmedListenerMeanMs\": %.3f,%n", orderAssetReservationListener.meanMillis());
@@ -641,6 +719,7 @@ public class OrderHttpLoadGenerator {
                          order_service.match_history,
                          order_service.order_trade_execution_inbox,
                          order_service.order_trade_applications,
+                         order_service.order_event_store_relay_checkpoints,
                          order_service.order_event_outbox,
                          order_service.order_matching_state,
                          order_service.orders_current,
@@ -707,6 +786,8 @@ public class OrderHttpLoadGenerator {
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(config.waitTimeoutSeconds());
         long submissionRequestedRows = 0;
         long orderSubmittedOutboxSentRows = 0;
+        long orderSubmittedCheckpointPublishedRows = 0;
+        long orderSubmittedPublicationRows = 0;
         long walletOrderSubmissionClaimRows = 0;
         long assetReservationConfirmedRows = 0;
         long orderbookAdmissionCount = 0;
@@ -721,6 +802,8 @@ public class OrderHttpLoadGenerator {
         }
         double submissionRequestedReachedSeconds = 0;
         double orderSubmittedOutboxSentReachedSeconds = 0;
+        double orderSubmittedCheckpointPublishedReachedSeconds = 0;
+        double orderSubmittedPublicationReachedSeconds = 0;
         double walletOrderSubmissionClaimReachedSeconds = 0;
         double assetReservationConfirmedReachedSeconds = 0;
         double orderbookAdmissionReachedSeconds = 0;
@@ -733,6 +816,18 @@ public class OrderHttpLoadGenerator {
             orderSubmittedOutboxSentRows = countOrderSubmittedOutbox(config, orderIds, "SENT");
             if (orderSubmittedOutboxSentRows == config.events() && orderSubmittedOutboxSentReachedSeconds == 0) {
                 orderSubmittedOutboxSentReachedSeconds = elapsedSince(startedAtNanos);
+            }
+            orderSubmittedCheckpointPublishedRows = countOrderSubmittedCheckpointPublished(config, orderIds);
+            if (orderSubmittedCheckpointPublishedRows == config.events()
+                    && orderSubmittedCheckpointPublishedReachedSeconds == 0) {
+                orderSubmittedCheckpointPublishedReachedSeconds = elapsedSince(startedAtNanos);
+            }
+            orderSubmittedPublicationRows = Math.max(
+                    orderSubmittedOutboxSentRows,
+                    orderSubmittedCheckpointPublishedRows);
+            if (orderSubmittedPublicationRows == config.events()
+                    && orderSubmittedPublicationReachedSeconds == 0) {
+                orderSubmittedPublicationReachedSeconds = elapsedSince(startedAtNanos);
             }
             walletOrderSubmissionClaimRows = countWalletOrderSubmissionClaims(config, orderIds);
             if (walletOrderSubmissionClaimRows == config.events() && walletOrderSubmissionClaimReachedSeconds == 0) {
@@ -763,7 +858,7 @@ public class OrderHttpLoadGenerator {
                 }
             }
             boolean durableFactsReached = submissionRequestedRows == config.events()
-                    && orderSubmittedOutboxSentRows == config.events()
+                    && orderSubmittedPublicationRows == config.events()
                     && walletOrderSubmissionClaimRows == config.events()
                     && assetReservationConfirmedRows == config.events()
                     && orderbookAdmissionCount == config.events();
@@ -784,6 +879,8 @@ public class OrderHttpLoadGenerator {
         return new AdmissionSnapshot(
                 submissionRequestedRows,
                 orderSubmittedOutboxSentRows,
+                orderSubmittedCheckpointPublishedRows,
+                orderSubmittedPublicationRows,
                 walletOrderSubmissionClaimRows,
                 assetReservationConfirmedRows,
                 orderbookAdmissionCount,
@@ -791,6 +888,8 @@ public class OrderHttpLoadGenerator {
                 queueMetricsReadFailures,
                 submissionRequestedReachedSeconds,
                 orderSubmittedOutboxSentReachedSeconds,
+                orderSubmittedCheckpointPublishedReachedSeconds,
+                orderSubmittedPublicationReachedSeconds,
                 walletOrderSubmissionClaimReachedSeconds,
                 assetReservationConfirmedReachedSeconds,
                 orderbookAdmissionReachedSeconds,
@@ -839,6 +938,30 @@ public class OrderHttpLoadGenerator {
             Array sqlArray = connection.createArrayOf("uuid", uuidArray);
             statement.setArray(1, sqlArray);
             statement.setString(2, status);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? resultSet.getLong(1) : 0;
+            } finally {
+                sqlArray.free();
+            }
+        }
+    }
+
+    private static long countOrderSubmittedCheckpointPublished(Config config, List<UUID> orderIds) throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                config.orderJdbcUrl(), config.orderJdbcUser(), config.orderJdbcPassword());
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT count(*)
+                     FROM order_service.order_event_store event_store
+                     JOIN order_service.order_event_store_relay_checkpoints checkpoint
+                       ON checkpoint.relay_name = ?
+                      AND event_store.global_position <= checkpoint.last_global_position
+                     WHERE event_store.event_type = 'OrderSubmissionRequestedV1'
+                       AND event_store.aggregate_id = ANY(?)
+                     """)) {
+            statement.setString(1, ORDER_SUBMITTED_EVENT_STORE_RELAY);
+            UUID[] uuidArray = orderIds.toArray(UUID[]::new);
+            Array sqlArray = connection.createArrayOf("uuid", uuidArray);
+            statement.setArray(2, sqlArray);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next() ? resultSet.getLong(1) : 0;
             } finally {
@@ -971,10 +1094,22 @@ public class OrderHttpLoadGenerator {
     private record QueueNonZeroSample(double observedSeconds, String queues) {
     }
 
+    private static void printDerivedMeanMillis(
+            String fieldName,
+            PrometheusTimerSnapshot total,
+            PrometheusTimerSnapshot... knownParts) {
+        double value = total.meanMillis();
+        for (PrometheusTimerSnapshot knownPart : knownParts) {
+            value -= knownPart.meanMillis();
+        }
+        System.out.printf("  \"%s\": %.3f,%n", fieldName, Math.max(0, value));
+    }
+
     private static void printTimerSnapshot(String prefix, PrometheusTimerSnapshot snapshot) {
         System.out.printf("  \"%sCount\": %.0f,%n", prefix, snapshot.count());
         System.out.printf("  \"%sSumSeconds\": %.6f,%n", prefix, snapshot.sumSeconds());
         System.out.printf("  \"%sMeanMs\": %.3f,%n", prefix, snapshot.meanMillis());
+        System.out.printf("  \"%sMaxMs\": %.3f,%n", prefix, snapshot.maxMillis());
     }
 
     private static QueueDepth readQueue(Config config, HttpClient httpClient, ObjectMapper objectMapper, String queue)
@@ -1020,6 +1155,7 @@ public class OrderHttpLoadGenerator {
             }
             double count = 0;
             double sumSeconds = 0;
+            double maxSeconds = 0;
             for (String line : response.body().split("\\R")) {
                 if (line.startsWith("#")) {
                     continue;
@@ -1031,9 +1167,11 @@ public class OrderHttpLoadGenerator {
                     count += prometheusValue(line);
                 } else if (line.startsWith(prometheusBase + "_sum")) {
                     sumSeconds += prometheusValue(line);
+                } else if (line.startsWith(prometheusBase + "_max")) {
+                    maxSeconds = Math.max(maxSeconds, prometheusValue(line));
                 }
             }
-            return new PrometheusTimerSnapshot(count, sumSeconds);
+            return new PrometheusTimerSnapshot(count, sumSeconds, maxSeconds);
         } catch (Exception e) {
             System.err.printf("actuator timer read failed: baseUrl=%s, metric=%s, error=%s%n",
                     baseUrl, metricName, e.getMessage());
@@ -1087,7 +1225,7 @@ public class OrderHttpLoadGenerator {
                     sum += prometheusValue(line);
                 }
             }
-            return new PrometheusTimerSnapshot(count, sum);
+            return new PrometheusTimerSnapshot(count, sum, 0);
         } catch (Exception e) {
             System.err.printf("actuator summary read failed: baseUrl=%s, metric=%s, error=%s%n",
                     baseUrl, metricName, e.getMessage());
@@ -1201,8 +1339,8 @@ public class OrderHttpLoadGenerator {
         if (admission.submissionRequestedRows() != config.events()) {
             reasons.add("order_submission_requested_not_equal_events");
         }
-        if (admission.orderSubmittedOutboxSentRows() != config.events()) {
-            reasons.add("order_submitted_outbox_sent_not_equal_events");
+        if (admission.orderSubmittedPublicationRows() != config.events()) {
+            reasons.add("order_submitted_publication_not_equal_events");
         }
         if (admission.walletOrderSubmissionClaimRows() != config.events()) {
             reasons.add("wallet_order_submission_claim_not_equal_events");
@@ -1292,19 +1430,25 @@ public class OrderHttpLoadGenerator {
     private record QueueSnapshot(long backlog, long readFailures, String nonZeroQueues, Map<String, QueueDepth> depths) {
     }
 
-    private record PrometheusTimerSnapshot(double count, double sumSeconds) {
+    private record PrometheusTimerSnapshot(double count, double sumSeconds, double maxSeconds) {
         static PrometheusTimerSnapshot empty() {
-            return new PrometheusTimerSnapshot(0, 0);
+            return new PrometheusTimerSnapshot(0, 0, 0);
         }
 
         double meanMillis() {
             return count <= 0 ? 0 : (sumSeconds / count) * 1000;
+        }
+
+        double maxMillis() {
+            return maxSeconds * 1000;
         }
     }
 
     private record AdmissionSnapshot(
             long submissionRequestedRows,
             long orderSubmittedOutboxSentRows,
+            long orderSubmittedCheckpointPublishedRows,
+            long orderSubmittedPublicationRows,
             long walletOrderSubmissionClaimRows,
             long assetReservationConfirmedRows,
             long orderbookAdmissionCount,
@@ -1312,6 +1456,8 @@ public class OrderHttpLoadGenerator {
             long queueMetricsReadFailures,
             double submissionRequestedReachedSeconds,
             double orderSubmittedOutboxSentReachedSeconds,
+            double orderSubmittedCheckpointPublishedReachedSeconds,
+            double orderSubmittedPublicationReachedSeconds,
             double walletOrderSubmissionClaimReachedSeconds,
             double assetReservationConfirmedReachedSeconds,
             double orderbookAdmissionReachedSeconds,
@@ -1323,8 +1469,8 @@ public class OrderHttpLoadGenerator {
             double elapsedSeconds) {
         static AdmissionSnapshot disabled(double elapsedSeconds) {
             return new AdmissionSnapshot(
-                    0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0,
                     "", 0, List.of(), Map.of(), elapsedSeconds);
         }
     }
@@ -1337,6 +1483,10 @@ public class OrderHttpLoadGenerator {
             int events,
             int tps,
             int workers,
+            int maxInFlight,
+            String orderSubmissionWriteMode,
+            boolean orderSubmissionHeadProjectorEnabled,
+            boolean orderSubmissionEventStoreRelayEnabled,
             int waitTimeoutSeconds,
             boolean orderAdmissionGate,
             boolean resetData,
@@ -1367,6 +1517,7 @@ public class OrderHttpLoadGenerator {
             if (!"BUY".equals(side) && !"SELL".equals(side)) {
                 throw new IllegalArgumentException("--side must be BUY or SELL");
             }
+            int workers = intArg(args, "--workers", 128);
             return new Config(
                     mode,
                     stringArg(args, "--run-id", "ORDER_ADMISSION_" + Instant.now().toEpochMilli()),
@@ -1374,7 +1525,11 @@ public class OrderHttpLoadGenerator {
                     intArg(args, "--users", 500),
                     events,
                     tps,
-                    intArg(args, "--workers", 128),
+                    workers,
+                    intArg(args, "--max-in-flight", workers * 2),
+                    stringArg(args, "--order-submission-write-mode", "current_order_path"),
+                    booleanArg(args, "--order-submission-head-projector-enabled", false),
+                    booleanArg(args, "--order-submission-event-store-relay-enabled", false),
                     intArg(args, "--wait-timeout-seconds", 120),
                     booleanArg(args, "--order-admission-gate", true),
                     booleanArg(args, "--reset-data", true),

@@ -33,6 +33,7 @@ public class PlaceBuyOrderService {
 
     public OrderSubmissionResult execute(PlaceBuyOrderReq request) {
         long totalStartedNanos = System.nanoTime();
+        long preEventStoreStartedNanos = totalStartedNanos;
         try {
             long backpressureStartedNanos = System.nanoTime();
             backpressureGuard.checkCanAcceptOrder();
@@ -60,6 +61,7 @@ public class PlaceBuyOrderService {
             log.info("Creating buy order: {}", event);
 
             // Event Store + integration outbox are committed atomically.
+            metrics.recordPreEventStore(Duration.ofNanos(System.nanoTime() - preEventStoreStartedNanos));
             long requestStartedNanos = System.nanoTime();
             orderEventSourcingService.request(event);
             metrics.recordEventStoreRequest(Duration.ofNanos(System.nanoTime() - requestStartedNanos));

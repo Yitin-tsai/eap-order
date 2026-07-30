@@ -27,7 +27,7 @@ public class OrderSubmissionDbCeilingProbe {
     private static final String DEFAULT_PASSWORD = "admin123";
     private static final String GENESIS_HASH = "0".repeat(64);
 
-    private static final String INITIAL_APPEND_SQL = """
+    private static final String CURRENT_ORDER_PATH_SQL = """
             WITH inserted_head AS (
                 INSERT INTO order_service.order_stream_heads
                     (aggregate_id, current_version, last_event_id, last_hash,
@@ -48,18 +48,6 @@ public class OrderSubmissionDbCeilingProbe {
                 FROM inserted_head
                 RETURNING global_position
             ),
-            upserted_matching_state AS (
-                INSERT INTO order_service.order_matching_state
-                    (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-                SELECT ?, ?, ?, 0, 'PENDING_ASSET_CHECK', CURRENT_TIMESTAMP
-                FROM inserted_head
-                ON CONFLICT (order_id) DO UPDATE
-                SET user_id = EXCLUDED.user_id,
-                    remaining_amount = EXCLUDED.remaining_amount,
-                    status = EXCLUDED.status,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING order_id
-            ),
             inserted_outbox AS (
                 INSERT INTO order_service.order_event_outbox
                     (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
@@ -73,16 +61,113 @@ public class OrderSubmissionDbCeilingProbe {
                 (SELECT COUNT(*) FROM inserted_head) AS inserted_head,
                 (SELECT COUNT(*) FROM inserted_event) AS inserted_event,
                 (SELECT COUNT(*) FROM inserted_head) AS updated_head,
-                (SELECT COUNT(*) FROM upserted_matching_state) AS upserted_matching_state,
                 (SELECT COUNT(*) FROM inserted_outbox) AS inserted_outbox
+            """;
+
+    private static final String EVENT_STORE_ONLY_SQL = """
+            INSERT INTO order_service.order_submission_event_store_probe
+                (run_id, event_id, aggregate_id, aggregate_type, aggregate_version,
+                 event_type, payload_canonical, metadata_canonical, schema_version,
+                 occurred_at, prev_hash, hash)
+            VALUES
+                (?, ?, ?, 'Order', 1, 'OrderSubmissionRequestedV1', ?, ?, 1, ?, ?, ?)
+            ON CONFLICT (event_id) DO NOTHING
+            """;
+
+    private static final String INTAKE_LOG_ONLY_SQL = """
+            INSERT INTO order_service.order_submission_intake_probe
+                (run_id, command_id, order_id, user_id, market_id, market_sequence,
+                 side, price, amount, payload, received_at)
+            VALUES
+                (?, ?, ?, ?, ?, ?, 'SELL', 10, ?, ?, ?)
+            ON CONFLICT (command_id) DO NOTHING
+            """;
+
+    private static final String CREATE_EVENT_STORE_PROBE_SQL = """
+            CREATE TABLE IF NOT EXISTS order_service.order_submission_event_store_probe (
+                global_position BIGSERIAL PRIMARY KEY,
+                run_id VARCHAR(200) NOT NULL,
+                event_id UUID NOT NULL UNIQUE,
+                aggregate_id UUID NOT NULL,
+                aggregate_type VARCHAR(50) NOT NULL,
+                aggregate_version BIGINT NOT NULL,
+                event_type VARCHAR(100) NOT NULL,
+                payload_canonical TEXT NOT NULL,
+                metadata_canonical TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                occurred_at TIMESTAMP NOT NULL,
+                prev_hash VARCHAR(64) NOT NULL,
+                hash VARCHAR(64) NOT NULL
+            )
+            """;
+
+    private static final String CREATE_EVENT_STORE_PROBE_AGGREGATE_INDEX_SQL = """
+            CREATE UNIQUE INDEX IF NOT EXISTS uk_order_submission_event_store_probe_aggregate_version
+                ON order_service.order_submission_event_store_probe(aggregate_id, aggregate_version)
+            """;
+
+    private static final String CREATE_EVENT_STORE_PROBE_RUN_INDEX_SQL = """
+            CREATE INDEX IF NOT EXISTS idx_order_submission_event_store_probe_run_position
+                ON order_service.order_submission_event_store_probe(run_id, global_position)
+            """;
+
+    private static final String CREATE_INTAKE_PROBE_SQL = """
+            CREATE TABLE IF NOT EXISTS order_service.order_submission_intake_probe (
+                id BIGSERIAL PRIMARY KEY,
+                run_id VARCHAR(200) NOT NULL,
+                command_id UUID NOT NULL UNIQUE,
+                order_id UUID NOT NULL UNIQUE,
+                user_id UUID NOT NULL,
+                market_id VARCHAR(100) NOT NULL,
+                market_sequence BIGINT NOT NULL,
+                side VARCHAR(4) NOT NULL,
+                price INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                received_at TIMESTAMP NOT NULL
+            )
+            """;
+
+    private static final String CREATE_INTAKE_PROBE_RUN_INDEX_SQL = """
+            CREATE INDEX IF NOT EXISTS idx_order_submission_intake_probe_run_id
+                ON order_service.order_submission_intake_probe(run_id, id)
             """;
 
     public static void main(String[] args) throws Exception {
         Config config = Config.from(args);
+        prepareSchema(config);
         Result result = run(config);
         printJson(config, result);
         if (result.failures() > 0) {
             throw new IllegalStateException("Order submission DB ceiling probe failed rows=" + result.failures());
+        }
+    }
+
+    private static void prepareSchema(Config config) throws SQLException {
+        if (config.writePath() == WritePath.CURRENT_ORDER_PATH) {
+            return;
+        }
+        try (Connection connection = DriverManager.getConnection(
+                config.jdbcUrl(),
+                config.username(),
+                config.password());
+             java.sql.Statement statement = connection.createStatement()) {
+            if (config.writePath() == WritePath.EVENT_STORE_ONLY) {
+                statement.execute(CREATE_EVENT_STORE_PROBE_SQL);
+                statement.execute(CREATE_EVENT_STORE_PROBE_AGGREGATE_INDEX_SQL);
+                statement.execute(CREATE_EVENT_STORE_PROBE_RUN_INDEX_SQL);
+                if (config.cleanupProbeRows()) {
+                    statement.executeUpdate("DELETE FROM order_service.order_submission_event_store_probe WHERE run_id = '"
+                            + config.marketId().replace("'", "''") + "'");
+                }
+                return;
+            }
+            statement.execute(CREATE_INTAKE_PROBE_SQL);
+            statement.execute(CREATE_INTAKE_PROBE_RUN_INDEX_SQL);
+            if (config.cleanupProbeRows()) {
+                statement.executeUpdate("DELETE FROM order_service.order_submission_intake_probe WHERE run_id = '"
+                        + config.marketId().replace("'", "''") + "'");
+            }
         }
     }
 
@@ -123,7 +208,7 @@ public class OrderSubmissionDbCeilingProbe {
                 config.jdbcUrl(),
                 config.username(),
                 config.password());
-             PreparedStatement statement = connection.prepareStatement(INITIAL_APPEND_SQL)) {
+             PreparedStatement statement = connection.prepareStatement(sql(config.writePath()))) {
             connection.setAutoCommit(config.mode() == Mode.AUTOCOMMIT);
             while (true) {
                 int index = next.getAndIncrement();
@@ -132,10 +217,10 @@ public class OrderSubmissionDbCeilingProbe {
                 }
                 long rowStarted = System.nanoTime();
                 try {
-                    bindInitialAppend(statement, config.marketId(), index + 1, config.amount());
-                    InitialAppendCounts counts = executeInitialAppend(statement);
-                    if (!counts.completed()) {
-                        throw new IllegalStateException("unexpected initial append counts=" + counts);
+                    bind(statement, config, index + 1);
+                    if (!execute(statement, config.writePath())) {
+                        throw new IllegalStateException("unexpected append result for writePath="
+                                + config.writePath());
                     }
                     if (config.mode() != Mode.AUTOCOMMIT) {
                         connection.commit();
@@ -167,11 +252,24 @@ public class OrderSubmissionDbCeilingProbe {
         }
     }
 
-    private static void bindInitialAppend(
-            PreparedStatement statement,
-            String marketId,
-            int index,
-            int amount) throws Exception {
+    private static String sql(WritePath writePath) {
+        return switch (writePath) {
+            case CURRENT_ORDER_PATH -> CURRENT_ORDER_PATH_SQL;
+            case EVENT_STORE_ONLY -> EVENT_STORE_ONLY_SQL;
+            case INTAKE_LOG_ONLY -> INTAKE_LOG_ONLY_SQL;
+        };
+    }
+
+    private static void bind(PreparedStatement statement, Config config, int index) throws Exception {
+        SubmissionRow row = submissionRow(config.marketId(), index, config.amount());
+        switch (config.writePath()) {
+            case CURRENT_ORDER_PATH -> bindCurrentOrderPath(statement, row);
+            case EVENT_STORE_ONLY -> bindEventStoreOnly(statement, config.marketId(), row);
+            case INTAKE_LOG_ONLY -> bindIntakeLogOnly(statement, config.marketId(), index, row);
+        }
+    }
+
+    private static SubmissionRow submissionRow(String marketId, int index, int amount) throws Exception {
         UUID aggregateId = deterministicUuid(marketId + ":order:" + index);
         UUID userId = deterministicUuid(marketId + ":user:" + index);
         UUID eventId = deterministicUuid(aggregateId + ":REQUESTED");
@@ -179,25 +277,50 @@ public class OrderSubmissionDbCeilingProbe {
         String payload = payload(aggregateId, userId, marketId, index, amount, occurredAt);
         String metadata = "{\"correlationId\":\"" + aggregateId + "\",\"userId\":\"" + userId + "\"}";
         String hash = sha256(aggregateId + "|" + eventId + "|" + payload + "|" + metadata);
+        return new SubmissionRow(aggregateId, userId, eventId, occurredAt, amount, payload, metadata, hash);
+    }
 
-        statement.setObject(1, aggregateId);
-        statement.setObject(2, eventId);
-        statement.setString(3, hash);
-        statement.setObject(4, userId);
-        statement.setInt(5, amount);
-        statement.setObject(6, eventId);
-        statement.setObject(7, aggregateId);
-        statement.setString(8, payload);
-        statement.setString(9, metadata);
-        statement.setTimestamp(10, Timestamp.valueOf(occurredAt));
+    private static void bindCurrentOrderPath(PreparedStatement statement, SubmissionRow row) throws SQLException {
+        statement.setObject(1, row.aggregateId());
+        statement.setObject(2, row.eventId());
+        statement.setString(3, row.hash());
+        statement.setObject(4, row.userId());
+        statement.setInt(5, row.amount());
+        statement.setObject(6, row.eventId());
+        statement.setObject(7, row.aggregateId());
+        statement.setString(8, row.payload());
+        statement.setString(9, row.metadata());
+        statement.setTimestamp(10, Timestamp.valueOf(row.occurredAt()));
         statement.setString(11, GENESIS_HASH);
-        statement.setString(12, hash);
-        statement.setObject(13, aggregateId);
-        statement.setObject(14, userId);
-        statement.setInt(15, amount);
-        statement.setObject(16, eventId);
-        statement.setObject(17, aggregateId);
-        statement.setString(18, payload);
+        statement.setString(12, row.hash());
+        statement.setObject(13, row.eventId());
+        statement.setObject(14, row.aggregateId());
+        statement.setString(15, row.payload());
+    }
+
+    private static void bindEventStoreOnly(PreparedStatement statement, String runId, SubmissionRow row)
+            throws SQLException {
+        statement.setString(1, runId);
+        statement.setObject(2, row.eventId());
+        statement.setObject(3, row.aggregateId());
+        statement.setString(4, row.payload());
+        statement.setString(5, row.metadata());
+        statement.setTimestamp(6, Timestamp.valueOf(row.occurredAt()));
+        statement.setString(7, GENESIS_HASH);
+        statement.setString(8, row.hash());
+    }
+
+    private static void bindIntakeLogOnly(PreparedStatement statement, String runId, int index, SubmissionRow row)
+            throws SQLException {
+        statement.setString(1, runId);
+        statement.setObject(2, row.eventId());
+        statement.setObject(3, row.aggregateId());
+        statement.setObject(4, row.userId());
+        statement.setString(5, runId);
+        statement.setLong(6, index);
+        statement.setInt(7, row.amount());
+        statement.setString(8, row.payload());
+        statement.setTimestamp(9, Timestamp.valueOf(row.occurredAt()));
     }
 
     private static String payload(
@@ -219,17 +342,20 @@ public class OrderSubmissionDbCeilingProbe {
                 + "}";
     }
 
-    private static InitialAppendCounts executeInitialAppend(PreparedStatement statement) throws SQLException {
+    private static boolean execute(PreparedStatement statement, WritePath writePath) throws SQLException {
+        if (writePath != WritePath.CURRENT_ORDER_PATH) {
+            return statement.executeUpdate() == 1;
+        }
         try (ResultSet rs = statement.executeQuery()) {
             if (!rs.next()) {
                 throw new IllegalStateException("initial append did not return counts");
             }
-            return new InitialAppendCounts(
+            CurrentOrderPathCounts counts = new CurrentOrderPathCounts(
                     rs.getInt("inserted_head"),
                     rs.getInt("inserted_event"),
                     rs.getInt("updated_head"),
-                    rs.getInt("upserted_matching_state"),
                     rs.getInt("inserted_outbox"));
+            return counts.completed();
         }
     }
 
@@ -264,6 +390,7 @@ public class OrderSubmissionDbCeilingProbe {
     private static void printJson(Config config, Result result) {
         System.out.println("{");
         System.out.printf("  \"mode\": \"orderSubmissionDbCeilingProbe\",%n");
+        System.out.printf("  \"writePath\": \"%s\",%n", config.writePath().name().toLowerCase());
         System.out.printf("  \"transactionMode\": \"%s\",%n", config.mode().name().toLowerCase());
         System.out.printf("  \"marketId\": \"%s\",%n", config.marketId());
         System.out.printf("  \"events\": %d,%n", config.events());
@@ -285,19 +412,34 @@ public class OrderSubmissionDbCeilingProbe {
         TRANSACTION_PER_ROW
     }
 
-    private record InitialAppendCounts(
+    private enum WritePath {
+        CURRENT_ORDER_PATH,
+        EVENT_STORE_ONLY,
+        INTAKE_LOG_ONLY
+    }
+
+    private record CurrentOrderPathCounts(
             int insertedHead,
             int insertedEvent,
             int updatedHead,
-            int upsertedMatchingState,
             int insertedOutbox) {
         boolean completed() {
             return insertedHead == 1
                     && insertedEvent == 1
                     && updatedHead == 1
-                    && upsertedMatchingState == 1
                     && insertedOutbox == 1;
         }
+    }
+
+    private record SubmissionRow(
+            UUID aggregateId,
+            UUID userId,
+            UUID eventId,
+            LocalDateTime occurredAt,
+            int amount,
+            String payload,
+            String metadata,
+            String hash) {
     }
 
     private record Result(
@@ -317,7 +459,9 @@ public class OrderSubmissionDbCeilingProbe {
             int events,
             int workers,
             int amount,
-            Mode mode) {
+            Mode mode,
+            WritePath writePath,
+            boolean cleanupProbeRows) {
 
         private static Config from(String[] args) {
             return new Config(
@@ -328,15 +472,25 @@ public class OrderSubmissionDbCeilingProbe {
                     intArg(args, "--events", 10_000),
                     intArg(args, "--workers", 35),
                     intArg(args, "--amount", 1),
-                    parseMode(stringArg(args, "--mode", "transaction_per_row")));
+                    parseMode(stringArg(args, "--mode", "transaction_per_row")),
+                    parseWritePath(stringArg(args, "--write-path", "current_order_path")),
+                    booleanArg(args, "--cleanup-probe-rows", true));
         }
 
         private static Mode parseMode(String value) {
             return Mode.valueOf(value.toUpperCase());
         }
 
+        private static WritePath parseWritePath(String value) {
+            return WritePath.valueOf(value.toUpperCase());
+        }
+
         private static int intArg(String[] args, String name, int defaultValue) {
             return Integer.parseInt(stringArg(args, name, String.valueOf(defaultValue)));
+        }
+
+        private static boolean booleanArg(String[] args, String name, boolean defaultValue) {
+            return Boolean.parseBoolean(stringArg(args, name, String.valueOf(defaultValue)));
         }
 
         private static String stringArg(String[] args, String name, String defaultValue) {

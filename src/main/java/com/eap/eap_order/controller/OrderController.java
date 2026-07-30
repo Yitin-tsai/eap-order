@@ -3,6 +3,7 @@ package com.eap.eap_order.controller;
 import com.eap.common.event.OrderCancelEvent;
 import com.eap.eap_order.application.OrderQueryService;
 import com.eap.eap_order.application.OrderSubmissionResult;
+import com.eap.eap_order.application.OrderSubmissionMetrics;
 import com.eap.eap_order.application.PlaceBuyOrderService;
 import com.eap.eap_order.application.PlaceSellOrderService;
 import com.eap.eap_order.application.OutBound.EapMatchEngine;
@@ -27,6 +28,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -45,6 +47,8 @@ public class OrderController {
     @Autowired
     protected OrderQueryService orderQueryService;
     @Autowired
+    private OrderSubmissionMetrics orderSubmissionMetrics;
+    @Autowired
     private EapMatchEngine eapMatchEngine;
     @Autowired
     private OrderEventSourcingService orderEventSourcingService;
@@ -59,17 +63,30 @@ public class OrderController {
             @Parameter(description = "交易編號") @RequestHeader(value = "txnSEq", required = false) String txnSeq,
             @Parameter(description = "掛買單請求") @Valid @RequestBody PlaceBuyOrderReq request) {
 
-        log.info("掛買單請求: {}", request);
-        OrderSubmissionResult result = placeBuyOrderService.execute(request);
+        long controllerStartedNanos = System.nanoTime();
+        long serviceCompletedNanos = 0;
+        try {
+            log.info("掛買單請求: {}", request);
+            OrderSubmissionResult result = placeBuyOrderService.execute(request);
+            serviceCompletedNanos = System.nanoTime();
 
-        Map<String, Object> response = new HashMap<>();
-        response.put("orderId", result.orderId());
-        response.put("marketId", result.marketId());
-        response.put("marketSequence", result.marketSequence());
-        response.put("status", "PENDING_WALLET_CHECK");
-        response.put("message", "訂單已提交，正在檢查餘額...");
+            Map<String, Object> response = new HashMap<>();
+            response.put("orderId", result.orderId());
+            response.put("marketId", result.marketId());
+            response.put("marketSequence", result.marketSequence());
+            response.put("status", "PENDING_WALLET_CHECK");
+            response.put("message", "訂單已提交，正在檢查餘額...");
 
-        return ResponseEntity.ok(response);
+            return ResponseEntity.ok(response);
+        } finally {
+            long completedNanos = System.nanoTime();
+            orderSubmissionMetrics.recordController("BUY",
+                    Duration.ofNanos(completedNanos - controllerStartedNanos));
+            if (serviceCompletedNanos > 0) {
+                orderSubmissionMetrics.recordControllerAfterService(
+                        Duration.ofNanos(completedNanos - serviceCompletedNanos));
+            }
+        }
     }
 
     @Operation(operationId = "post-bid-sell", summary = "掛賣單", description = "掛單功能 - 賣出訂單")
@@ -82,18 +99,30 @@ public class OrderController {
             @Parameter(description = "交易編號") @RequestHeader(value = "txnSEq", required = false) String txnSeq,
             @Parameter(description = "掛賣單請求") @Valid @RequestBody PlaceSellOrderReq request) {
 
-        log.info("掛賣單請求: {}", request);
+        long controllerStartedNanos = System.nanoTime();
+        long serviceCompletedNanos = 0;
+        try {
+            log.info("掛賣單請求: {}", request);
+            OrderSubmissionResult result = placeSellOrderService.placeSellOrder(request);
+            serviceCompletedNanos = System.nanoTime();
 
-        OrderSubmissionResult result = placeSellOrderService.placeSellOrder(request);
+            Map<String, Object> response = new HashMap<>();
+            response.put("orderId", result.orderId());
+            response.put("marketId", result.marketId());
+            response.put("marketSequence", result.marketSequence());
+            response.put("status", "PENDING_WALLET_CHECK");
+            response.put("message", "訂單已提交，正在檢查餘額...");
 
-        Map<String, Object> response = new HashMap<>();
-        response.put("orderId", result.orderId());
-        response.put("marketId", result.marketId());
-        response.put("marketSequence", result.marketSequence());
-        response.put("status", "PENDING_WALLET_CHECK");
-        response.put("message", "訂單已提交，正在檢查餘額...");
-
-        return ResponseEntity.ok(response);
+            return ResponseEntity.ok(response);
+        } finally {
+            long completedNanos = System.nanoTime();
+            orderSubmissionMetrics.recordController("SELL",
+                    Duration.ofNanos(completedNanos - controllerStartedNanos));
+            if (serviceCompletedNanos > 0) {
+                orderSubmissionMetrics.recordControllerAfterService(
+                        Duration.ofNanos(completedNanos - serviceCompletedNanos));
+            }
+        }
     }
 
 

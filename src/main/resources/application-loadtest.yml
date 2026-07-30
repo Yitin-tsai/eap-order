@@ -5,7 +5,7 @@ spring:
     password: admin123
     hikari:
       maximum-pool-size: ${EAP_ORDER_COMMAND_POOL_SIZE:35}
-      minimum-idle: ${EAP_ORDER_COMMAND_POOL_MIN_IDLE:10}
+      minimum-idle: ${EAP_ORDER_COMMAND_POOL_MIN_IDLE:${EAP_ORDER_COMMAND_POOL_SIZE:35}}
   rabbitmq:
     cache:
       channel:
@@ -24,6 +24,18 @@ eap:
   redis:
     share-native-connection: ${EAP_REDIS_SHARE_NATIVE_CONNECTION:true}
   order:
+    submission:
+      write-mode: ${EAP_ORDER_SUBMISSION_WRITE_MODE:current_order_path}
+    submission-head-projector:
+      enabled: ${EAP_ORDER_SUBMISSION_HEAD_PROJECTOR_ENABLED:false}
+      batch-size: ${EAP_ORDER_SUBMISSION_HEAD_PROJECTOR_BATCH_SIZE:500}
+      max-batches-per-tick: ${EAP_ORDER_SUBMISSION_HEAD_PROJECTOR_MAX_BATCHES_PER_TICK:4}
+      poll-interval-ms: ${EAP_ORDER_SUBMISSION_HEAD_PROJECTOR_POLL_INTERVAL_MS:25}
+    submission-event-store-relay:
+      enabled: ${EAP_ORDER_SUBMISSION_EVENT_STORE_RELAY_ENABLED:false}
+      batch-size: ${EAP_ORDER_SUBMISSION_EVENT_STORE_RELAY_BATCH_SIZE:500}
+      poll-interval-ms: ${EAP_ORDER_SUBMISSION_EVENT_STORE_RELAY_POLL_INTERVAL_MS:25}
+      confirm-timeout-ms: ${EAP_ORDER_SUBMISSION_EVENT_STORE_RELAY_CONFIRM_TIMEOUT_MS:5000}
     market-data-scheduler:
       enabled: false
     status:
