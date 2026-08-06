@@ -91,6 +91,7 @@ eap:
         concurrency: 8
         batch-size: 1
         receive-timeout-ms: 50
+        single-round-trip-enabled: false
       asset-reservation-failed:
         concurrency: 4
       order-matched:
@@ -99,3 +100,13 @@ eap:
         concurrency: 4
         batch-size: 1
         receive-timeout-ms: 50
+    trade-execution-reconciler:
+      poll-interval-ms: 100
+      initial-delay-ms: 500
+      batch-size: 100
+      lease-ms: 30000
+      max-attempts: 20
+    trade-execution-inbox-admin:
+      enabled: false
+    trade-execution-inbox-metrics:
+      poll-interval-ms: 10000

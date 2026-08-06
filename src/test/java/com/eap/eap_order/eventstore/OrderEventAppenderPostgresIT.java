@@ -13,8 +13,10 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -45,7 +47,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
                 "spring.liquibase.drop-first=false",
                 "spring.rabbitmq.listener.simple.auto-startup=false",
                 "eap.wallet.base-url=http://localhost:8081/eap-wallet",
-                "eap.matchEngine.base-url=http://localhost:8082/match-engine"
+                "eap.matchEngine.base-url=http://localhost:8082/match-engine",
+                "eap.order.listeners.asset-reservation-confirmed.single-round-trip-enabled=true"
         })
 @EnabledIfSystemProperty(named = "eap.integration.postgres", matches = "true")
 class OrderEventAppenderPostgresIT {
@@ -174,6 +177,65 @@ class OrderEventAppenderPostgresIT {
 
         assertEquals(2L, currentVersion(aggregateId));
         assertMatchingState(aggregateId, 3, 0, "OPEN");
+    }
+
+    @Test
+    void appendAssetConfirmedSingleRoundTripBatch_shouldPreserveHashChainsAndMatchingState() {
+        List<OrderEventAppendResult> initialResults = new ArrayList<>();
+        List<OrderEventAppendCommand> confirmedCommands = new ArrayList<>();
+
+        for (int i = 0; i < 3; i++) {
+            UUID aggregateId = aggregateId();
+            UUID userId = UUID.randomUUID();
+            initialResults.add(appendInitialSubmission(aggregateId, userId, i + 2));
+            confirmedCommands.add(assetReservationConfirmedCommand(aggregateId, userId));
+        }
+
+        appender.appendFromConsumerBatch(confirmedCommands);
+
+        for (int i = 0; i < confirmedCommands.size(); i++) {
+            OrderEventAppendCommand command = confirmedCommands.get(i);
+            OrderEventAppendResult initialResult = initialResults.get(i);
+            Map<String, Object> event = jdbc.queryForMap("""
+                    SELECT payload_canonical, metadata_canonical, prev_hash, hash
+                    FROM order_service.order_event_store
+                    WHERE aggregate_id = ? AND aggregate_version = 2
+                    """, command.aggregateId());
+            String prevHash = (String) event.get("prev_hash");
+            assertEquals(initialResult.hash(), prevHash);
+            assertEquals(expectedHash(
+                            command,
+                            (String) event.get("payload_canonical"),
+                            (String) event.get("metadata_canonical"),
+                            prevHash),
+                    event.get("hash"));
+            assertEquals(2L, currentVersion(command.aggregateId()));
+            assertMatchingState(command.aggregateId(), i + 2, 0, "OPEN");
+        }
+    }
+
+    @Test
+    void appendAssetConfirmedSingleRoundTripBatch_ineligibleBatchShouldPreserveDuplicateFallback() {
+        UUID duplicateOrderId = aggregateId();
+        UUID duplicateUserId = UUID.randomUUID();
+        UUID freshOrderId = aggregateId();
+        UUID freshUserId = UUID.randomUUID();
+        appendInitialSubmission(duplicateOrderId, duplicateUserId, 3);
+        appendInitialSubmission(freshOrderId, freshUserId, 4);
+        OrderEventAppendCommand duplicateCommand =
+                assetReservationConfirmedCommand(duplicateOrderId, duplicateUserId);
+        OrderEventAppendCommand freshCommand =
+                assetReservationConfirmedCommand(freshOrderId, freshUserId);
+
+        appender.appendFromConsumerBatch(List.of(duplicateCommand));
+        appender.appendFromConsumerBatch(List.of(duplicateCommand, freshCommand));
+
+        assertEquals(2, count("order_event_store", duplicateOrderId));
+        assertEquals(2, count("order_event_store", freshOrderId));
+        assertEquals(2L, currentVersion(duplicateOrderId));
+        assertEquals(2L, currentVersion(freshOrderId));
+        assertMatchingState(duplicateOrderId, 3, 0, "OPEN");
+        assertMatchingState(freshOrderId, 4, 0, "OPEN");
     }
 
     @Test
@@ -348,7 +410,7 @@ class OrderEventAppenderPostgresIT {
     void appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent_shouldApplyTradeWithoutOutbox() {
         UUID buyerOrderId = aggregateId();
         UUID sellerOrderId = aggregateId();
-        LocalDateTime appliedAt = LocalDateTime.now();
+        LocalDateTime appliedAt = LocalDateTime.now().minusMinutes(1);
         seedCaughtUpProjection(buyerOrderId, 2, "OPEN", 10);
         seedCaughtUpProjection(sellerOrderId, 2, "OPEN", 10);
 
@@ -366,6 +428,11 @@ class OrderEventAppenderPostgresIT {
         assertEquals(1, countTradeApplications("trade-application"));
         assertEquals(0, count("order_event_outbox", buyerOrderId));
         assertEquals(0, count("order_event_outbox", sellerOrderId));
+        LocalDateTime insertedAt = jdbc.queryForObject(
+                "SELECT inserted_at FROM order_service.order_trade_applications WHERE trade_id = ?",
+                LocalDateTime.class,
+                "trade-application");
+        assertTrue(insertedAt.isAfter(appliedAt));
         assertEquals(2L, currentVersion(buyerOrderId));
         assertEquals(2L, currentVersion(sellerOrderId));
         assertMatchingState(buyerOrderId, 6, 4, "PARTIALLY_MATCHED");
@@ -408,6 +475,38 @@ class OrderEventAppenderPostgresIT {
         assertEquals(2L, currentVersion(sellerOrderId));
         assertMatchingState(buyerOrderId, 6, 4, "PARTIALLY_MATCHED");
         assertMatchingState(sellerOrderId, 6, 4, "PARTIALLY_MATCHED");
+    }
+
+    @Test
+    void appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent_fullyMatchedDuplicateShouldSkipBothOrders() {
+        UUID buyerOrderId = aggregateId();
+        UUID sellerOrderId = aggregateId();
+        LocalDateTime appliedAt = LocalDateTime.now();
+        seedCaughtUpProjection(buyerOrderId, 2, "OPEN", 10);
+        seedCaughtUpProjection(sellerOrderId, 2, "OPEN", 10);
+
+        OrderTradeApplication tradeApplication =
+                tradeApplication("fully-matched-trade-duplicate", buyerOrderId, sellerOrderId, 10, appliedAt);
+        OrderEventAppender.TradeExecutionAppendResult first =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
+                        matchedCommandWithoutOutbox(buyerOrderId, "fully-matched-trade-duplicate"),
+                        10,
+                        matchedCommandWithoutOutbox(sellerOrderId, "fully-matched-trade-duplicate"),
+                        10,
+                        tradeApplication);
+        OrderEventAppender.TradeExecutionAppendResult duplicate =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
+                        matchedCommandWithoutOutbox(buyerOrderId, "fully-matched-trade-duplicate"),
+                        10,
+                        matchedCommandWithoutOutbox(sellerOrderId, "fully-matched-trade-duplicate"),
+                        10,
+                        tradeApplication);
+
+        assertEquals(APPLIED, first.status());
+        assertEquals(DUPLICATE, duplicate.status());
+        assertEquals(1, countTradeApplications("fully-matched-trade-duplicate"));
+        assertMatchingState(buyerOrderId, 0, 10, "MATCHED");
+        assertMatchingState(sellerOrderId, 0, 10, "MATCHED");
     }
 
     @Test
@@ -490,6 +589,74 @@ class OrderEventAppenderPostgresIT {
                 LocalDateTime.now(),
                 integrationEvent
         );
+    }
+
+    private OrderEventAppendResult appendInitialSubmission(
+            UUID aggregateId,
+            UUID userId,
+            int amount) {
+        LocalDateTime occurredAt = LocalDateTime.now();
+        OrderSubmissionRequestedV1 domainEvent = new OrderSubmissionRequestedV1(
+                aggregateId, userId, "ENERGY-SPOT", 123L, "SELL", 10, amount, occurredAt);
+        OrderSubmittedEvent integrationEvent = OrderSubmittedEvent.builder()
+                .orderId(aggregateId)
+                .userId(userId)
+                .marketId("ENERGY-SPOT")
+                .marketSequence(123L)
+                .orderType("SELL")
+                .price(10)
+                .amount(amount)
+                .createdAt(occurredAt)
+                .build();
+        return appender.append(new OrderEventAppendCommand(
+                aggregateId,
+                0,
+                UUID.nameUUIDFromBytes((aggregateId + ":REQUESTED").getBytes(StandardCharsets.UTF_8)),
+                "OrderSubmissionRequestedV1",
+                domainEvent,
+                Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
+                1,
+                occurredAt,
+                new OrderIntegrationEvent("order.exchange", "order.submitted", integrationEvent)));
+    }
+
+    private OrderEventAppendCommand assetReservationConfirmedCommand(
+            UUID aggregateId,
+            UUID userId) {
+        LocalDateTime occurredAt = LocalDateTime.now();
+        return new OrderEventAppendCommand(
+                aggregateId,
+                1,
+                UUID.nameUUIDFromBytes((aggregateId + ":CONFIRMED").getBytes(StandardCharsets.UTF_8)),
+                "OrderAssetReservationConfirmedV1",
+                new OrderAssetReservationConfirmedV1(aggregateId, userId, occurredAt),
+                Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
+                1,
+                occurredAt,
+                null);
+    }
+
+    private String expectedHash(
+            OrderEventAppendCommand command,
+            String payloadCanonical,
+            String metadataCanonical,
+            String prevHash) {
+        String material = command.eventId() + "|"
+                + command.aggregateId() + "|"
+                + (command.expectedVersion() + 1) + "|"
+                + command.eventType() + "|"
+                + payloadCanonical + "|"
+                + metadataCanonical + "|"
+                + command.schemaVersion() + "|"
+                + command.occurredAt() + "|"
+                + prevHash;
+        try {
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(material.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not compute expected SHA-256 event hash", e);
+        }
     }
 
     private OrderEventAppendCommand matchedCommand(UUID aggregateId, String tradeId, String exchange) {

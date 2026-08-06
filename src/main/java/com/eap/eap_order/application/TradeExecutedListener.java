@@ -44,13 +44,60 @@ public class TradeExecutedListener {
 
         try {
             orderEventSourcingService.applyTrades(events);
+        } catch (TradeProjectionNotReadyException e) {
+            log.debug("Order projection is behind TradeExecuted; deferring batch: size={}", events.size());
+            if (markPending(events, e)) {
+                ack(messages, channel);
+            } else {
+                nack(messages, channel, true);
+            }
+            return;
+        } catch (TradeApplicationRejectedException e) {
+            log.error("TradeExecutedEvent batch contains an event that contradicts Order state: size={}",
+                    events.size(), e);
+            if (isolateRejectedEvents(events)) {
+                ack(messages, channel);
+            } else {
+                nack(messages, channel, true);
+            }
+            return;
         } catch (Exception e) {
             log.warn("Failed to apply TradeExecutedEvent batch to Order state: size={}", events.size(), e);
-            markFailed(events, e);
-            nack(messages, channel, true);
+            if (markRetryable(events, e)) {
+                ack(messages, channel);
+            } else {
+                nack(messages, channel, true);
+            }
             return;
         }
         ack(messages, channel);
+    }
+
+    /**
+     * A batch append can fall back to individual application and stop at the first invalid trade.
+     * Replaying each event is safe because trade application is idempotent, and prevents one bad
+     * event from permanently rejecting unrelated events later in the same broker batch.
+     */
+    private boolean isolateRejectedEvents(List<TradeExecutedEvent> events) {
+        for (TradeExecutedEvent event : events) {
+            try {
+                orderEventSourcingService.applyTrade(event);
+            } catch (TradeProjectionNotReadyException failure) {
+                if (!markPending(List.of(event), failure)) {
+                    return false;
+                }
+            } catch (TradeApplicationRejectedException failure) {
+                log.error("TradeExecutedEvent contradicts Order state: tradeId={}", event.getTradeId(), failure);
+                if (!markPermanent(List.of(event), failure)) {
+                    return false;
+                }
+            } catch (Exception failure) {
+                if (!markRetryable(List.of(event), failure)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private List<TradeExecutedEvent> deserialize(List<Message> messages) throws IOException {
@@ -77,12 +124,36 @@ public class TradeExecutedListener {
         return last;
     }
 
-    private void markFailed(List<TradeExecutedEvent> events, Exception failure) {
+    private boolean markRetryable(List<TradeExecutedEvent> events, Exception failure) {
         try {
-            tradeExecutedInbox.markFailed(events, failure);
+            tradeExecutedInbox.markRetryable(events, failure);
+            return true;
         } catch (Exception markerFailure) {
             log.warn("Failed to mark Order TradeExecuted inbox rows as retryable failure: size={}",
                     events.size(), markerFailure);
+            return false;
+        }
+    }
+
+    private boolean markPermanent(List<TradeExecutedEvent> events, Exception failure) {
+        try {
+            tradeExecutedInbox.markPermanentFailure(events, failure);
+            return true;
+        } catch (Exception markerFailure) {
+            log.warn("Failed to persist permanently rejected Order TradeExecuted rows: size={}",
+                    events.size(), markerFailure);
+            return false;
+        }
+    }
+
+    private boolean markPending(List<TradeExecutedEvent> events, Exception failure) {
+        try {
+            tradeExecutedInbox.markPending(events, failure);
+            return true;
+        } catch (Exception markerFailure) {
+            log.warn("Failed to persist pending Order TradeExecuted inbox rows: size={}",
+                    events.size(), markerFailure);
+            return false;
         }
     }
 }

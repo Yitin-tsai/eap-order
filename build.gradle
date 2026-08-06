@@ -50,6 +50,17 @@ tasks.named('test') {
     systemProperty 'eap.integration.postgres', System.getProperty('eap.integration.postgres', 'false')
 }
 
+tasks.register('postgresIntegrationTest', Test) {
+    group = 'verification'
+    description = 'Run PostgreSQL-backed Order event-store concurrency and hash-chain integration tests.'
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    systemProperty 'eap.integration.postgres', 'true'
+    include '**/*PostgresIT.class'
+    shouldRunAfter tasks.named('test')
+}
+
 tasks.register('orderHttpLoadTest', JavaExec) {
     group = 'verification'
     description = 'Load test Order HTTP acceptance and optional order-admission-chain convergence gate.'
@@ -74,6 +85,34 @@ tasks.register('matchedE2eLoadTest', JavaExec) {
     systemProperty 'eap.scheduling.enabled', 'false'
     systemProperty 'eap.order-event-outbox.batch-size', '0'
     systemProperty 'eap.order-projection.enabled', 'false'
+}
+
+tasks.register('httpMatchedTradeCompletionLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Drive BUY and SELL through HTTP, then verify Match/Order/Wallet trade convergence and queue drain.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedTradeCompletionLoadGenerator'
+}
+
+tasks.register('httpMatchedSteadyStateLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Run sustained balanced mixed-side HTTP traffic and verify throughput, backlog stability, and convergence.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedSteadyStateLoadGenerator'
+}
+
+tasks.register('httpMatchedResetLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Reset HTTP matched-trade databases, queues, and Redis before services start.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedResetLoadGenerator'
+}
+
+tasks.register('httpMatchedStaircaseLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Ramp balanced mixed-side HTTP traffic through configurable stages and find the sustained capacity knee.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedStaircaseLoadGenerator'
 }
 
 tasks.register('orderDbCeilingProbe', JavaExec) {

@@ -368,6 +368,17 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-023" author="eap">
+        <comment>Keep projection-lagged TradeExecuted events durable without broker requeue storms</comment>
+        <sql>
+            ALTER TABLE order_service.order_trade_execution_inbox
+                DROP CONSTRAINT IF EXISTS ck_order_trade_execution_inbox_status;
+            ALTER TABLE order_service.order_trade_execution_inbox
+                ADD CONSTRAINT ck_order_trade_execution_inbox_status
+                CHECK (status IN ('RECEIVED', 'APPLIED', 'PENDING_PREREQUISITE', 'FAILED_RETRYABLE'));
+        </sql>
+    </changeSet>
+
     <changeSet id="order-es-021" author="eap">
         <comment>Allow Order event-store intake rows before command-state projection for experimental checkpoint relay</comment>
         <sql>
@@ -382,6 +393,36 @@
                     CHECK (last_global_position &gt;= 0)
             );
         </sql>
+    </changeSet>
+
+    <changeSet id="order-es-024" author="eap">
+        <comment>Add leased retry state to the durable Order TradeExecuted inbox</comment>
+        <sql>
+            ALTER TABLE order_service.order_trade_execution_inbox
+                ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS claimed_by VARCHAR(80),
+                ADD COLUMN IF NOT EXISTS claim_until TIMESTAMP;
+
+            ALTER TABLE order_service.order_trade_execution_inbox
+                DROP CONSTRAINT IF EXISTS ck_order_trade_execution_inbox_status;
+            ALTER TABLE order_service.order_trade_execution_inbox
+                ADD CONSTRAINT ck_order_trade_execution_inbox_status
+                CHECK (status IN ('RECEIVED', 'APPLIED', 'PENDING_PREREQUISITE',
+                                  'FAILED_RETRYABLE', 'IN_PROGRESS', 'FAILED_PERMANENT'));
+
+            CREATE INDEX IF NOT EXISTS idx_order_trade_execution_inbox_retry
+                ON order_service.order_trade_execution_inbox(status, next_retry_at, updated_at)
+                WHERE status IN ('PENDING_PREREQUISITE', 'FAILED_RETRYABLE', 'IN_PROGRESS');
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-025" author="eap">
+        <comment>Record the database insertion time of Order trade facts for cross-service lag diagnostics</comment>
+        <addColumn tableName="order_trade_applications" schemaName="order_service">
+            <column name="inserted_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </addColumn>
     </changeSet>
 
 </databaseChangeLog>

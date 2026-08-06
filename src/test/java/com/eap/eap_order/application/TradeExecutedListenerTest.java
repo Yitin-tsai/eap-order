@@ -69,7 +69,7 @@ class TradeExecutedListenerTest {
     }
 
     @Test
-    void handleTradeExecuted_whenApplyFails_shouldMarkRetryableAndRequeue() throws Exception {
+    void handleTradeExecuted_whenApplyFails_shouldPersistRetryableAndAck() throws Exception {
         TradeExecutedEvent event = event();
         Message message = message(event, 11L);
         RuntimeException failure = new RuntimeException("apply failed");
@@ -78,13 +78,27 @@ class TradeExecutedListenerTest {
         listener.handleTradeExecuted(List.of(message), channel);
 
         verify(orderEventSourcingService).applyTrades(List.of(event));
-        verify(tradeExecutedInbox).markFailed(List.of(event), failure);
-        verify(channel).basicNack(11L, false, true);
+        verify(tradeExecutedInbox).markRetryable(List.of(event), failure);
+        verify(channel).basicAck(11L, false);
         verifyNoMoreInteractions(channel);
     }
 
     @Test
-    void handleTradeExecutedBatch_whenApplyFails_shouldMarkRetryableAndRequeueThroughLastDeliveryTag() throws Exception {
+    void handleTradeExecuted_whenProjectionIsBehind_shouldPersistPendingAndAck() throws Exception {
+        TradeExecutedEvent event = event();
+        Message message = message(event, 12L);
+        TradeProjectionNotReadyException failure = new TradeProjectionNotReadyException("projection behind");
+        doThrow(failure).when(orderEventSourcingService).applyTrades(List.of(event));
+
+        listener.handleTradeExecuted(List.of(message), channel);
+
+        verify(tradeExecutedInbox).markPending(List.of(event), failure);
+        verify(channel).basicAck(12L, false);
+        verifyNoMoreInteractions(channel);
+    }
+
+    @Test
+    void handleTradeExecutedBatch_whenApplyFails_shouldPersistRetryableAndAckThroughLastDeliveryTag() throws Exception {
         TradeExecutedEvent first = event("trade-1");
         TradeExecutedEvent second = event("trade-2");
         Message firstMessage = message(first, 20L);
@@ -95,8 +109,64 @@ class TradeExecutedListenerTest {
         listener.handleTradeExecuted(List.of(firstMessage, secondMessage), channel);
 
         verify(orderEventSourcingService).applyTrades(List.of(first, second));
-        verify(tradeExecutedInbox).markFailed(List.of(first, second), failure);
-        verify(channel).basicNack(21L, true, true);
+        verify(tradeExecutedInbox).markRetryable(List.of(first, second), failure);
+        verify(channel).basicAck(21L, true);
+        verifyNoMoreInteractions(channel);
+    }
+
+    @Test
+    void handleTradeExecuted_whenOrderStateRejectsTrade_shouldPersistPermanentFailureAndAck() throws Exception {
+        TradeExecutedEvent event = event();
+        Message message = message(event, 22L);
+        TradeApplicationRejectedException failure = new TradeApplicationRejectedException("invalid state");
+        doThrow(failure).when(orderEventSourcingService).applyTrades(List.of(event));
+        doThrow(failure).when(orderEventSourcingService).applyTrade(event);
+
+        listener.handleTradeExecuted(List.of(message), channel);
+
+        verify(orderEventSourcingService).applyTrades(List.of(event));
+        verify(orderEventSourcingService).applyTrade(event);
+        verify(tradeExecutedInbox).markPermanentFailure(List.of(event), failure);
+        verify(channel).basicAck(22L, false);
+        verifyNoMoreInteractions(channel);
+    }
+
+    @Test
+    void handleTradeExecutedBatch_whenOneTradeIsRejected_shouldIsolateFailureAndApplyRemainingEvents() throws Exception {
+        TradeExecutedEvent first = event("trade-1");
+        TradeExecutedEvent rejected = event("trade-2");
+        TradeExecutedEvent last = event("trade-3");
+        List<TradeExecutedEvent> batch = List.of(first, rejected, last);
+        TradeApplicationRejectedException failure = new TradeApplicationRejectedException("invalid state");
+        doThrow(failure).when(orderEventSourcingService).applyTrades(batch);
+        doThrow(failure).when(orderEventSourcingService).applyTrade(rejected);
+
+        listener.handleTradeExecuted(List.of(
+                message(first, 30L), message(rejected, 31L), message(last, 32L)), channel);
+
+        verify(orderEventSourcingService).applyTrade(first);
+        verify(orderEventSourcingService).applyTrade(rejected);
+        verify(orderEventSourcingService).applyTrade(last);
+        verify(tradeExecutedInbox).markPermanentFailure(List.of(rejected), failure);
+        verify(channel).basicAck(32L, true);
+        verifyNoMoreInteractions(channel);
+    }
+
+    @Test
+    void handleTradeExecutedBatch_whenIsolatedFailureCannotBePersisted_shouldRequeueBatch() throws Exception {
+        TradeExecutedEvent rejected = event("trade-1");
+        TradeExecutedEvent next = event("trade-2");
+        List<TradeExecutedEvent> batch = List.of(rejected, next);
+        TradeApplicationRejectedException failure = new TradeApplicationRejectedException("invalid state");
+        doThrow(failure).when(orderEventSourcingService).applyTrades(batch);
+        doThrow(failure).when(orderEventSourcingService).applyTrade(rejected);
+        doThrow(new RuntimeException("inbox unavailable"))
+                .when(tradeExecutedInbox).markPermanentFailure(List.of(rejected), failure);
+
+        listener.handleTradeExecuted(List.of(message(rejected, 40L), message(next, 41L)), channel);
+
+        verify(orderEventSourcingService).applyTrade(rejected);
+        verify(channel).basicNack(41L, true, true);
         verifyNoMoreInteractions(channel);
     }
 

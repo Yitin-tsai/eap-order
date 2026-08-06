@@ -39,29 +39,40 @@ eap:
     market-data-scheduler:
       enabled: false
     status:
-      realtime-updates-enabled: false
+      realtime-updates-enabled: ${EAP_ORDER_REALTIME_UPDATES_ENABLED:false}
     market-sequence:
       allocation-block-size: ${EAP_ORDER_MARKET_SEQUENCE_ALLOCATION_BLOCK_SIZE:1}
     datasource:
       consumer:
-        maximum-pool-size: 20
-        minimum-idle: 5
+        maximum-pool-size: ${EAP_ORDER_CONSUMER_POOL_SIZE:20}
+        minimum-idle: ${EAP_ORDER_CONSUMER_POOL_MIN_IDLE:5}
       projection:
-        maximum-pool-size: 3
-        minimum-idle: 1
+        maximum-pool-size: ${EAP_ORDER_PROJECTION_POOL_SIZE:3}
+        minimum-idle: ${EAP_ORDER_PROJECTION_POOL_MIN_IDLE:1}
     listeners:
       asset-reservation-confirmed:
         concurrency: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_CONCURRENCY:16}
         batch-size: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_BATCH_SIZE:50}
         receive-timeout-ms: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_RECEIVE_TIMEOUT_MS:25}
+        single-round-trip-enabled: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_SINGLE_ROUND_TRIP_ENABLED:true}
       asset-reservation-failed:
-        concurrency: 4
+        concurrency: ${EAP_ORDER_ASSET_RESERVATION_FAILED_CONCURRENCY:4}
       order-matched:
-        concurrency: 16
+        concurrency: ${EAP_ORDER_MATCHED_CONCURRENCY:16}
       trade-executed:
-        concurrency: 12
-        batch-size: 50
-        receive-timeout-ms: 25
+        concurrency: ${EAP_ORDER_TRADE_EXECUTED_CONCURRENCY:12}
+        batch-size: ${EAP_ORDER_TRADE_EXECUTED_BATCH_SIZE:50}
+        receive-timeout-ms: ${EAP_ORDER_TRADE_EXECUTED_RECEIVE_TIMEOUT_MS:25}
+    trade-execution-reconciler:
+      poll-interval-ms: ${EAP_ORDER_TRADE_EXECUTION_RECONCILER_POLL_INTERVAL_MS:100}
+      initial-delay-ms: ${EAP_ORDER_TRADE_EXECUTION_RECONCILER_INITIAL_DELAY_MS:500}
+      batch-size: ${EAP_ORDER_TRADE_EXECUTION_RECONCILER_BATCH_SIZE:100}
+      lease-ms: ${EAP_ORDER_TRADE_EXECUTION_RECONCILER_LEASE_MS:30000}
+      max-attempts: ${EAP_ORDER_TRADE_EXECUTION_RECONCILER_MAX_ATTEMPTS:20}
+    trade-execution-inbox-admin:
+      enabled: false
+    trade-execution-inbox-metrics:
+      poll-interval-ms: ${EAP_ORDER_TRADE_EXECUTION_INBOX_METRICS_POLL_INTERVAL_MS:10000}
   order-event-outbox:
     batch-size: ${EAP_ORDER_OUTBOX_BATCH_SIZE:500}
     publish-concurrency: ${EAP_ORDER_OUTBOX_PUBLISH_CONCURRENCY:1}
@@ -74,9 +85,9 @@ eap:
     enabled: true
     batch-size: 500
     max-batches-per-tick: 1
-    poll-interval-ms: 5000
+    poll-interval-ms: ${EAP_ORDER_PROJECTION_POLL_INTERVAL_MS:5000}
     repair:
-      enabled: false
+      enabled: ${EAP_ORDER_PROJECTION_REPAIR_ENABLED:false}
       batch-size: 100
       poll-interval-ms: 60000
   rate-limit:

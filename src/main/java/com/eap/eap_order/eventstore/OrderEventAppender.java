@@ -112,6 +112,99 @@ public class OrderEventAppender {
                 (SELECT COUNT(*) FROM trade_application) AS inserted_trade_applications,
                 (SELECT COUNT(*) FROM updated_matching_states) AS updated_matching_states
             """;
+    private static final String APPEND_ASSET_RESERVATION_CONFIRMED_SINGLE_ROUND_TRIP_SQL = """
+            WITH input(event_id, aggregate_id, event_type, payload_canonical, metadata_canonical,
+                       schema_version, occurred_at, hash_material_prefix, current_version, new_version,
+                       user_id, order_status) AS (
+                SELECT *
+                FROM unnest(?::uuid[], ?::uuid[], ?::varchar[], ?::text[], ?::text[],
+                            ?::integer[], ?::timestamp[], ?::text[], ?::bigint[], ?::bigint[],
+                            ?::uuid[], ?::varchar[])
+            ),
+            locked_heads AS MATERIALIZED (
+                SELECT head.aggregate_id,
+                       head.current_version,
+                       head.last_hash,
+                       head.remaining_amount,
+                       input.current_version AS expected_version
+                FROM order_service.order_stream_heads head
+                JOIN input ON input.aggregate_id = head.aggregate_id
+                ORDER BY head.aggregate_id
+                FOR UPDATE OF head
+            ),
+            batch_eligibility AS MATERIALIZED (
+                SELECT COUNT(*) = (SELECT COUNT(*) FROM input)
+                       AND COALESCE(BOOL_AND(current_version = expected_version), false)
+                           AS eligible
+                FROM locked_heads
+            ),
+            prepared AS MATERIALIZED (
+                SELECT input.event_id,
+                       input.aggregate_id,
+                       input.event_type,
+                       input.payload_canonical,
+                       input.metadata_canonical,
+                       input.schema_version,
+                       input.occurred_at,
+                       locked_heads.last_hash AS prev_hash,
+                       encode(
+                           sha256(convert_to(input.hash_material_prefix || locked_heads.last_hash, 'UTF8')),
+                           'hex'
+                       ) AS hash,
+                       input.current_version,
+                       input.new_version,
+                       input.user_id,
+                       locked_heads.remaining_amount,
+                       input.order_status
+                FROM input
+                JOIN locked_heads ON locked_heads.aggregate_id = input.aggregate_id
+                CROSS JOIN batch_eligibility
+                WHERE batch_eligibility.eligible
+            ),
+            inserted_events AS (
+                INSERT INTO order_service.order_event_store
+                    (event_id, aggregate_id, aggregate_type, aggregate_version,
+                     event_type, payload_canonical, metadata_canonical, schema_version,
+                     occurred_at, prev_hash, hash)
+                SELECT event_id, aggregate_id, 'Order', new_version,
+                       event_type, payload_canonical, metadata_canonical, schema_version,
+                       occurred_at, prev_hash, hash
+                FROM prepared
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING aggregate_id
+            ),
+            updated_heads AS (
+                UPDATE order_service.order_stream_heads head
+                SET current_version = prepared.new_version,
+                    last_event_id = prepared.event_id,
+                    last_hash = prepared.hash,
+                    user_id = prepared.user_id,
+                    remaining_amount = prepared.remaining_amount,
+                    status = prepared.order_status,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM prepared
+                WHERE head.aggregate_id = prepared.aggregate_id
+                  AND head.current_version = prepared.current_version
+                RETURNING head.aggregate_id
+            ),
+            upserted_matching_state AS (
+                INSERT INTO order_service.order_matching_state
+                    (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
+                SELECT aggregate_id, user_id, remaining_amount, 0, order_status, CURRENT_TIMESTAMP
+                FROM prepared
+                ON CONFLICT (order_id) DO UPDATE
+                SET user_id = EXCLUDED.user_id,
+                    remaining_amount = EXCLUDED.remaining_amount,
+                    status = EXCLUDED.status,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING order_id
+            )
+            SELECT
+                (SELECT eligible FROM batch_eligibility) AS eligible,
+                (SELECT COUNT(*) FROM inserted_events) AS inserted_events,
+                (SELECT COUNT(*) FROM updated_heads) AS updated_heads,
+                (SELECT COUNT(*) FROM upserted_matching_state) AS upserted_matching_state
+            """;
 
     private final NamedParameterJdbcTemplate commandJdbc;
     private final NamedParameterJdbcTemplate consumerJdbc;
@@ -122,6 +215,7 @@ public class OrderEventAppender {
     private final OrderSubmissionAppendMetrics submissionAppendMetrics;
     private final OrderAssetReservationAppendMetrics assetReservationAppendMetrics;
     private final SubmissionWriteMode submissionWriteMode;
+    private final boolean assetReservationConfirmedSingleRoundTripEnabled;
 
     public OrderEventAppender(
             @Qualifier("namedParameterJdbcTemplate") NamedParameterJdbcTemplate commandJdbc,
@@ -132,7 +226,9 @@ public class OrderEventAppender {
             OrderTradeApplyMetrics tradeApplyMetrics,
             OrderSubmissionAppendMetrics submissionAppendMetrics,
             OrderAssetReservationAppendMetrics assetReservationAppendMetrics,
-            @Value("${eap.order.submission.write-mode:current_order_path}") String submissionWriteMode) {
+            @Value("${eap.order.submission.write-mode:current_order_path}") String submissionWriteMode,
+            @Value("${eap.order.listeners.asset-reservation-confirmed.single-round-trip-enabled:false}")
+            boolean assetReservationConfirmedSingleRoundTripEnabled) {
         this.commandJdbc = commandJdbc;
         this.consumerJdbc = consumerJdbc;
         this.commandTransactionTemplate = new TransactionTemplate(transactionManager);
@@ -141,6 +237,8 @@ public class OrderEventAppender {
         this.submissionAppendMetrics = submissionAppendMetrics;
         this.assetReservationAppendMetrics = assetReservationAppendMetrics;
         this.submissionWriteMode = SubmissionWriteMode.parse(submissionWriteMode);
+        this.assetReservationConfirmedSingleRoundTripEnabled =
+                assetReservationConfirmedSingleRoundTripEnabled;
         this.canonicalObjectMapper = objectMapper.copy()
                 .configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true)
                 .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
@@ -229,6 +327,19 @@ public class OrderEventAppender {
                         callbackStartedNanos[0] - startedNanos);
                 long bodyStartedNanos = System.nanoTime();
                 try {
+                    if (assetReservationConfirmedSingleRoundTripEnabled) {
+                        boolean appended = appendAssetReservationConfirmedBatchSingleRoundTrip(commands);
+                        if (!appended) {
+                            long fallbackStartedNanos = System.nanoTime();
+                            for (OrderEventAppendCommand command : commands) {
+                                appendInTransaction(command, consumerJdbc);
+                            }
+                            assetReservationAppendMetrics.record(
+                                    "fallback_individual_append",
+                                    fallbackStartedNanos);
+                        }
+                        return;
+                    }
                     long lockStartedNanos = System.nanoTime();
                     Map<UUID, StreamHead> heads = lockHeads(consumerJdbc, commands.stream()
                             .map(OrderEventAppendCommand::aggregateId)
@@ -562,10 +673,18 @@ public class OrderEventAppender {
         tradeApplyMetrics.record("lock_heads", lockStartedNanos);
         MatchingState buyerState = states.get(buyerDraftCommand.aggregateId());
         MatchingState sellerState = states.get(sellerDraftCommand.aggregateId());
-        if (buyerState == null || sellerState == null
-                || !buyerState.canMatch(buyerMatchedQuantity)
+        if (buyerState == null || sellerState == null) {
+            if (existingTradeApplicationMatches(tradeApplication)) {
+                return TradeExecutionAppendResult.duplicate();
+            }
+            return TradeExecutionAppendResult.missingPrerequisite();
+        }
+        if (!buyerState.canMatch(buyerMatchedQuantity)
                 || !sellerState.canMatch(sellerMatchedQuantity)) {
-            return TradeExecutionAppendResult.notFastPath();
+            if (existingTradeApplicationMatches(tradeApplication)) {
+                return TradeExecutionAppendResult.duplicate();
+            }
+            return TradeExecutionAppendResult.invalidOrderState();
         }
         long appendStartedNanos = System.nanoTime();
         TradeApplicationHotPathOutcome outcome = insertTradeApplicationAndMatchingState(
@@ -665,7 +784,7 @@ public class OrderEventAppender {
     }
 
     private Map<UUID, StreamHead> lockHeadsInStableOrder(UUID first, UUID second) {
-        return lockHeadsInStableOrder(stableOrder(first, second));
+        return lockHeadsInStableOrder(List.of(first, second));
     }
 
     private Map<UUID, StreamHead> lockHeadsInStableOrder(Collection<UUID> aggregateIds) {
@@ -690,7 +809,7 @@ public class OrderEventAppender {
     }
 
     private Map<UUID, MatchingState> lockMatchingStatesInStableOrder(UUID first, UUID second) {
-        return lockMatchingStatesInStableOrder(stableOrder(first, second));
+        return lockMatchingStatesInStableOrder(List.of(first, second));
     }
 
     private Map<UUID, MatchingState> lockMatchingStatesInStableOrder(Collection<UUID> orderIds) {
@@ -747,10 +866,6 @@ public class OrderEventAppender {
                         0,
                         rs.getString("status")));
         return states.isEmpty() ? null : states.get(0);
-    }
-
-    private List<UUID> stableOrder(UUID first, UUID second) {
-        return first.compareTo(second) <= 0 ? List.of(first, second) : List.of(second, first);
     }
 
     private boolean existingTradeApplicationMatches(OrderTradeApplication tradeApplication) {
@@ -1155,6 +1270,7 @@ public class OrderEventAppender {
                 SELECT aggregate_id, current_version, last_hash, user_id, remaining_amount, status
                 FROM order_service.order_stream_heads
                 WHERE aggregate_id IN (:aggregateIds)
+                ORDER BY aggregate_id
                 FOR UPDATE
                 """, Map.of("aggregateIds", aggregateIds), rs -> {
             heads.put(
@@ -1167,6 +1283,113 @@ public class OrderEventAppender {
                             rs.getString("status")));
         });
         return heads;
+    }
+
+    private boolean appendAssetReservationConfirmedBatchSingleRoundTrip(
+            List<OrderEventAppendCommand> commands) {
+        long callbackStartedNanos = System.nanoTime();
+        Boolean appended = consumerJdbc.getJdbcTemplate().execute((ConnectionCallback<Boolean>) connection -> {
+            Array eventIds = null;
+            Array aggregateIds = null;
+            Array eventTypes = null;
+            Array payloads = null;
+            Array metadatas = null;
+            Array schemaVersions = null;
+            Array occurredAts = null;
+            Array hashMaterialPrefixes = null;
+            Array currentVersions = null;
+            Array newVersions = null;
+            Array userIds = null;
+            Array statuses = null;
+            long statementStartedNanos = System.nanoTime();
+            try (PreparedStatement statement =
+                         connection.prepareStatement(APPEND_ASSET_RESERVATION_CONFIRMED_SINGLE_ROUND_TRIP_SQL)) {
+                assetReservationAppendMetrics.record("prepare_statement", statementStartedNanos);
+                long prepareArraysStartedNanos = System.nanoTime();
+                AssetReservationConfirmedSingleRoundTripBatchArrays arrays =
+                        assetReservationConfirmedSingleRoundTripBatchArrays(commands);
+                assetReservationAppendMetrics.record("prepare_batch_arrays", prepareArraysStartedNanos);
+                long createSqlArraysStartedNanos = System.nanoTime();
+                eventIds = connection.createArrayOf("uuid", arrays.eventIds());
+                aggregateIds = connection.createArrayOf("uuid", arrays.aggregateIds());
+                eventTypes = connection.createArrayOf("varchar", arrays.eventTypes());
+                payloads = connection.createArrayOf("text", arrays.payloads());
+                metadatas = connection.createArrayOf("text", arrays.metadatas());
+                schemaVersions = connection.createArrayOf("integer", arrays.schemaVersions());
+                occurredAts = connection.createArrayOf("timestamp", arrays.occurredAts());
+                hashMaterialPrefixes = connection.createArrayOf("text", arrays.hashMaterialPrefixes());
+                currentVersions = connection.createArrayOf("bigint", arrays.currentVersions());
+                newVersions = connection.createArrayOf("bigint", arrays.newVersions());
+                userIds = connection.createArrayOf("uuid", arrays.userIds());
+                statuses = connection.createArrayOf("varchar", arrays.statuses());
+                assetReservationAppendMetrics.record("create_sql_arrays", createSqlArraysStartedNanos);
+                long bindArraysStartedNanos = System.nanoTime();
+                statement.setArray(1, eventIds);
+                statement.setArray(2, aggregateIds);
+                statement.setArray(3, eventTypes);
+                statement.setArray(4, payloads);
+                statement.setArray(5, metadatas);
+                statement.setArray(6, schemaVersions);
+                statement.setArray(7, occurredAts);
+                statement.setArray(8, hashMaterialPrefixes);
+                statement.setArray(9, currentVersions);
+                statement.setArray(10, newVersions);
+                statement.setArray(11, userIds);
+                statement.setArray(12, statuses);
+                assetReservationAppendMetrics.record("bind_sql_arrays", bindArraysStartedNanos);
+                long executeStartedNanos = System.nanoTime();
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    assetReservationAppendMetrics.record("execute_cte", executeStartedNanos);
+                    if (!resultSet.next()) {
+                        throw new IllegalStateException(
+                                "Asset reservation single-round-trip batch append did not return counts");
+                    }
+                    if (!resultSet.getBoolean("eligible")) {
+                        assertBatchCount(
+                                "ineligible asset reservation event insert",
+                                0,
+                                resultSet.getInt("inserted_events"));
+                        assertBatchCount(
+                                "ineligible asset reservation head update",
+                                0,
+                                resultSet.getInt("updated_heads"));
+                        assertBatchCount(
+                                "ineligible asset reservation matching-state upsert",
+                                0,
+                                resultSet.getInt("upserted_matching_state"));
+                        return false;
+                    }
+                    assertBatchCount(
+                            "asset reservation event insert",
+                            commands.size(),
+                            resultSet.getInt("inserted_events"));
+                    assertBatchCount(
+                            "asset reservation head update",
+                            commands.size(),
+                            resultSet.getInt("updated_heads"));
+                    assertBatchCount(
+                            "asset reservation matching-state upsert",
+                            commands.size(),
+                            resultSet.getInt("upserted_matching_state"));
+                    return true;
+                }
+            } finally {
+                freeQuietly(eventIds);
+                freeQuietly(aggregateIds);
+                freeQuietly(eventTypes);
+                freeQuietly(payloads);
+                freeQuietly(metadatas);
+                freeQuietly(schemaVersions);
+                freeQuietly(occurredAts);
+                freeQuietly(hashMaterialPrefixes);
+                freeQuietly(currentVersions);
+                freeQuietly(newVersions);
+                freeQuietly(userIds);
+                freeQuietly(statuses);
+                assetReservationAppendMetrics.record("connection_callback", callbackStartedNanos);
+            }
+        });
+        return Boolean.TRUE.equals(appended);
     }
 
     private void appendAssetReservationConfirmedBatchWithLockedHeads(
@@ -1457,6 +1680,64 @@ public class OrderEventAppender {
                 sellerRemainingAmounts,
                 sellerMatchedAmounts,
                 sellerStatuses);
+    }
+
+    private AssetReservationConfirmedSingleRoundTripBatchArrays
+            assetReservationConfirmedSingleRoundTripBatchArrays(
+                    List<OrderEventAppendCommand> commands) {
+        int size = commands.size();
+        UUID[] eventIds = new UUID[size];
+        UUID[] aggregateIds = new UUID[size];
+        String[] eventTypes = new String[size];
+        String[] payloads = new String[size];
+        String[] metadatas = new String[size];
+        Integer[] schemaVersions = new Integer[size];
+        Timestamp[] occurredAts = new Timestamp[size];
+        String[] hashMaterialPrefixes = new String[size];
+        Long[] currentVersions = new Long[size];
+        Long[] newVersions = new Long[size];
+        UUID[] userIds = new UUID[size];
+        String[] statuses = new String[size];
+
+        for (int i = 0; i < size; i++) {
+            OrderEventAppendCommand command = commands.get(i);
+            OrderAssetReservationConfirmedV1 confirmed =
+                    (OrderAssetReservationConfirmedV1) command.payload();
+            String payloadCanonical = serialize(command.payload());
+            String metadataCanonical = serialize(command.metadata());
+            long nextVersion = command.expectedVersion() + 1;
+
+            eventIds[i] = command.eventId();
+            aggregateIds[i] = command.aggregateId();
+            eventTypes[i] = command.eventType();
+            payloads[i] = payloadCanonical;
+            metadatas[i] = metadataCanonical;
+            schemaVersions[i] = command.schemaVersion();
+            occurredAts[i] = Timestamp.valueOf(command.occurredAt());
+            hashMaterialPrefixes[i] = hashMaterialPrefix(
+                    command,
+                    nextVersion,
+                    payloadCanonical,
+                    metadataCanonical);
+            currentVersions[i] = command.expectedVersion();
+            newVersions[i] = nextVersion;
+            userIds[i] = confirmed.userId();
+            statuses[i] = "OPEN";
+        }
+
+        return new AssetReservationConfirmedSingleRoundTripBatchArrays(
+                eventIds,
+                aggregateIds,
+                eventTypes,
+                payloads,
+                metadatas,
+                schemaVersions,
+                occurredAts,
+                hashMaterialPrefixes,
+                currentVersions,
+                newVersions,
+                userIds,
+                statuses);
     }
 
     private AssetReservationConfirmedBatchArrays assetReservationConfirmedBatchArrays(
@@ -1781,15 +2062,11 @@ public class OrderEventAppender {
             String payloadCanonical,
             String metadataCanonical,
             String prevHash) {
-        String material = command.eventId() + "|"
-                + command.aggregateId() + "|"
-                + aggregateVersion + "|"
-                + command.eventType() + "|"
-                + payloadCanonical + "|"
-                + metadataCanonical + "|"
-                + command.schemaVersion() + "|"
-                + command.occurredAt() + "|"
-                + prevHash;
+        String material = hashMaterialPrefix(
+                command,
+                aggregateVersion,
+                payloadCanonical,
+                metadataCanonical) + prevHash;
         try {
             return HexFormat.of().formatHex(
                     MessageDigest.getInstance("SHA-256")
@@ -1797,6 +2074,21 @@ public class OrderEventAppender {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
         }
+    }
+
+    private String hashMaterialPrefix(
+            OrderEventAppendCommand command,
+            long aggregateVersion,
+            String payloadCanonical,
+            String metadataCanonical) {
+        return command.eventId() + "|"
+                + command.aggregateId() + "|"
+                + aggregateVersion + "|"
+                + command.eventType() + "|"
+                + payloadCanonical + "|"
+                + metadataCanonical + "|"
+                + command.schemaVersion() + "|"
+                + command.occurredAt() + "|";
     }
 
     private record StreamHead(
@@ -1858,6 +2150,21 @@ public class OrderEventAppender {
             Integer[] sellerRemainingAmounts,
             Integer[] sellerMatchedAmounts,
             String[] sellerStatuses) {
+    }
+
+    private record AssetReservationConfirmedSingleRoundTripBatchArrays(
+            UUID[] eventIds,
+            UUID[] aggregateIds,
+            String[] eventTypes,
+            String[] payloads,
+            String[] metadatas,
+            Integer[] schemaVersions,
+            Timestamp[] occurredAts,
+            String[] hashMaterialPrefixes,
+            Long[] currentVersions,
+            Long[] newVersions,
+            UUID[] userIds,
+            String[] statuses) {
     }
 
     private record AssetReservationConfirmedBatchArrays(
@@ -1971,15 +2278,20 @@ public class OrderEventAppender {
             return new TradeExecutionAppendResult(TradeExecutionAppendStatus.DUPLICATE, null);
         }
 
-        private static TradeExecutionAppendResult notFastPath() {
-            return new TradeExecutionAppendResult(TradeExecutionAppendStatus.NOT_FAST_PATH, null);
+        private static TradeExecutionAppendResult missingPrerequisite() {
+            return new TradeExecutionAppendResult(TradeExecutionAppendStatus.MISSING_PREREQUISITE, null);
+        }
+
+        private static TradeExecutionAppendResult invalidOrderState() {
+            return new TradeExecutionAppendResult(TradeExecutionAppendStatus.INVALID_ORDER_STATE, null);
         }
     }
 
     public enum TradeExecutionAppendStatus {
         APPLIED,
         DUPLICATE,
-        NOT_FAST_PATH
+        MISSING_PREREQUISITE,
+        INVALID_ORDER_STATE
     }
 
     private record ExistingEvent(

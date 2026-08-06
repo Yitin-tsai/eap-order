@@ -188,16 +188,22 @@ public class OrderEventSourcingService {
 
     private void applyPreparedTrade(PreparedTrade preparedTrade) {
         TradeExecutedEvent source = preparedTrade.source();
-        if (applyTradeFromCaughtUpProjection(source, preparedTrade.buyerFastPathEvent(),
+        TradeExecutionAppendStatus status = applyTradeFromCaughtUpProjection(
+                source, preparedTrade.buyerFastPathEvent(),
                 preparedTrade.sellerFastPathEvent(), preparedTrade.tradeApplication(),
-                source.getQuantity())) {
-            return;
+                source.getQuantity());
+        switch (status) {
+            case APPLIED, DUPLICATE -> {
+                return;
+            }
+            case MISSING_PREREQUISITE -> throw new TradeProjectionNotReadyException(
+                    "Order command state has not caught up: tradeId=" + source.getTradeId());
+            case INVALID_ORDER_STATE -> throw new TradeApplicationRejectedException(
+                    "Trade contradicts current Order state: tradeId=" + source.getTradeId());
         }
-        throw new IllegalStateException("TradeExecutedEvent could not be applied from command state: tradeId="
-                + source.getTradeId());
     }
 
-    private boolean applyTradeFromCaughtUpProjection(
+    private TradeExecutionAppendStatus applyTradeFromCaughtUpProjection(
             TradeExecutedEvent source,
             OrderMatchedV1 buyerEvent,
             OrderMatchedV1 sellerEvent,
@@ -228,8 +234,7 @@ public class OrderEventSourcingService {
                         buyerCommand, quantity,
                         sellerCommand, quantity,
                         tradeApplication);
-        return result.status() == TradeExecutionAppendStatus.APPLIED
-                || result.status() == TradeExecutionAppendStatus.DUPLICATE;
+        return result.status();
     }
 
     private OrderTradeApplication tradeApplication(
