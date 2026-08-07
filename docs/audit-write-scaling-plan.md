@@ -1,9 +1,11 @@
 # Audit Write Scaling Plan
 
+> **已完成遷移的歷史計畫。** 本文的瓶頸數據與 Phase 1/切換規劃描述 2026-06 當時版本。現行 BUY/SELL 路徑已切換到 order event store + integration outbox；`orders_current` 為非同步可重建投影，`TradeExecutedEvent` 由 durable inbox 套用。現況請以 [Order README](../README.md) 與 [Order Event Sourcing 設計](./order-event-sourcing-design.md) 開頭的 current boundary 為準。
+>
 > 最後更新：2026-06-24  
 > 目標：解除 Order DB connection pool 飽和，同時保留 audit hash chain、冪等與事件順序。
 > Order Service Event Sourcing 的目標架構、Event Store、Aggregate 與 Projection 設計，見 [`docs/order-event-sourcing-design.md`](./order-event-sourcing-design.md)。
-> 更新：Order Event Sourcing Phase 1 schema 與 atomic append primitive 已完成；目前尚未切換 BUY/SELL write path。
+> 當時更新：Order Event Sourcing Phase 1 schema 與 atomic append primitive 已完成；該文件撰寫時尚未切換 BUY/SELL write path，現行版本已完成切換。
 
 ## 1. 問題不是單純「SQL 太慢」
 

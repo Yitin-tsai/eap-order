@@ -1,44 +1,76 @@
 # EAP Order Service
 
-`eap-order` is the entry point for the trading flow.
+`eap-order` owns CDA order acceptance, the command-side order event stream, durable application of trade results, and rebuildable order query projections. It also exposes TDA bid entry and maintains auction status/result views.
 
-It accepts order requests, maintains the order lifecycle, and reacts to downstream events from `eap-wallet` and `eap-matchEngine`.
+## Current Flow
 
-## Responsibilities
+```text
+POST /bid/buy or /bid/sell
+  -> allocate market sequence
+  -> append OrderSubmissionRequestedV1 + OrderSubmitted outbox atomically
+  -> return PENDING_WALLET_CHECK
 
-- Expose REST APIs for buy/sell/auction order operations
-- Publish order events into RabbitMQ
-- Update order state from downstream confirmations, failures, and matches
-- Provide order query and market-data endpoints
+OrderConfirmedEvent / OrderFailedEvent
+  -> append the corresponding order lifecycle event
 
-## What belongs here
+TradeExecutedEvent
+  -> persist durable inbox before manual ACK
+  -> idempotently append command-side trade application events
+  -> retry from the inbox when command state is not ready yet
 
-- Order submission and cancellation
-- Order state machine
-- Order query / history
-- Market data presentation
+order event stream
+  -> asynchronously rebuild orders_current projection
+```
 
-## What does not belong here
+The query projection is not a prerequisite for trade application. MatchEngine's durable `TradeExecuted` fact is sufficient authority to apply a valid trade to Order's command state; projection lag is measured and repaired separately.
 
-- Wallet balance locking logic
-- Matching engine price-time execution
-- AI orchestration / tool routing
+TDA follows a separate contract:
 
-## Main dependencies
+```text
+auction bid HTTP
+  -> validate and publish AuctionBidSubmittedEvent
+  -> Wallet reserves the requested auction assets
 
-- `eap-common` for shared DTOs and events
-- RabbitMQ for async event flow
-- PostgreSQL for order persistence
+AuctionCreatedEvent / AuctionClearedEvent
+  -> persist the auction session or result view
+  -> publish status/results to WebSocket clients
+```
+
+`AuctionBidSubmittedEvent` is currently published directly through RabbitMQ rather than the Order integration outbox. The auction-result listener also catches processing failures, so a failed local update does not automatically force broker redelivery. TDA is therefore implemented functionality, but it does not yet share the CDA path's publication, retry, or published capacity evidence.
+
+## Ownership
+
+| Owns | Does not own |
+| --- | --- |
+| CDA order IDs, market sequence allocation, order lifecycle events | Wallet balances and reservations |
+| Order submission and integration-event outbox | Price-time matching decisions |
+| Durable `TradeExecuted` inbox and `order_trade_applications` | The authoritative `TradeExecuted` fact |
+| Rebuildable current-order projection and audit/replay APIs | Cross-service completion state |
+| TDA bid entry and auction status/result views | TDA asset reservation and auction clearing |
+
+Order does not publish a per-trade completion callback to MatchEngine. Full-flow verification compares Order's durable trade applications with MatchEngine and Wallet outside the transaction path.
+
+## Reliability
+
+- Local state and outbox rows are committed atomically.
+- RabbitMQ consumers ACK only after durable local handling.
+- `trade_id` and database constraints make repeated `TradeExecutedEvent` delivery idempotent.
+- Projection-lagged events remain in a durable inbox and are reconciled without broker requeue storms.
+- API rate limiting and queue-aware backpressure protect the asynchronous pipeline.
+- TDA direct publication and caught listener failures are explicit gaps and are not described as transactional-outbox or retry protected.
 
 ## Run
 
 ```bash
-./gradlew :eap-order:bootRun
+./gradlew bootRun
 ```
 
-Default port: `8080`
+Default port: `8080`; context path: `/eap-order`.
 
-## Notes
+## Further Reading
 
-- This service is part of the core RabbitMQ-driven trading path.
-- Keep request validation and state transitions explicit.
+- [Order event sourcing design](docs/order-event-sourcing-design.md)
+- [MQ backpressure design](docs/mq-backpressure-design.md)
+- [Order/Wallet admission load test](docs/order-wallet-e2e-load-test.md)
+- [Audit write scaling plan](docs/audit-write-scaling-plan.md)
+- [EAP system architecture](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/architecture.md)

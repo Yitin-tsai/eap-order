@@ -1,5 +1,7 @@
 # MQ Backpressure Design
 
+> **現行 guard、歷史流程圖。** `WalletQueueBackpressureGuard` 仍在 BUY/SELL 接受流程最前方執行，並可由設定停用；現行接受流程通過 guard 後會原子寫入 order event store + integration outbox，不再同步 publish 後另寫 audit。下方 publisher-confirm 與 audit 順序描述保留為設計演進紀錄。現行主流程請看 [Order README](../README.md)。容量測試可能停用或調整保護設定，報告必須記錄實際值，且不得把 admission rejection 當成後端容量。
+>
 > 最後更新：2026-06-22  
 > 範圍：`eap-order` 在接受新訂單前，依 wallet queue backlog 與 consumer 狀態進行 admission control。
 > Order 接受後的 RabbitMQ publisher confirm 與完整 HTTP 壓測，見 [`docs/order-wallet-e2e-load-test.md`](./order-wallet-e2e-load-test.md)。
@@ -23,16 +25,15 @@ Guard 放在 `PlaceBuyOrderService` 與 `PlaceSellOrderService` 的最前面：
 REST / MCP order request
   -> wallet queue backpressure guard
   -> allocate market sequence
-  -> build OrderSubmittedEvent
-  -> publish RabbitMQ
-  -> audit
+  -> atomically append OrderSubmissionRequestedV1 + OrderSubmitted outbox
+  -> asynchronous outbox relay publishes RabbitMQ
 ```
 
 這個位置確保：
 
 - REST 與 MCP 下單共用同一條規則。
 - 被拒絕的訂單不會消耗 market sequence。
-- 被拒絕的訂單不會發布 MQ event 或留下成功 audit。
+- 被拒絕的訂單不會寫入 order event stream 或建立 integration outbox。
 
 Auction bid 使用不同流程與 queue，不在這次範圍。
 

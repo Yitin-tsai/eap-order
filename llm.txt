@@ -1,69 +1,59 @@
-# eap-order — LLM Context
+# eap-order - LLM Context
 
-> Port 8080 | Context Path: /eap-order
-> OpenAPI spec: `docs/api/order-service.json`
+> Port 8080 | Context path `/eap-order`
 
-## API Endpoints
+## Ownership
 
-| Endpoint | Description | Involves |
-|----------|-------------|----------|
-| POST /bid/buy | 掛買單，觸發 wallet 餘額檢查 → 撮合流程 | order → wallet → matchEngine |
-| POST /bid/sell | 掛賣單，同上 | order → wallet → matchEngine |
-| GET /bid/user-orders/all | 查詢用戶所有訂單（待處理 + 已成交） | order (DB) |
-| GET /bid/user-orders/pending | 僅待處理訂單 | order (Redis via matchEngine) |
-| GET /bid/user-orders/matched | 僅已成交訂單 | order (DB: match_history) |
-| POST /bid/user-orders/cancel | 取消訂單 | order → matchEngine (Redis) |
-| GET /orders/order/{orderId}/status | 查詢訂單當前狀態 | order (in-memory status map) |
-| GET /orders/order/{orderId}/status/stream | SSE 即時訂單狀態推送 | order (SSE emitter) |
-| POST /mcp/v1/orders | 統一下單（MCP API，供 LLM 使用） | order → wallet → matchEngine |
-| DELETE /mcp/v1/orders/{orderId} | 取消訂單（MCP API） | order → matchEngine |
-| GET /mcp/v1/orders | 查詢訂單，支援 status 篩選 | order (DB + Redis) |
-| GET /mcp/v1/orderbook | 訂單簿快照（depth 參數） | matchEngine (Redis ZSet) |
-| GET /mcp/v1/metrics | 市場指標（spread、流動性等） | matchEngine (Redis) |
-| GET /mcp/v1/health | 健康檢查 | order only |
-| WS /ws | STOMP over SockJS：市場數據、即時成交、訂單簿更新 | order (in-memory broker) |
+- HTTP BUY/SELL acceptance and market-sequence allocation.
+- Append-only order lifecycle event store.
+- Transactional Order integration outbox.
+- Durable `TradeExecutedEvent` inbox and idempotent command-side application.
+- Rebuildable `orders_current` query projection, audit, and replay.
+- TDA auction bid entry plus auction session/result views.
 
-## Database Schema (order_service)
+Order does not own Wallet balances, matching, the authoritative trade fact, or cross-service completion state.
 
-**Table: match_history** — Completed trade records
-| Column | Type | Notes |
-|--------|------|-------|
-| id | SERIAL PK | |
-| match_id | INTEGER NOT NULL | Unique (uk_match_history_match_id) |
-| price | INTEGER NOT NULL | Deal price |
-| amount | INTEGER NOT NULL | Matched quantity |
-| buyer_uuid | UUID NOT NULL | Indexed |
-| seller_uuid | UUID NOT NULL | Indexed |
-| order_type | VARCHAR(10) NOT NULL | 'BUY' or 'SELL' |
-| update_time | TIMESTAMP | Default CURRENT_TIMESTAMP, indexed DESC |
+## Current Write Flow
 
-**Table: orders** — Async backup of confirmed/matched orders
-| Column | Type | Notes |
-|--------|------|-------|
-| order_id | UUID PK | Not auto-generated, from event |
-| user_id | UUID NOT NULL | Indexed |
-| price | INTEGER NOT NULL | |
-| amount | INTEGER NOT NULL | |
-| order_type | VARCHAR(4) NOT NULL | 'BUY' or 'SELL' |
-| status | VARCHAR(20) | Default 'CONFIRMED', indexed. Values: CONFIRMED → MATCHED |
-| created_at | TIMESTAMP NOT NULL | |
-| updated_at | TIMESTAMP | Default CURRENT_TIMESTAMP |
+```text
+POST /bid/buy or /bid/sell
+  -> OrderSubmissionRequestedV1 + OrderSubmitted outbox
+  -> response status PENDING_WALLET_CHECK
 
-## RabbitMQ Listeners
+OrderConfirmedEvent / OrderFailedEvent
+  -> append reservation result to order stream
 
-| Queue | Listener Class | Handles |
-|-------|---------------|---------|
-| order.orderConfirmed.queue | OrderStatusUpdateListener | Update order status on confirmation |
-| order.tradeExecuted.queue | TradeExecutedListener | Apply matched trade state → write OrderTradeApplied outbox |
-| order.orderFailed.queue | OrderStatusUpdateListener | Update order status on failure via SSE |
+TradeExecutedEvent
+  -> persist order_trade_execution_inbox
+  -> claim trade_id in order_trade_applications
+  -> append buyer/seller trade application events
+  -> manual ACK after durable handling
+```
 
-## Key Files
+If command state is not ready, the inbox reconciler retries locally. The query projection is not a prerequisite for applying a durable trade.
 
-| What | Path |
-|------|------|
-| Controllers | src/main/java/com/eap/eap_order/controller/ |
-| Listeners | src/main/java/com/eap/eap_order/listener/ |
-| Feign Clients | src/main/java/com/eap/eap_order/client/ |
-| WebSocket Config | src/main/java/com/eap/eap_order/configuration/ |
-| Liquibase | src/main/resources/db/changelog/ |
-| Hand-written OpenAPI | src/main/resources/openapi/orderService.yml |
+## TDA Flow
+
+```text
+auction bid HTTP -> direct AuctionBidSubmittedEvent publish -> Wallet
+AuctionCreatedEvent / AuctionClearedEvent -> persist auction view + notify WebSocket clients
+```
+
+The auction bid publication currently bypasses the Order integration outbox. Auction result listeners catch processing exceptions, so local failure does not necessarily trigger RabbitMQ redelivery. Do not apply CDA reliability or capacity claims to TDA.
+
+## RabbitMQ Consumers
+
+| Queue | Handler |
+| --- | --- |
+| `order.orderConfirmed.queue` | reservation confirmation batch listener |
+| `order.orderFailed.queue` | reservation failure listener |
+| `order.tradeExecuted.queue` | durable trade inbox/application listener |
+| `order.auctionCreated.queue` | create/update auction session view |
+| `order.auctionCleared.queue` | apply auction result view and client notification |
+
+## Key Paths
+
+- Controllers: `src/main/java/com/eap/eap_order/controller/`
+- Event store/outbox/projectors: `src/main/java/com/eap/eap_order/eventstore/`
+- Trade inbox/listener: `src/main/java/com/eap/eap_order/application/`
+- Liquibase: `src/main/resources/db/changelog/`

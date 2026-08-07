@@ -1,5 +1,7 @@
 # Order → Wallet HTTP 全鏈路壓測
 
+> **歷史 benchmark contract。** 本文記錄 Order Event Sourcing 前的 HTTP-to-Wallet admission 測試，不能代表現行完整成交容量。現行 Order 先寫 event store + integration outbox，完整業務測試還必須經 MatchEngine、Order trade application、Wallet settlement、三服務 durable `trade_id` 核對、資產核對與 queue drain。現行 runner 與 workload 分類請看 [eap-infra load-test taxonomy](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/benchmarks/load-test-taxonomy.md)。
+>
 > 最後更新：2026-06-24  
 > 範圍：從 Order HTTP API 到 RabbitMQ、Wallet transaction 與 Wallet Outbox Relay。
 

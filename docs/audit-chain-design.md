@@ -1,5 +1,7 @@
 # Audit Hash Chain Design
 
+> **歷史設計紀錄。** 本文記錄 Order Event Sourcing 切換前後的 audit chain 問題與決策，不是現行下單流程規範。現行寫入以 `OrderSubmissionRequestedV1`、order event store 與 integration outbox 的原子 append 為準；請先閱讀 [Order README](../README.md) 與 [Order Event Sourcing 設計](./order-event-sourcing-design.md)。下方 `ORDER_MATCHED` 等名稱只代表當時的演進脈絡。
+>
 > 最後更新：2026-06-24  
 > 範圍：Order / Auction lifecycle audit 的 correlation chain、初始事件與後續事件寫入規則。
 > 後續 audit 的資料庫瓶頸、chain-head 模型、workload isolation 與容量驗證計畫，見 [`docs/audit-write-scaling-plan.md`](./audit-write-scaling-plan.md)。

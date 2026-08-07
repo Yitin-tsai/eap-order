@@ -385,8 +385,7 @@ public class OrderEventOutboxRelay {
     }
 
     private Message toJsonMessage(OutboxRow row) {
-        if (!"com.eap.common.event.OrderSubmittedEvent".equals(row.messageType())
-                && !"com.eap.common.event.OrderTradeAppliedEvent".equals(row.messageType())) {
+        if (!"com.eap.common.event.OrderSubmittedEvent".equals(row.messageType())) {
             throw new IllegalArgumentException("Unsupported Order outbox message type: " + row.messageType());
         }
         MessageProperties properties = new MessageProperties();

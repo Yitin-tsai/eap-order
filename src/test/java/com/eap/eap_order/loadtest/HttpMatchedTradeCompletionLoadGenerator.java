@@ -44,8 +44,6 @@ import java.util.concurrent.atomic.AtomicLongArray;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_WALLET_TRADE_SETTLED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
@@ -67,8 +65,6 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
             ORDER_TRADE_EXECUTED_QUEUE,
             WALLET_TRADE_EXECUTED_QUEUE,
-            MATCH_ENGINE_ORDER_TRADE_APPLIED_QUEUE,
-            MATCH_ENGINE_WALLET_TRADE_SETTLED_QUEUE,
             DEAD_LETTER_QUEUE
     );
 
@@ -739,8 +735,6 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     END IF;
                 END $$;
                 TRUNCATE TABLE
-                    match_engine.trade_completion_markers,
-                    match_engine.trade_completion_view,
                     match_engine.trade_outbox,
                     match_engine.trade_executions
                 RESTART IDENTITY CASCADE;
@@ -1344,9 +1338,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 int index = scheduledOrder.tradeIndex();
                 String side = scheduledOrder.side();
                 List<UUID> users = "BUY".equals(side) ? buyers : sellers;
-                // Keep the buyer/seller identity attached to the trade pair; shuffling
-                // should change arrival order, not create artificial wallet hot spots.
-                int userIndex = index;
+                int userIndex = scheduledOrder.userSequence();
                 throttle(nextSendAtNanos, orderIntervalNanos);
                 submitSteadyOrder(
                         executor,
@@ -2362,9 +2354,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 int index = scheduledOrder.tradeIndex();
                 String side = scheduledOrder.side();
                 List<UUID> users = "BUY".equals(side) ? buyers : sellers;
-                // User assignment follows the trade index so shuffled arrival does not
-                // turn a disjoint settlement batch into overlapping wallet updates.
-                int userIndex = index;
+                int userIndex = scheduledOrder.userSequence();
                 throttle(nextSendAtNanos, orderIntervalNanos);
                 base.submitSteadyOrder(
                         executor,
@@ -3057,7 +3047,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     BalancedOrderSchedule.ArrivalPattern.parse(
                             SteadyStateConfig.stringArg(args, "--arrival-pattern", "shuffled")),
                     SteadyStateConfig.longArg(args, "--workload-seed", 20260804L),
-                    SteadyStateConfig.stringArg(args, "--runtime-profile", "core-capacity"),
+                    SteadyStateConfig.stringArg(args, "--runtime-profile", "canonical"),
                     SteadyStateConfig.stringArg(args, "--sample-output", ""),
                     SteadyStateConfig.stringArg(args, "--stage-output", ""));
         }
@@ -3177,7 +3167,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     BalancedOrderSchedule.ArrivalPattern.parse(
                             stringArg(args, "--arrival-pattern", "shuffled")),
                     longArg(args, "--workload-seed", 20260804L),
-                    stringArg(args, "--runtime-profile", "core-capacity"),
+                    stringArg(args, "--runtime-profile", "canonical"),
                     stringArg(args, "--sample-output", ""));
         }
 

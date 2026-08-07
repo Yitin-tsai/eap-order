@@ -25,17 +25,27 @@ final class BalancedOrderSchedule {
             throw new IllegalArgumentException("trades must be non-negative");
         }
 
-        List<ScheduledOrder> orders = new ArrayList<>(Math.multiplyExact(trades, 2));
+        List<OrderIdentity> orders = new ArrayList<>(Math.multiplyExact(trades, 2));
         for (int offset = 0; offset < trades; offset++) {
             int tradeIndex = Math.addExact(startingTradeIndex, offset);
-            orders.add(new ScheduledOrder(tradeIndex, "SELL"));
-            orders.add(new ScheduledOrder(tradeIndex, "BUY"));
+            orders.add(new OrderIdentity(tradeIndex, "SELL"));
+            orders.add(new OrderIdentity(tradeIndex, "BUY"));
         }
         if (pattern == ArrivalPattern.SHUFFLED) {
             long phaseSeed = workloadSeed ^ (PHASE_SEED_MULTIPLIER * startingTradeIndex);
             Collections.shuffle(orders, new Random(phaseSeed));
         }
-        return List.copyOf(orders);
+
+        int nextBuyUserSequence = startingTradeIndex;
+        int nextSellUserSequence = startingTradeIndex;
+        List<ScheduledOrder> schedule = new ArrayList<>(orders.size());
+        for (OrderIdentity order : orders) {
+            int userSequence = "BUY".equals(order.side())
+                    ? nextBuyUserSequence++
+                    : nextSellUserSequence++;
+            schedule.add(new ScheduledOrder(order.tradeIndex(), order.side(), userSequence));
+        }
+        return List.copyOf(schedule);
     }
 
     enum ArrivalPattern {
@@ -64,6 +74,9 @@ final class BalancedOrderSchedule {
         }
     }
 
-    record ScheduledOrder(int tradeIndex, String side) {
+    private record OrderIdentity(int tradeIndex, String side) {
+    }
+
+    record ScheduledOrder(int tradeIndex, String side, int userSequence) {
     }
 }
