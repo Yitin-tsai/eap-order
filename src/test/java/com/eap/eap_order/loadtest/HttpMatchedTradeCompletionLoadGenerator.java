@@ -57,6 +57,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
     private static final int PRICE = 100;
     private static final int AMOUNT = 1;
     private static final int BENCHMARK_SCHEMA_VERSION = 2;
+    private static final int MAX_STEADY_SCHEDULING_OVERRUN_SECONDS = 30;
     private static final String HTTP_MARKET_ID = "ENERGY-SPOT";
     private static final List<String> CHAIN_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
@@ -1361,6 +1362,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             ExecutorService executor = Executors.newFixedThreadPool(common.workers());
             AtomicLong nextSendAtNanos = new AtomicLong(startedAtNanos);
             long orderIntervalNanos = TimeUnit.SECONDS.toNanos(1) / config.targetOrderTps();
+            long schedulingDeadlineNanos = startedAtNanos
+                    + TimeUnit.SECONDS.toNanos(
+                            config.warmupSeconds()
+                                    + config.durationSeconds()
+                                    + MAX_STEADY_SCHEDULING_OVERRUN_SECONDS);
 
             System.out.printf(
                     "sending continuous balanced mixed HTTP traffic: totalOrders=%d, expectedTrades=%d, "
@@ -1379,12 +1385,19 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     common.events(),
                     config.arrivalPattern(),
                     config.workloadSeed());
+            int submittedOrders = 0;
             for (BalancedOrderSchedule.ScheduledOrder scheduledOrder : schedule) {
+                if (System.nanoTime() >= schedulingDeadlineNanos) {
+                    break;
+                }
                 int index = scheduledOrder.tradeIndex();
                 String side = scheduledOrder.side();
                 List<UUID> users = "BUY".equals(side) ? buyers : sellers;
                 int userIndex = scheduledOrder.userSequence();
                 throttle(nextSendAtNanos, orderIntervalNanos);
+                if (System.nanoTime() >= schedulingDeadlineNanos) {
+                    break;
+                }
                 submitSteadyOrder(
                         executor,
                         inFlight,
@@ -1394,6 +1407,20 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         side,
                         deterministicSteadyOrderId(common.runId(), side, index),
                         users.get(userIndex % users.size()));
+                submittedOrders++;
+            }
+
+            int unscheduledOrders = totalOrders - submittedOrders;
+            if (unscheduledOrders > 0) {
+                counters.recordUnscheduled(unscheduledOrders);
+                for (int i = 0; i < unscheduledOrders; i++) {
+                    done.countDown();
+                }
+                System.err.printf(
+                        "steady scheduling deadline exceeded: submitted=%d, unscheduled=%d, graceSeconds=%d%n",
+                        submittedOrders,
+                        unscheduledOrders,
+                        MAX_STEADY_SCHEDULING_OVERRUN_SECONDS);
             }
 
             done.await();
@@ -1933,6 +1960,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (counters.otherFailures.get() != 0) {
                 reasons.add("http_other_failures");
             }
+            if (counters.unscheduled.get() != 0) {
+                reasons.add("traffic_scheduling_deadline_exceeded");
+            }
             if (window.samples() < 2) {
                 reasons.add("insufficient_steady_samples");
             }
@@ -2065,6 +2095,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"http429\": %d,%n", counters.tooManyRequests.get());
             System.out.printf("  \"http503\": %d,%n", counters.unavailable.get());
             System.out.printf("  \"httpOtherFailures\": %d,%n", counters.otherFailures.get());
+            System.out.printf("  \"unscheduledOrders\": %d,%n", counters.unscheduled.get());
             System.out.printf("  \"trafficSendSeconds\": %.4f,%n", sendElapsedSeconds);
             System.out.printf("  \"totalHttpAcceptedTps\": %.2f,%n",
                     counters.accepted() / Math.max(sendElapsedSeconds, 0.001));
@@ -2729,6 +2760,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         private final AtomicInteger tooManyRequests = new AtomicInteger();
         private final AtomicInteger unavailable = new AtomicInteger();
         private final AtomicInteger otherFailures = new AtomicInteger();
+        private final AtomicInteger unscheduled = new AtomicInteger();
         private final LatencyHistogram latency = new LatencyHistogram();
 
         private void recordResponse(String side, int status, long latencyNanos, String body) {
@@ -2760,12 +2792,19 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             }
         }
 
+        private void recordUnscheduled(int count) {
+            unscheduled.addAndGet(count);
+        }
+
         private long accepted() {
             return sellAccepted.get() + (long) buyAccepted.get();
         }
 
         private long failures() {
-            return tooManyRequests.get() + (long) unavailable.get() + otherFailures.get();
+            return tooManyRequests.get()
+                    + (long) unavailable.get()
+                    + otherFailures.get()
+                    + unscheduled.get();
         }
     }
 
