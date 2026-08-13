@@ -17,6 +17,8 @@ import java.util.Map;
 
 final class RabbitManagementClient {
 
+    static final long UNAVAILABLE_BACKLOG = -1;
+
     private final String managementUrl;
     private final String vhost;
     private final String authorization;
@@ -127,8 +129,8 @@ final class RabbitManagementClient {
     }
 
     record QueueSnapshot(long backlog, long readFailures, Map<String, QueueDepth> depths) {
-        private static QueueSnapshot failed(int queueCount) {
-            return new QueueSnapshot(Long.MAX_VALUE, queueCount, Map.of());
+        static QueueSnapshot failed(int queueCount) {
+            return new QueueSnapshot(UNAVAILABLE_BACKLOG, queueCount, Map.of());
         }
     }
 }

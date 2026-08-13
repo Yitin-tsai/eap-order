@@ -1162,6 +1162,51 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 && endBacklog - startBacklog > minimumMeaningfulGrowth;
     }
 
+    static BacklogWindow summarizeBacklog(List<SteadySample> samples) {
+        List<SteadySample> validSamples = samples.stream()
+                .filter(sample -> sample.queueReadFailures() == 0)
+                .toList();
+        if (validSamples.isEmpty()) {
+            return new BacklogWindow(-1, -1, -1, 0, 0);
+        }
+        SteadySample first = validSamples.get(0);
+        SteadySample last = validSamples.get(validSamples.size() - 1);
+        long max = validSamples.stream()
+                .mapToLong(SteadySample::queueBacklog)
+                .max()
+                .orElse(-1);
+        return new BacklogWindow(
+                first.queueBacklog(),
+                last.queueBacklog(),
+                max,
+                backlogSlope(validSamples),
+                validSamples.size());
+    }
+
+    private static double backlogSlope(List<SteadySample> samples) {
+        if (samples.size() < 2) {
+            return 0;
+        }
+        double origin = samples.get(0).elapsedSeconds();
+        double sumX = 0;
+        double sumY = 0;
+        double sumXX = 0;
+        double sumXY = 0;
+        for (SteadySample sample : samples) {
+            double x = sample.elapsedSeconds() - origin;
+            double y = sample.queueBacklog();
+            sumX += x;
+            sumY += y;
+            sumXX += x * x;
+            sumXY += x * y;
+        }
+        double count = samples.size();
+        double denominator = count * sumXX - sumX * sumX;
+        return Math.abs(denominator) < 0.000001
+                ? 0
+                : (count * sumXY - sumX * sumY) / denominator;
+    }
+
     private static final class SteadyStateRunner {
 
         private final SteadyStateConfig config;
@@ -1513,7 +1558,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             double acceptedTps = accepted / Math.max(seconds, 0.001);
             double completedTps = completed / Math.max(seconds, 0.001);
             double completionToAcceptedRatio = completed / Math.max(accepted / 2.0, 0.001);
-            long maxBacklog = windowSamples.stream().mapToLong(SteadySample::queueBacklog).max().orElse(0);
+            BacklogWindow backlog = summarizeBacklog(windowSamples);
             long queueReadFailures = windowSamples.stream().mapToLong(SteadySample::queueReadFailures).sum();
             return new SteadyWindow(
                     first.elapsedSeconds(),
@@ -1526,33 +1571,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     acceptedTps / targetOrderTps,
                     completedTps / (targetOrderTps / 2.0),
                     completionToAcceptedRatio,
-                    first.queueBacklog(),
-                    last.queueBacklog(),
-                    maxBacklog,
-                    backlogSlope(windowSamples),
+                    backlog.start(),
+                    backlog.end(),
+                    backlog.max(),
+                    backlog.slopePerSecond(),
                     queueReadFailures,
                     windowSamples.size());
-        }
-
-        private double backlogSlope(List<SteadySample> samples) {
-            double origin = samples.get(0).elapsedSeconds();
-            double sumX = 0;
-            double sumY = 0;
-            double sumXX = 0;
-            double sumXY = 0;
-            for (SteadySample sample : samples) {
-                double x = sample.elapsedSeconds() - origin;
-                double y = sample.queueBacklog();
-                sumX += x;
-                sumY += y;
-                sumXX += x * x;
-                sumXY += x * y;
-            }
-            double count = samples.size();
-            double denominator = count * sumXX - sumX * sumX;
-            return Math.abs(denominator) < 0.000001
-                    ? 0
-                    : (count * sumXY - sumX * sumY) / denominator;
         }
 
         private SteadyExpectedOutcome resolveExpectedOutcome(
@@ -2783,7 +2807,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         }
     }
 
-    private record SteadySample(
+    record SteadySample(
             double elapsedSeconds,
             long httpAccepted,
             long httpFailures,
@@ -2793,6 +2817,14 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long completedTrades,
             long queueBacklog,
             long queueReadFailures) {
+    }
+
+    record BacklogWindow(
+            long start,
+            long end,
+            long max,
+            double slopePerSecond,
+            int validSamples) {
     }
 
     private record SteadyWindow(
