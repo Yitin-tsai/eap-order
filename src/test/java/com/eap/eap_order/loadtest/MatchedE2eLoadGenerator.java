@@ -2,6 +2,7 @@ package com.eap.eap_order.loadtest;
 
 import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
+import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_order.EapOrderApplication;
 import com.eap.eap_order.application.OrderEventSourcingService;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
@@ -15,6 +16,7 @@ import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -29,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -46,7 +49,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.core.MessageProperties;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -66,6 +74,8 @@ import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CREATED_Q
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.TRADE_EXCHANGE;
+import static com.eap.common.constants.RabbitMQConstants.TRADE_EXECUTED_KEY;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_AUCTION_BID_SUBMITTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_AUCTION_CLEARED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_SUBMITTED_QUEUE;
@@ -87,6 +97,14 @@ public class MatchedE2eLoadGenerator {
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
     private static final AtomicLong QUEUE_METRICS_READ_FAILURES = new AtomicLong();
+    private static final AtomicInteger RABBIT_CLIENT_THREAD_SEQUENCE = new AtomicInteger();
+    private static final ExecutorService RABBIT_CLIENT_EXECUTOR = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(
+                runnable,
+                "matched-e2e-rabbit-" + RABBIT_CLIENT_THREAD_SEQUENCE.incrementAndGet());
+        thread.setDaemon(true);
+        return thread;
+    });
     private static final QueueDrainDiagnostics EMPTY_QUEUE_DRAIN_DIAGNOSTICS =
             new QueueDrainDiagnostics(List.of(), "none", "none", -1, 0, 0);
 
@@ -136,17 +154,117 @@ public class MatchedE2eLoadGenerator {
                     case "project" -> projectSeededOrders(config, orderJdbc, ordersCurrentProjector);
                     case "publish-only" -> publishOnly(config, pairs, objectMapper, rabbitAdmin);
                     case "run" -> run(config, pairs, orderJdbc, walletJdbc, matchJdbc, objectMapper, rabbitAdmin, redisTemplate);
+                    case "downstream-seed" -> seedDownstream(config, pairs, orderJdbc, walletJdbc, rabbitAdmin);
+                    case "downstream-run" -> runDownstream(
+                            config,
+                            pairs,
+                            orderJdbc,
+                            walletJdbc,
+                            objectMapper,
+                            rabbitAdmin,
+                            rabbitConnectionFactory);
+                    case "relay-downstream-seed" -> seedRelayDownstream(
+                            config, pairs, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin);
+                    case "relay-downstream-run" -> runRelayDownstream(
+                            config, pairs, orderJdbc, walletJdbc, matchJdbc, objectMapper, rabbitAdmin);
                     case "all" -> {
                         seed(config, pairs, orderJdbc, walletJdbc, matchJdbc, eventSourcingService, rabbitAdmin, redisTemplate);
                         projectSeededOrders(config, orderJdbc, ordersCurrentProjector);
                         run(config, pairs, orderJdbc, walletJdbc, matchJdbc, objectMapper, rabbitAdmin, redisTemplate);
                     }
-                    default -> throw new IllegalArgumentException("--phase must be seed, project, publish-only, run, or all");
+                    default -> throw new IllegalArgumentException(
+                            "--phase must be seed, project, publish-only, run, downstream-seed, downstream-run, "
+                                    + "relay-downstream-seed, relay-downstream-run, or all");
                 }
             } finally {
                 redisConnectionFactory.destroy();
                 rabbitConnectionFactory.destroy();
             }
+        }
+    }
+
+    private static void seedDownstream(
+            Config config,
+            List<Pair> pairs,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            RabbitAdmin rabbitAdmin) {
+        if (config.truncate()) {
+            truncateOrderTestData(orderJdbc);
+            truncateWalletTestData(walletJdbc);
+        }
+        purgeQueues(rabbitAdmin);
+        seedOrdersBulk(config, pairs, orderJdbc);
+        orderJdbc.execute("TRUNCATE TABLE order_service.order_event_outbox RESTART IDENTITY");
+        seedWallets(walletJdbc, pairs);
+        System.out.printf(
+                "downstream seed complete; marketId=%s, trades=%d, orders=%d, wallets=%d%n",
+                config.marketId(), config.events(), config.events() * 2, config.events() * 2);
+    }
+
+    private static void seedRelayDownstream(
+            Config config,
+            List<Pair> pairs,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            JdbcTemplate matchJdbc,
+            RabbitAdmin rabbitAdmin) {
+        seedDownstream(config, pairs, orderJdbc, walletJdbc, rabbitAdmin);
+        if (config.truncate()) {
+            truncateMatchTestData(matchJdbc);
+        }
+        seedMatchTradesAndDeferredOutbox(config, pairs, matchJdbc);
+        System.out.printf(
+                "relay downstream seed complete; marketId=%s, durableTrades=%d, deferredOutbox=%d%n",
+                config.marketId(), config.events(), config.events());
+    }
+
+    private static void seedMatchTradesAndDeferredOutbox(
+            Config config,
+            List<Pair> pairs,
+            JdbcTemplate matchJdbc) {
+        for (int start = 0; start < pairs.size(); start += SEED_BATCH_PAIRS) {
+            int end = Math.min(start + SEED_BATCH_PAIRS, pairs.size());
+            List<Object[]> tradeRows = new ArrayList<>(end - start);
+            List<Object[]> outboxRows = new ArrayList<>(end - start);
+            for (int index = start; index < end; index++) {
+                Pair pair = pairs.get(index);
+                String tradeId = config.marketId() + "-" + pair.matchId();
+                LocalDateTime occurredAt = LocalDateTime.now();
+                tradeRows.add(new Object[] {
+                        tradeId,
+                        (long) pair.matchId(),
+                        (long) pair.matchId(),
+                        config.marketId(),
+                        pair.buyerId(),
+                        pair.sellerId(),
+                        pair.buyOrderId(),
+                        pair.sellOrderId(),
+                        pair.buySequence(),
+                        pair.sellSequence(),
+                        PRICE,
+                        PRICE,
+                        PRICE,
+                        AMOUNT,
+                        occurredAt
+                });
+                outboxRows.add(new Object[] { tradeId, TRADE_EXECUTED_KEY });
+            }
+            matchJdbc.batchUpdate("""
+                    INSERT INTO match_engine.trade_executions
+                        (trade_id, sequence, legacy_match_id, market_id,
+                         buyer_id, seller_id, buyer_order_id, seller_order_id,
+                         buyer_market_sequence, seller_market_sequence,
+                         origin_buyer_price, origin_seller_price, deal_price, quantity, occurred_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, tradeRows);
+            matchJdbc.batchUpdate("""
+                    INSERT INTO match_engine.trade_outbox
+                        (event_type, aggregate_type, aggregate_id, routing_key,
+                         status, attempt_count, next_retry_at)
+                    VALUES ('TradeExecutedEvent', 'TRADE', ?, ?,
+                            'PENDING', 0, CURRENT_TIMESTAMP + INTERVAL '1 hour')
+                    """, outboxRows);
         }
     }
 
@@ -403,6 +521,514 @@ public class MatchedE2eLoadGenerator {
         require(remainingSellOrders == 0, "all resting SELL orders should be consumed");
         require(remainingBuyOrders == 0, "incoming BUY orders should not remain in order book");
         require(reservationCleanupWait.activeReservations() == 0, "MatchEngine reservations should converge to zero");
+    }
+
+    private static void runDownstream(
+            Config config,
+            List<Pair> pairs,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            ObjectMapper objectMapper,
+            RabbitAdmin rabbitAdmin,
+            CachingConnectionFactory rabbitConnectionFactory) throws Exception {
+        purgeQueues(rabbitAdmin);
+        long startedNanos = System.nanoTime();
+        DownstreamPublishResult publish = publishTradeExecuted(
+                config, pairs, objectMapper, rabbitConnectionFactory, startedNanos);
+        DownstreamWaitResult wait = waitForTradeConsumers(
+                config, orderJdbc, walletJdbc, rabbitAdmin, startedNanos);
+        DownstreamTradeIdCheck tradeIds = checkDownstreamTradeIds(config, pairs, orderJdbc, walletJdbc);
+
+        boolean publishPassed = publish.acked() == config.events()
+                && publish.nacked() == 0
+                && publish.returned() == 0
+                && publish.timedOut() == 0
+                && publish.failures() == 0;
+        boolean dataPassed = wait.orderApplications() == config.events()
+                && wait.orderMatchedRows() == config.events() * 2L
+                && wait.walletSettlements() == config.events()
+                && wait.lockedCurrency() == 0
+                && wait.lockedAmount() == 0
+                && wait.buyerAvailableAmount() == config.events() * (long) AMOUNT
+                && wait.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT
+                && wait.orderInboxRows() == 0
+                && wait.orderOutboxRows() == 0
+                && wait.walletOutboxRows() == 0;
+        boolean queuePassed = wait.orderQueueFinal().total() == 0
+                && wait.walletQueueFinal().total() == 0
+                && wait.dlqFinal().total() == 0
+                && wait.queueDrainedSeconds() > 0;
+        boolean correctnessPassed = publishPassed && dataPassed && queuePassed && tradeIds.equal();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("benchmarkSchemaVersion", BENCHMARK_SCHEMA_VERSION);
+        result.put("mode", "trade-consumer-fanout-isolated");
+        result.put("evidenceClass", "isolated-diagnostic");
+        result.put("capacityClaimAllowed", false);
+        result.put("marketId", config.marketId());
+        result.put("trades", config.events());
+        result.put("targetTradeEventsPerSecond", config.targetTps());
+        result.put("publisherOfferSeconds", publish.offerSeconds());
+        result.put("publisherConfirmSeconds", publish.confirmSeconds());
+        result.put("publisherOfferedEventsPerSecond", rate(config.events(), publish.offerSeconds()));
+        result.put("publisherConfirmedEventsPerSecond", rate(publish.acked(), publish.confirmSeconds()));
+        result.put("publisherAcked", publish.acked());
+        result.put("publisherNacked", publish.nacked());
+        result.put("publisherReturned", publish.returned());
+        result.put("publisherTimedOut", publish.timedOut());
+        result.put("publisherFailures", publish.failures());
+        result.put("orderReachedSeconds", wait.orderReachedSeconds());
+        result.put("orderApplicationsPerSecond", rate(wait.orderApplications(), wait.orderReachedSeconds()));
+        result.put("walletReachedSeconds", wait.walletReachedSeconds());
+        result.put("walletSettlementsPerSecond", rate(wait.walletSettlements(), wait.walletReachedSeconds()));
+        double durableFanoutReachedSeconds = Math.max(wait.orderReachedSeconds(), wait.walletReachedSeconds());
+        result.put("durableFanoutReachedSeconds", durableFanoutReachedSeconds);
+        result.put("durableFanoutTradesPerSecond", rate(config.events(), durableFanoutReachedSeconds));
+        result.put("queueDrainVerifiedSeconds", wait.queueDrainedSeconds());
+        result.put("fanoutConvergenceSeconds", wait.convergenceSeconds());
+        result.put("fanoutConvergedTradesPerSecond", rate(config.events(), wait.convergenceSeconds()));
+        result.put("orderApplications", wait.orderApplications());
+        result.put("orderMatchedRows", wait.orderMatchedRows());
+        result.put("walletSettlements", wait.walletSettlements());
+        result.put("lockedCurrency", wait.lockedCurrency());
+        result.put("lockedAmount", wait.lockedAmount());
+        result.put("buyerAvailableAmount", wait.buyerAvailableAmount());
+        result.put("sellerAvailableCurrency", wait.sellerAvailableCurrency());
+        result.put("orderInboxRows", wait.orderInboxRows());
+        result.put("orderOutboxRows", wait.orderOutboxRows());
+        result.put("walletOutboxRows", wait.walletOutboxRows());
+        result.put("orderQueueMax", wait.orderQueueMax());
+        result.put("walletQueueMax", wait.walletQueueMax());
+        result.put("dlqMax", wait.dlqMax());
+        result.put("orderQueueFinal", wait.orderQueueFinal());
+        result.put("walletQueueFinal", wait.walletQueueFinal());
+        result.put("dlqFinal", wait.dlqFinal());
+        result.put("queuePeakSamplingIntervalMs", 500);
+        result.put("queuePeakMayBeUndercounted", true);
+        result.put("queueMetricsReadFailures", QUEUE_METRICS_READ_FAILURES.get());
+        result.put("expectedTradeIdCount", tradeIds.expectedCount());
+        result.put("orderTradeIdCount", tradeIds.orderCount());
+        result.put("walletTradeIdCount", tradeIds.walletCount());
+        result.put("tradeIdUnionCount", tradeIds.unionCount());
+        result.put("missingInOrder", tradeIds.missingInOrder());
+        result.put("missingInWallet", tradeIds.missingInWallet());
+        result.put("unexpectedInOrder", tradeIds.unexpectedInOrder());
+        result.put("unexpectedInWallet", tradeIds.unexpectedInWallet());
+        result.put("tradeIdFingerprint", tradeIds.fingerprint());
+        result.put("correctnessGate", correctnessPassed ? "PASS" : "FAIL");
+        result.put("measurementBoundary",
+                "direct TradeExecuted publish -> real Order batch listener + real Wallet transaction listener -> durable state + queue drain");
+        result.put("excludedFromBoundary", List.of(
+                "HTTP admission", "Wallet reservation", "Order confirmation", "Redis matching",
+                "MatchEngine persistence", "Trade outbox relay", "Order projection", "completion feedback"));
+
+        String json = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result);
+        System.out.println(json);
+        if (config.output() != null && !config.output().isBlank()) {
+            objectMapper.writerWithDefaultPrettyPrinter().writeValue(new File(config.output()), result);
+        }
+        require(correctnessPassed, "Trade consumer fanout probe failed its correctness gate");
+    }
+
+    private static void runRelayDownstream(
+            Config config,
+            List<Pair> pairs,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            JdbcTemplate matchJdbc,
+            ObjectMapper objectMapper,
+            RabbitAdmin rabbitAdmin) throws Exception {
+        purgeQueues(rabbitAdmin);
+        MatchOutboxState beforeActivation = matchOutboxState(config, matchJdbc);
+        require(beforeActivation.pending() == config.events(),
+                "Every seeded Match outbox row must remain pending before activation");
+        require(beforeActivation.sent() == 0 && beforeActivation.failed() == 0,
+                "No Match outbox row may be sent or failed before activation");
+
+        long startedNanos = System.nanoTime();
+        int activatedRows = activateMatchOutbox(config, matchJdbc);
+        DownstreamWaitResult wait = waitForTradeConsumers(
+                config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, startedNanos);
+        TradeIdSetCheck tradeIds = checkTradeIdSets(config, orderJdbc, walletJdbc, matchJdbc);
+
+        boolean outboxPassed = activatedRows == config.events()
+                && wait.matchOutboxPending() == 0
+                && wait.matchOutboxSent() == config.events()
+                && wait.matchOutboxFailed() == 0
+                && wait.matchOutboxReachedSeconds() > 0;
+        boolean dataPassed = wait.orderApplications() == config.events()
+                && wait.orderMatchedRows() == config.events() * 2L
+                && wait.walletSettlements() == config.events()
+                && wait.lockedCurrency() == 0
+                && wait.lockedAmount() == 0
+                && wait.buyerAvailableAmount() == config.events() * (long) AMOUNT
+                && wait.sellerAvailableCurrency() == config.events() * (long) PRICE * AMOUNT
+                && wait.orderInboxRows() == 0
+                && wait.orderOutboxRows() == 0
+                && wait.walletOutboxRows() == 0;
+        boolean queuePassed = wait.orderQueueFinal().total() == 0
+                && wait.walletQueueFinal().total() == 0
+                && wait.dlqFinal().total() == 0
+                && wait.queueDrainedSeconds() > 0;
+        boolean correctnessPassed = outboxPassed && dataPassed && queuePassed && tradeIds.equal();
+
+        double downstreamReachedSeconds = Math.max(wait.orderReachedSeconds(), wait.walletReachedSeconds());
+        double durableConvergenceSeconds = Math.max(wait.matchOutboxReachedSeconds(), downstreamReachedSeconds);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("benchmarkSchemaVersion", BENCHMARK_SCHEMA_VERSION);
+        result.put("mode", "match-relay-trade-consumer-fanout-isolated");
+        result.put("evidenceClass", "isolated-component-boundary");
+        result.put("capacityClaimAllowed", false);
+        result.put("marketId", config.marketId());
+        result.put("trades", config.events());
+        result.put("activatedOutboxRows", activatedRows);
+        result.put("matchOutboxReachedSeconds", wait.matchOutboxReachedSeconds());
+        result.put("matchRelaySentPerSecond", rate(wait.matchOutboxSent(), wait.matchOutboxReachedSeconds()));
+        result.put("orderReachedSeconds", wait.orderReachedSeconds());
+        result.put("orderApplicationsPerSecond", rate(wait.orderApplications(), wait.orderReachedSeconds()));
+        result.put("walletReachedSeconds", wait.walletReachedSeconds());
+        result.put("walletSettlementsPerSecond", rate(wait.walletSettlements(), wait.walletReachedSeconds()));
+        result.put("downstreamDurableReachedSeconds", downstreamReachedSeconds);
+        result.put("downstreamDurableTradesPerSecond", rate(config.events(), downstreamReachedSeconds));
+        result.put("durableConvergenceSeconds", durableConvergenceSeconds);
+        result.put("durableConvergedTradesPerSecond", rate(config.events(), durableConvergenceSeconds));
+        result.put("queueDrainVerifiedSeconds", wait.queueDrainedSeconds());
+        result.put("fullGateSeconds", wait.convergenceSeconds());
+        result.put("fullGateTradesPerSecond", rate(config.events(), wait.convergenceSeconds()));
+        result.put("matchOutboxPending", wait.matchOutboxPending());
+        result.put("matchOutboxSent", wait.matchOutboxSent());
+        result.put("matchOutboxFailed", wait.matchOutboxFailed());
+        result.put("orderApplications", wait.orderApplications());
+        result.put("orderMatchedRows", wait.orderMatchedRows());
+        result.put("walletSettlements", wait.walletSettlements());
+        result.put("lockedCurrency", wait.lockedCurrency());
+        result.put("lockedAmount", wait.lockedAmount());
+        result.put("buyerAvailableAmount", wait.buyerAvailableAmount());
+        result.put("sellerAvailableCurrency", wait.sellerAvailableCurrency());
+        result.put("orderInboxRows", wait.orderInboxRows());
+        result.put("orderOutboxRows", wait.orderOutboxRows());
+        result.put("walletOutboxRows", wait.walletOutboxRows());
+        result.put("orderQueueMax", wait.orderQueueMax());
+        result.put("walletQueueMax", wait.walletQueueMax());
+        result.put("dlqMax", wait.dlqMax());
+        result.put("orderQueueFinal", wait.orderQueueFinal());
+        result.put("walletQueueFinal", wait.walletQueueFinal());
+        result.put("dlqFinal", wait.dlqFinal());
+        result.put("queuePeakSamplingIntervalMs", 500);
+        result.put("queuePeakMayBeUndercounted", true);
+        result.put("queueMetricsReadFailures", QUEUE_METRICS_READ_FAILURES.get());
+        result.put("matchTradeIdCount", tradeIds.matchCount());
+        result.put("orderTradeIdCount", tradeIds.orderCount());
+        result.put("walletTradeIdCount", tradeIds.walletCount());
+        result.put("tradeIdUnionCount", tradeIds.unionCount());
+        result.put("missingInMatch", tradeIds.missingInMatch());
+        result.put("missingInOrder", tradeIds.missingInOrder());
+        result.put("missingInWallet", tradeIds.missingInWallet());
+        result.put("tradeIdFingerprint", tradeIds.fingerprint());
+        result.put("correctnessGate", correctnessPassed ? "PASS" : "FAIL");
+        result.put("measurementBoundary",
+                "activate durable Match trade outbox -> real Match relay -> RabbitMQ fanout -> "
+                        + "real Order batch listener + real Wallet transaction listener -> durable state + queue drain");
+        result.put("excludedFromBoundary", List.of(
+                "HTTP admission", "Wallet reservation", "Order confirmation", "Redis matching",
+                "MatchEngine trade persistence", "Order projection", "completion feedback"));
+
+        String json = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result);
+        System.out.println(json);
+        if (config.output() != null && !config.output().isBlank()) {
+            objectMapper.writerWithDefaultPrettyPrinter().writeValue(new File(config.output()), result);
+        }
+        require(correctnessPassed, "Match relay downstream probe failed its correctness gate");
+    }
+
+    private static int activateMatchOutbox(Config config, JdbcTemplate matchJdbc) {
+        String prefix = config.marketId() + "-";
+        return matchJdbc.update("""
+                UPDATE match_engine.trade_outbox
+                SET next_retry_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'PENDING'
+                  AND left(aggregate_id, ?) = ?
+                """, prefix.length(), prefix);
+    }
+
+    private static DownstreamPublishResult publishTradeExecuted(
+            Config config,
+            List<Pair> pairs,
+            ObjectMapper objectMapper,
+            CachingConnectionFactory connectionFactory,
+            long startedNanos) {
+        RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+        rabbitTemplate.setMandatory(true);
+        List<CorrelationData> confirmations = new ArrayList<>(pairs.size());
+        long intervalNanos = config.targetTps() > 0
+                ? Math.max(1L, 1_000_000_000L / config.targetTps())
+                : 0L;
+        int failures = 0;
+        for (int index = 0; index < pairs.size(); index++) {
+            try {
+                if (intervalNanos > 0) {
+                    sleepUntil(startedNanos + intervalNanos * index);
+                }
+                TradeExecutedEvent event = tradeExecuted(config.marketId(), pairs.get(index));
+                MessageProperties properties = new MessageProperties();
+                properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
+                properties.setContentEncoding(StandardCharsets.UTF_8.name());
+                properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                Message message = new Message(objectMapper.writeValueAsBytes(event), properties);
+                CorrelationData correlationData = new CorrelationData(event.getTradeId());
+                confirmations.add(correlationData);
+                rabbitTemplate.send(TRADE_EXCHANGE, TRADE_EXECUTED_KEY, message, correlationData);
+            } catch (Exception failure) {
+                failures++;
+            }
+        }
+        double offerSeconds = (System.nanoTime() - startedNanos) / 1_000_000_000.0;
+        int acked = 0;
+        int nacked = 0;
+        int returned = 0;
+        int timedOut = 0;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(config.timeoutSeconds());
+        for (CorrelationData correlationData : confirmations) {
+            long remainingNanos = deadline - System.nanoTime();
+            if (remainingNanos <= 0) {
+                timedOut++;
+                continue;
+            }
+            try {
+                CorrelationData.Confirm confirm = correlationData.getFuture().get(remainingNanos, TimeUnit.NANOSECONDS);
+                if (confirm.isAck()) {
+                    acked++;
+                } else {
+                    nacked++;
+                }
+                if (correlationData.getReturned() != null) {
+                    returned++;
+                }
+            } catch (java.util.concurrent.TimeoutException timeout) {
+                timedOut++;
+            } catch (Exception failure) {
+                failures++;
+            }
+        }
+        return new DownstreamPublishResult(
+                acked,
+                nacked,
+                returned,
+                timedOut,
+                failures,
+                offerSeconds,
+                (System.nanoTime() - startedNanos) / 1_000_000_000.0);
+    }
+
+    private static TradeExecutedEvent tradeExecuted(String marketId, Pair pair) {
+        return TradeExecutedEvent.builder()
+                .tradeId(marketId + "-" + pair.matchId())
+                .sequence((long) pair.matchId())
+                .legacyMatchId(pair.matchId())
+                .marketId(marketId)
+                .buyerId(pair.buyerId())
+                .sellerId(pair.sellerId())
+                .buyerOrderId(pair.buyOrderId())
+                .sellerOrderId(pair.sellOrderId())
+                .buyerMarketSequence(pair.buySequence())
+                .sellerMarketSequence(pair.sellSequence())
+                .originBuyerPrice(PRICE)
+                .originSellerPrice(PRICE)
+                .dealPrice(PRICE)
+                .quantity(AMOUNT)
+                .occurredAt(LocalDateTime.now())
+                .build();
+    }
+
+    private static DownstreamWaitResult waitForTradeConsumers(
+            Config config,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            RabbitAdmin rabbitAdmin,
+            long startedNanos) throws InterruptedException {
+        return waitForTradeConsumers(config, orderJdbc, walletJdbc, null, rabbitAdmin, startedNanos);
+    }
+
+    private static DownstreamWaitResult waitForTradeConsumers(
+            Config config,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc,
+            JdbcTemplate matchJdbc,
+            RabbitAdmin rabbitAdmin,
+            long startedNanos) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(config.timeoutSeconds());
+        long nextDbPoll = 0;
+        long nextQueuePoll = 0;
+        double matchOutboxReachedSeconds = matchJdbc == null ? 0 : -1;
+        double orderReachedSeconds = -1;
+        double walletReachedSeconds = -1;
+        double queueDrainedSeconds = -1;
+        int consecutiveDrainedSamples = 0;
+        DownstreamState state = downstreamState(orderJdbc, walletJdbc);
+        MatchOutboxState matchOutbox = matchJdbc == null
+                ? MatchOutboxState.notMeasured()
+                : matchOutboxState(config, matchJdbc);
+        QueueDepth orderQueue = new QueueDepth(0, 0, 0);
+        QueueDepth walletQueue = new QueueDepth(0, 0, 0);
+        QueueDepth dlq = new QueueDepth(0, 0, 0);
+        long orderQueueMax = 0;
+        long walletQueueMax = 0;
+        long dlqMax = 0;
+
+        while (System.nanoTime() < deadline) {
+            long now = System.nanoTime();
+            double elapsedSeconds = (now - startedNanos) / 1_000_000_000.0;
+            if (now >= nextDbPoll) {
+                state = downstreamState(orderJdbc, walletJdbc);
+                if (matchJdbc != null) {
+                    matchOutbox = matchOutboxState(config, matchJdbc);
+                    if (matchOutboxReachedSeconds < 0 && matchOutbox.complete(config.events())) {
+                        matchOutboxReachedSeconds = elapsedSeconds;
+                    }
+                }
+                nextDbPoll = now + TimeUnit.MILLISECONDS.toNanos(200);
+                if (orderReachedSeconds < 0 && state.orderComplete(config.events())) {
+                    orderReachedSeconds = elapsedSeconds;
+                }
+                if (walletReachedSeconds < 0 && state.walletComplete(config.events())) {
+                    walletReachedSeconds = elapsedSeconds;
+                }
+            }
+            if (now >= nextQueuePoll) {
+                orderQueue = queueDepth(config, rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
+                walletQueue = queueDepth(config, rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
+                dlq = queueDepth(config, rabbitAdmin, DEAD_LETTER_QUEUE);
+                orderQueueMax = Math.max(orderQueueMax, orderQueue.total());
+                walletQueueMax = Math.max(walletQueueMax, walletQueue.total());
+                dlqMax = Math.max(dlqMax, dlq.total());
+                nextQueuePoll = now + TimeUnit.MILLISECONDS.toNanos(500);
+                if (orderQueue.total() == 0 && walletQueue.total() == 0 && dlq.total() == 0) {
+                    consecutiveDrainedSamples++;
+                    if (consecutiveDrainedSamples >= 3) {
+                        queueDrainedSeconds = elapsedSeconds;
+                    }
+                } else {
+                    consecutiveDrainedSamples = 0;
+                    queueDrainedSeconds = -1;
+                }
+            }
+            boolean relayComplete = matchJdbc == null || matchOutbox.complete(config.events());
+            if (relayComplete && state.complete(config.events()) && queueDrainedSeconds > 0) {
+                break;
+            }
+            TimeUnit.MILLISECONDS.sleep(50);
+        }
+
+        state = downstreamState(orderJdbc, walletJdbc);
+        if (matchJdbc != null) {
+            matchOutbox = matchOutboxState(config, matchJdbc);
+        }
+        orderQueue = queueDepth(config, rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
+        walletQueue = queueDepth(config, rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
+        dlq = queueDepth(config, rabbitAdmin, DEAD_LETTER_QUEUE);
+        double elapsedSeconds = (System.nanoTime() - startedNanos) / 1_000_000_000.0;
+        boolean relayComplete = matchJdbc == null || matchOutbox.complete(config.events());
+        double convergenceSeconds = relayComplete && state.complete(config.events()) && queueDrainedSeconds > 0
+                ? Math.max(Math.max(Math.max(matchOutboxReachedSeconds, orderReachedSeconds), walletReachedSeconds),
+                        queueDrainedSeconds)
+                : elapsedSeconds;
+        return new DownstreamWaitResult(
+                state.orderApplications(),
+                state.orderMatchedRows(),
+                state.walletSettlements(),
+                state.lockedCurrency(),
+                state.lockedAmount(),
+                state.buyerAvailableAmount(),
+                state.sellerAvailableCurrency(),
+                state.orderInboxRows(),
+                state.orderOutboxRows(),
+                state.walletOutboxRows(),
+                matchOutbox.pending(),
+                matchOutbox.sent(),
+                matchOutbox.failed(),
+                matchOutboxReachedSeconds,
+                orderReachedSeconds,
+                walletReachedSeconds,
+                queueDrainedSeconds,
+                convergenceSeconds,
+                orderQueueMax,
+                walletQueueMax,
+                dlqMax,
+                orderQueue,
+                walletQueue,
+                dlq);
+    }
+
+    private static MatchOutboxState matchOutboxState(Config config, JdbcTemplate matchJdbc) {
+        String prefix = config.marketId() + "-";
+        MatchOutboxState state = matchJdbc.queryForObject("""
+                SELECT count(*) FILTER (WHERE status = 'PENDING') AS pending,
+                       count(*) FILTER (WHERE status = 'SENT') AS sent,
+                       count(*) FILTER (WHERE status = 'FAILED') AS failed
+                FROM match_engine.trade_outbox
+                WHERE event_type = 'TradeExecutedEvent'
+                  AND left(aggregate_id, ?) = ?
+                """,
+                (resultSet, rowNumber) -> new MatchOutboxState(
+                        resultSet.getLong("pending"),
+                        resultSet.getLong("sent"),
+                        resultSet.getLong("failed")),
+                prefix.length(),
+                prefix);
+        return state == null ? new MatchOutboxState(0, 0, 0) : state;
+    }
+
+    private static DownstreamState downstreamState(JdbcTemplate orderJdbc, JdbcTemplate walletJdbc) {
+        return new DownstreamState(
+                count(orderJdbc, "SELECT count(*) FROM order_service.order_trade_applications"),
+                countOrderCommandMatchedRows(orderJdbc),
+                count(walletJdbc, "SELECT count(*) FROM wallet_service.trade_settlements"),
+                count(walletJdbc, "SELECT COALESCE(sum(locked_currency), 0) FROM wallet_service.wallets"),
+                count(walletJdbc, "SELECT COALESCE(sum(locked_amount), 0) FROM wallet_service.wallets"),
+                count(walletJdbc, "SELECT COALESCE(sum(available_amount), 0) FROM wallet_service.wallets"),
+                count(walletJdbc, "SELECT COALESCE(sum(available_currency), 0) FROM wallet_service.wallets"),
+                count(orderJdbc, "SELECT count(*) FROM order_service.order_trade_execution_inbox"),
+                count(orderJdbc, "SELECT count(*) FROM order_service.order_event_outbox"),
+                count(walletJdbc, "SELECT count(*) FROM wallet_service.outbox"));
+    }
+
+    private static DownstreamTradeIdCheck checkDownstreamTradeIds(
+            Config config,
+            List<Pair> pairs,
+            JdbcTemplate orderJdbc,
+            JdbcTemplate walletJdbc) {
+        Set<String> expected = new HashSet<>();
+        for (Pair pair : pairs) {
+            expected.add(config.marketId() + "-" + pair.matchId());
+        }
+        Set<String> order = new HashSet<>(orderJdbc.queryForList(
+                "SELECT trade_id FROM order_service.order_trade_applications", String.class));
+        Set<String> wallet = new HashSet<>(walletJdbc.queryForList(
+                "SELECT trade_id FROM wallet_service.trade_settlements", String.class));
+        Set<String> union = new HashSet<>(expected);
+        union.addAll(order);
+        union.addAll(wallet);
+        Set<String> missingInOrder = new HashSet<>(expected);
+        missingInOrder.removeAll(order);
+        Set<String> missingInWallet = new HashSet<>(expected);
+        missingInWallet.removeAll(wallet);
+        Set<String> unexpectedInOrder = new HashSet<>(order);
+        unexpectedInOrder.removeAll(expected);
+        Set<String> unexpectedInWallet = new HashSet<>(wallet);
+        unexpectedInWallet.removeAll(expected);
+        boolean equal = expected.equals(order) && expected.equals(wallet);
+        return new DownstreamTradeIdCheck(
+                equal,
+                expected.size(),
+                order.size(),
+                wallet.size(),
+                union.size(),
+                missingInOrder.size(),
+                missingInWallet.size(),
+                unexpectedInOrder.size(),
+                unexpectedInWallet.size(),
+                fingerprint(expected));
     }
 
     private static double businessCompletionSeconds(WaitResult waitResult, long startedNanos) {
@@ -1406,6 +2032,11 @@ public class MatchedE2eLoadGenerator {
         CachingConnectionFactory connectionFactory = new CachingConnectionFactory(config.rabbitHost(), config.rabbitPort());
         connectionFactory.setUsername(config.rabbitUser());
         connectionFactory.setPassword(config.rabbitPassword());
+        connectionFactory.setExecutor(RABBIT_CLIENT_EXECUTOR);
+        if ("downstream-run".equals(config.phase())) {
+            connectionFactory.setPublisherConfirmType(CachingConnectionFactory.ConfirmType.CORRELATED);
+            connectionFactory.setPublisherReturns(true);
+        }
         if (config.publisherConnectionCacheSize() > 1) {
             connectionFactory.setCacheMode(CachingConnectionFactory.CacheMode.CONNECTION);
             connectionFactory.setConnectionCacheSize(config.publisherConnectionCacheSize());
@@ -1933,6 +2564,101 @@ public class MatchedE2eLoadGenerator {
             double maxScheduleLagMs) {
     }
 
+    private record DownstreamPublishResult(
+            int acked,
+            int nacked,
+            int returned,
+            int timedOut,
+            int failures,
+            double offerSeconds,
+            double confirmSeconds) {
+    }
+
+    private record DownstreamState(
+            long orderApplications,
+            long orderMatchedRows,
+            long walletSettlements,
+            long lockedCurrency,
+            long lockedAmount,
+            long buyerAvailableAmount,
+            long sellerAvailableCurrency,
+            long orderInboxRows,
+            long orderOutboxRows,
+            long walletOutboxRows) {
+
+        boolean orderComplete(int events) {
+            return orderApplications == events
+                    && orderMatchedRows == events * 2L;
+        }
+
+        boolean walletComplete(int events) {
+            return walletSettlements == events
+                    && lockedCurrency == 0
+                    && lockedAmount == 0
+                    && buyerAvailableAmount == events * (long) AMOUNT
+                    && sellerAvailableCurrency == events * (long) PRICE * AMOUNT;
+        }
+
+        boolean complete(int events) {
+            return orderComplete(events)
+                    && walletComplete(events)
+                    && orderInboxRows == 0
+                    && orderOutboxRows == 0
+                    && walletOutboxRows == 0;
+        }
+    }
+
+    private record DownstreamWaitResult(
+            long orderApplications,
+            long orderMatchedRows,
+            long walletSettlements,
+            long lockedCurrency,
+            long lockedAmount,
+            long buyerAvailableAmount,
+            long sellerAvailableCurrency,
+            long orderInboxRows,
+            long orderOutboxRows,
+            long walletOutboxRows,
+            long matchOutboxPending,
+            long matchOutboxSent,
+            long matchOutboxFailed,
+            double matchOutboxReachedSeconds,
+            double orderReachedSeconds,
+            double walletReachedSeconds,
+            double queueDrainedSeconds,
+            double convergenceSeconds,
+            long orderQueueMax,
+            long walletQueueMax,
+            long dlqMax,
+            QueueDepth orderQueueFinal,
+            QueueDepth walletQueueFinal,
+            QueueDepth dlqFinal) {
+    }
+
+    private record MatchOutboxState(long pending, long sent, long failed) {
+
+        static MatchOutboxState notMeasured() {
+            return new MatchOutboxState(-1, -1, -1);
+        }
+
+        boolean complete(int events) {
+            return pending == 0 && sent == events && failed == 0;
+        }
+    }
+
+    private record DownstreamTradeIdCheck(
+            boolean equal,
+            int expectedCount,
+            int orderCount,
+            int walletCount,
+            int unionCount,
+            int missingInOrder,
+            int missingInWallet,
+            int unexpectedInOrder,
+            int unexpectedInWallet,
+            String fingerprint) {
+    }
+
     private record SellBookWaitResult(long readyOrders, double elapsedSeconds) {
     }
 
@@ -2170,7 +2896,8 @@ public class MatchedE2eLoadGenerator {
             String rabbitPassword,
             String orderJdbcUrl,
             String walletJdbcUrl,
-            String matchJdbcUrl) {
+            String matchJdbcUrl,
+            String output) {
 
         private boolean projectionPhase() {
             return "project".equals(phase);
@@ -2212,7 +2939,8 @@ public class MatchedE2eLoadGenerator {
                     stringArg(args, "--rabbit-pass", "admin123"),
                     stringArg(args, "--order-jdbc-url", "jdbc:postgresql://localhost:15432/eap_order_db"),
                     stringArg(args, "--wallet-jdbc-url", "jdbc:postgresql://localhost:15433/eap_wallet_db"),
-                    stringArg(args, "--match-jdbc-url", "jdbc:postgresql://localhost:15434/eap_match_db"));
+                    stringArg(args, "--match-jdbc-url", "jdbc:postgresql://localhost:15434/eap_match_db"),
+                    stringArg(args, "--output", ""));
         }
 
         private static int intArg(String[] args, String name, int defaultValue) {
