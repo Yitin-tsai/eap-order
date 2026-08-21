@@ -21,7 +21,9 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.HexFormat;
@@ -154,6 +156,18 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
     static void runSteadyState(String[] args) throws Exception {
         new SteadyStateRunner(SteadyStateConfig.from(args)).run();
+    }
+
+    static void prepareExternalSteadyState(String[] args) throws Exception {
+        new ExternalSteadyStateRunner(args).prepare();
+    }
+
+    static void monitorExternalSteadyState(String[] args) throws Exception {
+        new ExternalSteadyStateRunner(args).monitor();
+    }
+
+    static void verifyExternalSteadyState(String[] args) throws Exception {
+        new ExternalSteadyStateRunner(args).verify();
     }
 
     static void resetData(String[] args) throws Exception {
@@ -1248,6 +1262,25 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         "SELECT COALESCE(max(global_position), 0) FROM order_service.order_event_store");
                 SteadyDatabaseBaseline databaseBaseline = captureDatabaseBaseline(databases, common);
 
+                List<PreparedHttpLoadDriver.PreparedOrder> preparedOrders = List.of();
+                double preparationSeconds = 0;
+                if (config.usesPreparedDriver()) {
+                    long preparationStartedAtNanos = System.nanoTime();
+                    preparedOrders = prepareSteadyOrders(
+                            buyers,
+                            sellers,
+                            0,
+                            common.events(),
+                            config.arrivalPattern(),
+                            config.workloadSeed());
+                    preparationSeconds = elapsedSince(preparationStartedAtNanos);
+                }
+                System.out.printf(
+                        "prepared steady HTTP workload: orders=%d, driver=%s, preparationSeconds=%.4f%n",
+                        config.usesPreparedDriver() ? preparedOrders.size() : 0,
+                        config.httpDriverMode(),
+                        preparationSeconds);
+
                 SteadyHttpCounters counters = new SteadyHttpCounters();
                 List<SteadySample> samples = Collections.synchronizedList(new ArrayList<>());
                 AtomicBoolean monitorRunning = new AtomicBoolean(true);
@@ -1258,7 +1291,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
                 double sendElapsedSeconds;
                 try {
-                    sendContinuousTraffic(buyers, sellers, counters, startedAtNanos);
+                    sendContinuousTraffic(
+                            buyers, sellers, preparedOrders, counters, startedAtNanos);
                     sendElapsedSeconds = elapsedSince(startedAtNanos);
                 } finally {
                     monitorRunning.set(false);
@@ -1299,6 +1333,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         completion,
                         initialBuyerBalances,
                         initialSellerBalances,
+                        preparationSeconds,
                         sendElapsedSeconds,
                         fullConvergenceSeconds,
                         expectedOutcome,
@@ -1353,15 +1388,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         private void sendContinuousTraffic(
                 List<UUID> buyers,
                 List<UUID> sellers,
+                List<PreparedHttpLoadDriver.PreparedOrder> preparedOrders,
                 SteadyHttpCounters counters,
                 long startedAtNanos) throws Exception {
             Config common = config.common();
             int totalOrders = Math.multiplyExact(common.events(), 2);
-            CountDownLatch done = new CountDownLatch(totalOrders);
-            Semaphore inFlight = new Semaphore(common.maxInFlight());
-            ExecutorService executor = Executors.newFixedThreadPool(common.workers());
-            AtomicLong nextSendAtNanos = new AtomicLong(startedAtNanos);
-            long orderIntervalNanos = TimeUnit.SECONDS.toNanos(1) / config.targetOrderTps();
             long schedulingDeadlineNanos = startedAtNanos
                     + TimeUnit.SECONDS.toNanos(
                             config.warmupSeconds()
@@ -1371,64 +1402,170 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf(
                     "sending continuous balanced mixed HTTP traffic: totalOrders=%d, expectedTrades=%d, "
                             + "targetTotalOrderTps=%d, warmupSeconds=%d, measurementSeconds=%d, "
-                            + "arrivalPattern=%s, workloadSeed=%d%n",
+                            + "arrivalPattern=%s, workloadSeed=%d, driver=%s, maxInFlight=%d%n",
                     totalOrders,
                     common.events(),
                     config.targetOrderTps(),
                     config.warmupSeconds(),
                     config.durationSeconds(),
                     config.arrivalPattern().externalName(),
-                    config.workloadSeed());
+                    config.workloadSeed(),
+                    config.httpDriverMode(),
+                    common.maxInFlight());
 
+            int dispatchedOrders;
+            int unscheduledOrders;
+            if (config.usesPreparedDriver()) {
+                PreparedHttpLoadDriver.ReplayResult replay = replayPreparedOrders(
+                        preparedOrders,
+                        counters,
+                        null,
+                        config.targetOrderTps(),
+                        common.maxInFlight(),
+                        startedAtNanos,
+                        schedulingDeadlineNanos);
+                dispatchedOrders = replay.dispatchedOrders();
+                unscheduledOrders = replay.unscheduledOrders();
+            } else {
+                dispatchedOrders = sendLegacyContinuousTraffic(
+                        buyers,
+                        sellers,
+                        counters,
+                        startedAtNanos,
+                        schedulingDeadlineNanos);
+                unscheduledOrders = totalOrders - dispatchedOrders;
+            }
+            if (unscheduledOrders > 0) {
+                counters.recordUnscheduled(unscheduledOrders);
+                System.err.printf(
+                        "steady scheduling deadline exceeded: submitted=%d, unscheduled=%d, graceSeconds=%d%n",
+                        dispatchedOrders,
+                        unscheduledOrders,
+                        MAX_STEADY_SCHEDULING_OVERRUN_SECONDS);
+            }
+        }
+
+        private int sendLegacyContinuousTraffic(
+                List<UUID> buyers,
+                List<UUID> sellers,
+                SteadyHttpCounters counters,
+                long startedAtNanos,
+                long schedulingDeadlineNanos) throws InterruptedException {
+            Config common = config.common();
+            int totalOrders = Math.multiplyExact(common.events(), 2);
+            CountDownLatch done = new CountDownLatch(totalOrders);
+            Semaphore inFlight = new Semaphore(common.maxInFlight());
+            ExecutorService executor = Executors.newFixedThreadPool(common.workers());
+            AtomicLong nextSendAtNanos = new AtomicLong(startedAtNanos);
+            long orderIntervalNanos = TimeUnit.SECONDS.toNanos(1) / config.targetOrderTps();
             List<BalancedOrderSchedule.ScheduledOrder> schedule = BalancedOrderSchedule.create(
                     0,
                     common.events(),
                     config.arrivalPattern(),
                     config.workloadSeed());
-            int submittedOrders = 0;
+            int dispatchedOrders = 0;
             for (BalancedOrderSchedule.ScheduledOrder scheduledOrder : schedule) {
                 if (System.nanoTime() >= schedulingDeadlineNanos) {
                     break;
                 }
-                int index = scheduledOrder.tradeIndex();
                 String side = scheduledOrder.side();
                 List<UUID> users = "BUY".equals(side) ? buyers : sellers;
-                int userIndex = scheduledOrder.userSequence();
                 throttle(nextSendAtNanos, orderIntervalNanos);
                 if (System.nanoTime() >= schedulingDeadlineNanos) {
                     break;
                 }
-                submitSteadyOrder(
+                submitLegacySteadyOrder(
                         executor,
                         inFlight,
                         done,
                         counters,
                         null,
                         side,
-                        deterministicSteadyOrderId(common.runId(), side, index),
-                        users.get(userIndex % users.size()));
-                submittedOrders++;
+                        deterministicSteadyOrderId(
+                                common.runId(), side, scheduledOrder.tradeIndex()),
+                        users.get(scheduledOrder.userSequence() % users.size()));
+                dispatchedOrders++;
             }
-
-            int unscheduledOrders = totalOrders - submittedOrders;
-            if (unscheduledOrders > 0) {
-                counters.recordUnscheduled(unscheduledOrders);
-                for (int i = 0; i < unscheduledOrders; i++) {
-                    done.countDown();
-                }
-                System.err.printf(
-                        "steady scheduling deadline exceeded: submitted=%d, unscheduled=%d, graceSeconds=%d%n",
-                        submittedOrders,
-                        unscheduledOrders,
-                        MAX_STEADY_SCHEDULING_OVERRUN_SECONDS);
+            for (int index = dispatchedOrders; index < totalOrders; index++) {
+                done.countDown();
             }
-
             done.await();
             executor.shutdown();
             executor.awaitTermination(30, TimeUnit.SECONDS);
+            return dispatchedOrders;
         }
 
-        private void submitSteadyOrder(
+        private List<PreparedHttpLoadDriver.PreparedOrder> prepareSteadyOrders(
+                List<UUID> buyers,
+                List<UUID> sellers,
+                int startingTradeIndex,
+                int trades,
+                BalancedOrderSchedule.ArrivalPattern arrivalPattern,
+                long workloadSeed) throws IOException {
+            Config common = config.common();
+            URI buyUri = URI.create(common.orderUrl() + "/bid/buy");
+            URI sellUri = URI.create(common.orderUrl() + "/bid/sell");
+            List<BalancedOrderSchedule.ScheduledOrder> schedule = BalancedOrderSchedule.create(
+                    startingTradeIndex,
+                    trades,
+                    arrivalPattern,
+                    workloadSeed);
+            List<PreparedHttpLoadDriver.PreparedOrder> prepared =
+                    new ArrayList<>(schedule.size());
+            for (BalancedOrderSchedule.ScheduledOrder scheduledOrder : schedule) {
+                String side = scheduledOrder.side();
+                boolean buy = "BUY".equals(side);
+                List<UUID> users = buy ? buyers : sellers;
+                UUID userId = users.get(scheduledOrder.userSequence() % users.size());
+                UUID orderId = deterministicSteadyOrderId(
+                        common.runId(), side, scheduledOrder.tradeIndex());
+                byte[] body = buy
+                        ? objectMapper.writeValueAsBytes(new BuyRequest(orderId, PRICE, AMOUNT, userId))
+                        : objectMapper.writeValueAsBytes(new SellRequest(orderId, PRICE, AMOUNT, userId));
+                prepared.add(new PreparedHttpLoadDriver.PreparedOrder(
+                        side,
+                        buy ? buyUri : sellUri,
+                        body));
+            }
+            return List.copyOf(prepared);
+        }
+
+        private PreparedHttpLoadDriver.ReplayResult replayPreparedOrders(
+                List<PreparedHttpLoadDriver.PreparedOrder> preparedOrders,
+                SteadyHttpCounters counters,
+                SteadyHttpCounters secondaryCounters,
+                int targetOrderTps,
+                int maxInFlight,
+                long firstSendAtNanos,
+                long schedulingDeadlineNanos) throws InterruptedException {
+            return PreparedHttpLoadDriver.replay(
+                    httpClient,
+                    preparedOrders,
+                    targetOrderTps,
+                    config.common().workers(),
+                    maxInFlight,
+                    firstSendAtNanos,
+                    schedulingDeadlineNanos,
+                    new PreparedHttpLoadDriver.ResponseRecorder() {
+                        @Override
+                        public void recordResponse(String side, int statusCode, long latencyNanos) {
+                            counters.recordResponse(side, statusCode, latencyNanos, "");
+                            if (secondaryCounters != null) {
+                                secondaryCounters.recordResponse(side, statusCode, latencyNanos, "");
+                            }
+                        }
+
+                        @Override
+                        public void recordFailure(String side, Throwable failure) {
+                            counters.recordFailure(side, failure);
+                            if (secondaryCounters != null) {
+                                secondaryCounters.recordFailure(side, failure);
+                            }
+                        }
+                    });
+        }
+
+        private void submitLegacySteadyOrder(
                 ExecutorService executor,
                 Semaphore inFlight,
                 CountDownLatch done,
@@ -1453,22 +1590,16 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                             .build();
                     HttpResponse<String> response = httpClient.send(
                             request, HttpResponse.BodyHandlers.ofString());
-                    counters.recordResponse(
-                            side,
-                            response.statusCode(),
-                            System.nanoTime() - requestStartedAt,
-                            response.body());
+                    long latencyNanos = System.nanoTime() - requestStartedAt;
+                    counters.recordResponse(side, response.statusCode(), latencyNanos, response.body());
                     if (secondaryCounters != null) {
                         secondaryCounters.recordResponse(
-                                side,
-                                response.statusCode(),
-                                System.nanoTime() - requestStartedAt,
-                                response.body());
+                                side, response.statusCode(), latencyNanos, response.body());
                     }
-                } catch (Exception e) {
-                    counters.recordException(side, e);
+                } catch (Exception failure) {
+                    counters.recordFailure(side, failure);
                     if (secondaryCounters != null) {
-                        secondaryCounters.recordException(side, e);
+                        secondaryCounters.recordFailure(side, failure);
                     }
                 } finally {
                     inFlight.release();
@@ -2061,6 +2192,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 SteadyCompletion completion,
                 RoleBalances initialBuyerBalances,
                 RoleBalances initialSellerBalances,
+                double preparationSeconds,
                 double sendElapsedSeconds,
                 double fullConvergenceSeconds,
                 SteadyExpectedOutcome expectedOutcome,
@@ -2068,7 +2200,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             Config common = config.common();
             System.out.println("{");
             System.out.println("  \"benchmarkSchemaVersion\": 2,");
-            System.out.println("  \"benchmarkContract\": \"http-matched-steady-state-chain\",");
+            String benchmarkContract = "external-vegeta".equals(config.httpDriverMode())
+                    ? ExternalHttpMatchedManifest.CONTRACT
+                    : "http-matched-steady-state-chain";
+            System.out.printf("  \"benchmarkContract\": \"%s\",%n", benchmarkContract);
             System.out.printf("  \"runId\": \"%s\",%n", json(common.runId()));
             System.out.printf("  \"marketId\": \"%s\",%n", json(common.marketId()));
             System.out.printf("  \"runtimeProfile\": \"%s\",%n", json(config.runtimeProfile()));
@@ -2078,6 +2213,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"warmupSeconds\": %d,%n", config.warmupSeconds());
             System.out.printf("  \"measurementSeconds\": %d,%n", config.durationSeconds());
             System.out.printf("  \"targetTotalOrderTps\": %d,%n", config.targetOrderTps());
+            System.out.printf("  \"httpDriverMode\": \"%s\",%n", config.httpDriverMode());
+            if ("external-vegeta".equals(config.httpDriverMode())) {
+                System.out.println("  \"loadGeneratorMaxInFlight\": null,");
+            } else {
+                System.out.printf("  \"loadGeneratorMaxInFlight\": %d,%n", common.maxInFlight());
+            }
+            System.out.printf("  \"workloadPreparationSeconds\": %.4f,%n", preparationSeconds);
             System.out.printf("  \"expectedHttpOrders\": %d,%n", common.events() * 2L);
             System.out.printf("  \"expectedTrades\": %d,%n", common.events());
             System.out.printf("  \"durableBuyOrders\": %d,%n", expectedOutcome.buyOrders());
@@ -2164,6 +2306,479 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         private UUID deterministicSteadyOrderId(String runId, String side, int index) {
             return UUID.nameUUIDFromBytes(
                     (runId + ":steady:" + side + ":" + index).getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static final class ExternalSteadyStateRunner {
+
+        private final String[] args;
+        private final SteadyStateConfig config;
+        private final SteadyStateRunner base;
+        private final ObjectMapper objectMapper = new ObjectMapper();
+        private final HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
+        private final Path manifestPath;
+        private final Path targetsPath;
+        private final Path monitorOutputPath;
+        private final Path monitorReadyPath;
+        private final Path monitorStopPath;
+        private final Path vegetaResultsPath;
+
+        private ExternalSteadyStateRunner(String[] args) {
+            this.args = args.clone();
+            this.config = SteadyStateConfig.from(args);
+            if (!"external-vegeta".equals(config.httpDriverMode())) {
+                throw new IllegalArgumentException(
+                        "external lifecycle requires --http-driver-mode external-vegeta");
+            }
+            this.base = new SteadyStateRunner(config);
+            this.manifestPath = requiredPath("--manifest");
+            this.targetsPath = pathArg("--targets", "");
+            this.monitorOutputPath = pathArg("--monitor-output", "");
+            this.monitorReadyPath = pathArg("--monitor-ready", "");
+            this.monitorStopPath = pathArg("--monitor-stop", "");
+            this.vegetaResultsPath = pathArg("--vegeta-results", "");
+        }
+
+        private void prepare() throws Exception {
+            requirePath(targetsPath, "--targets");
+            Config common = config.common();
+            validateMarket(common);
+            if (common.resetData()) {
+                reset(common, httpClient, objectMapper);
+            }
+
+            System.out.printf(
+                    "preparing external open-loop workload: orders=%d, target=%d/s%n",
+                    common.events() * 2L,
+                    config.targetOrderTps());
+            List<UUID> buyers = registerUsers(common, httpClient, objectMapper, common.usersPerSide());
+            List<UUID> sellers = registerUsers(common, httpClient, objectMapper, common.usersPerSide());
+            List<UUID> allUsers = new ArrayList<>(buyers.size() + sellers.size());
+            allUsers.addAll(buyers);
+            allUsers.addAll(sellers);
+
+            try (DatabaseHandles databases = DatabaseHandles.open(common)) {
+                base.fundSteadyStateUsers(databases.wallet(), allUsers, common.events());
+                RoleBalances initialBuyerBalances = readRoleBalances(databases.wallet(), buyers);
+                RoleBalances initialSellerBalances = readRoleBalances(databases.wallet(), sellers);
+                long submissionBaselinePosition = base.queryLong(
+                        databases.order(),
+                        "SELECT COALESCE(max(global_position), 0) FROM order_service.order_event_store");
+                SteadyDatabaseBaseline databaseBaseline = base.captureDatabaseBaseline(databases, common);
+                List<PreparedHttpLoadDriver.PreparedOrder> orders = base.prepareSteadyOrders(
+                        buyers,
+                        sellers,
+                        0,
+                        common.events(),
+                        config.arrivalPattern(),
+                        config.workloadSeed());
+                writeVegetaTargets(orders);
+                ExternalHttpMatchedManifest manifest = new ExternalHttpMatchedManifest(
+                        ExternalHttpMatchedManifest.SCHEMA_VERSION,
+                        ExternalHttpMatchedManifest.CONTRACT,
+                        common.runId(),
+                        common.marketId(),
+                        config.targetOrderTps(),
+                        config.warmupSeconds(),
+                        config.durationSeconds(),
+                        config.sampleIntervalSeconds(),
+                        config.workloadSeed(),
+                        config.arrivalPattern().externalName(),
+                        common.usersPerSide(),
+                        common.events() * 2L,
+                        common.events(),
+                        Instant.now().toEpochMilli(),
+                        sha256(targetsPath),
+                        buyers,
+                        sellers,
+                        balanceSnapshot(initialBuyerBalances),
+                        balanceSnapshot(initialSellerBalances),
+                        baselineSnapshot(databaseBaseline),
+                        submissionBaselinePosition);
+                createParent(manifestPath);
+                objectMapper.writerWithDefaultPrettyPrinter().writeValue(manifestPath.toFile(), manifest);
+                System.out.printf(
+                        "external workload prepared: manifest=%s, targets=%s, sha256=%s%n",
+                        manifestPath,
+                        targetsPath,
+                        manifest.targetsSha256());
+            }
+        }
+
+        private void monitor() throws Exception {
+            requirePath(monitorOutputPath, "--monitor-output");
+            requirePath(monitorReadyPath, "--monitor-ready");
+            requirePath(monitorStopPath, "--monitor-stop");
+            ExternalHttpMatchedManifest manifest = readManifest();
+            validateManifest(manifest);
+            SteadyDatabaseBaseline baseline = baseline(manifest.databaseBaseline());
+            createParent(monitorOutputPath);
+            createParent(monitorReadyPath);
+            Files.deleteIfExists(monitorReadyPath);
+            Files.deleteIfExists(monitorStopPath);
+
+            try (DatabaseHandles databases = DatabaseHandles.open(config.common());
+                 BufferedWriter writer = Files.newBufferedWriter(monitorOutputPath, StandardCharsets.UTF_8)) {
+                writer.write("epoch_millis,match_trades,order_trades,wallet_trades,completed_trades,"
+                        + "queue_backlog,queue_read_failures\n");
+                writeMonitorSample(writer, databases, baseline);
+                Files.writeString(monitorReadyPath, "ready\n", StandardCharsets.UTF_8);
+                System.out.printf("external monitor ready: %s%n", monitorReadyPath);
+                long nextSampleAt = System.nanoTime()
+                        + TimeUnit.SECONDS.toNanos(config.sampleIntervalSeconds());
+                while (!Files.exists(monitorStopPath)) {
+                    long remainingNanos = nextSampleAt - System.nanoTime();
+                    if (remainingNanos > 0) {
+                        TimeUnit.NANOSECONDS.sleep(Math.min(
+                                remainingNanos,
+                                TimeUnit.MILLISECONDS.toNanos(50)));
+                        continue;
+                    }
+                    writeMonitorSample(writer, databases, baseline);
+                    nextSampleAt += TimeUnit.SECONDS.toNanos(config.sampleIntervalSeconds());
+                }
+                writeMonitorSample(writer, databases, baseline);
+            }
+        }
+
+        private void verify() throws Exception {
+            requirePath(vegetaResultsPath, "--vegeta-results");
+            requirePath(targetsPath, "--targets");
+            requirePath(monitorOutputPath, "--monitor-output");
+            ExternalHttpMatchedManifest manifest = readManifest();
+            validateManifest(manifest);
+            if (!Files.isRegularFile(targetsPath)
+                    || !manifest.targetsSha256().equals(sha256(targetsPath))) {
+                throw new IllegalStateException("prepared Vegeta target checksum does not match manifest");
+            }
+
+            ExternalHttpResults externalResults = readVegetaResults(manifest);
+            SteadyHttpCounters counters = externalResults.counters();
+            List<SteadySample> samples = mergeMonitorSamples(externalResults);
+            SteadyWindow steadyWindow = base.deriveSteadyWindow(samples);
+            RoleBalances initialBuyerBalances = roleBalances(manifest.initialBuyerBalances());
+            RoleBalances initialSellerBalances = roleBalances(manifest.initialSellerBalances());
+            SteadyDatabaseBaseline databaseBaseline = baseline(manifest.databaseBaseline());
+
+            try (DatabaseHandles databases = DatabaseHandles.open(config.common())) {
+                SteadyExpectedOutcome expectedOutcome = base.resolveExpectedOutcome(
+                        databases.order(),
+                        config.common(),
+                        counters,
+                        manifest.submissionBaselinePosition());
+                long convergenceStartedAt = System.nanoTime();
+                SteadyCompletion completion = base.waitForSteadyCompletion(
+                        databases,
+                        manifest.buyers(),
+                        manifest.sellers(),
+                        initialBuyerBalances,
+                        initialSellerBalances,
+                        convergenceStartedAt,
+                        config.common(),
+                        expectedOutcome,
+                        databaseBaseline);
+                double fullConvergenceSeconds = Math.max(
+                        0.001,
+                        (System.currentTimeMillis() - externalResults.firstRequestEpochMillis()) / 1_000.0);
+                base.writeSamples(samples);
+                List<String> invalidReasons = base.steadyInvalidReasons(
+                        counters,
+                        steadyWindow,
+                        completion,
+                        initialBuyerBalances,
+                        initialSellerBalances,
+                        expectedOutcome);
+                base.printSteadyResult(
+                        counters,
+                        steadyWindow,
+                        completion,
+                        initialBuyerBalances,
+                        initialSellerBalances,
+                        0,
+                        externalResults.responseCompletionSeconds(),
+                        fullConvergenceSeconds,
+                        expectedOutcome,
+                        invalidReasons);
+                if (!invalidReasons.isEmpty()) {
+                    throw new IllegalStateException(
+                            "external HTTP matched steady-state benchmark invalid: " + invalidReasons);
+                }
+            }
+        }
+
+        private void writeVegetaTargets(List<PreparedHttpLoadDriver.PreparedOrder> orders)
+                throws IOException {
+            createParent(targetsPath);
+            try (BufferedWriter writer = Files.newBufferedWriter(targetsPath, StandardCharsets.UTF_8)) {
+                for (PreparedHttpLoadDriver.PreparedOrder order : orders) {
+                    Map<String, Object> target = new LinkedHashMap<>();
+                    target.put("method", "POST");
+                    target.put("url", order.uri().toString());
+                    target.put("body", Base64.getEncoder().encodeToString(order.body()));
+                    target.put("header", Map.of("Content-Type", List.of("application/json")));
+                    writer.write(objectMapper.writeValueAsString(target));
+                    writer.newLine();
+                }
+            }
+        }
+
+        private void writeMonitorSample(
+                BufferedWriter writer,
+                DatabaseHandles databases,
+                SteadyDatabaseBaseline baseline) throws Exception {
+            SteadySample sample = base.collectSample(
+                    databases,
+                    new SteadyHttpCounters(),
+                    System.nanoTime(),
+                    baseline);
+            writer.write(String.format(
+                    java.util.Locale.ROOT,
+                    "%d,%d,%d,%d,%d,%d,%d%n",
+                    System.currentTimeMillis(),
+                    sample.matchTrades(),
+                    sample.orderTrades(),
+                    sample.walletTrades(),
+                    sample.completedTrades(),
+                    sample.queueBacklog(),
+                    sample.queueReadFailures()));
+            writer.flush();
+        }
+
+        private ExternalHttpResults readVegetaResults(ExternalHttpMatchedManifest manifest)
+                throws IOException {
+            SteadyHttpCounters counters = new SteadyHttpCounters();
+            List<ExternalHttpResult> results = new ArrayList<>();
+            try (var reader = Files.newBufferedReader(vegetaResultsPath, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isBlank()) {
+                        continue;
+                    }
+                    JsonNode result = objectMapper.readTree(line);
+                    String url = result.path("url").asText();
+                    String side;
+                    if (url.endsWith("/bid/buy")) {
+                        side = "BUY";
+                    } else if (url.endsWith("/bid/sell")) {
+                        side = "SELL";
+                    } else {
+                        throw new IOException("unexpected Vegeta target URL: " + url);
+                    }
+                    int status = result.path("code").asInt();
+                    long latencyNanos = result.path("latency").asLong();
+                    long requestEpochNanos = epochNanos(result.path("timestamp").asText());
+                    counters.recordResponse(
+                            side,
+                            status,
+                            latencyNanos,
+                            result.path("error").asText());
+                    results.add(new ExternalHttpResult(
+                            requestEpochNanos,
+                            Math.addExact(requestEpochNanos, Math.max(0, latencyNanos)),
+                            status == 200 || status == 202));
+                }
+            }
+            results.sort((left, right) -> Long.compare(left.requestEpochNanos(), right.requestEpochNanos()));
+            long missing = manifest.expectedHttpOrders() - results.size();
+            if (missing > 0) {
+                counters.recordUnscheduled(Math.toIntExact(missing));
+            } else if (missing < 0) {
+                for (long extra = 0; extra < -missing; extra++) {
+                    counters.recordResponse("UNKNOWN", 0, 0, "extra Vegeta result");
+                }
+            }
+            if (results.isEmpty()) {
+                throw new IllegalStateException("Vegeta result file contains no requests");
+            }
+            long first = results.get(0).requestEpochNanos();
+            long lastCompletion = results.stream()
+                    .mapToLong(ExternalHttpResult::completionEpochNanos)
+                    .max()
+                    .orElse(first);
+            return new ExternalHttpResults(
+                    counters,
+                    List.copyOf(results),
+                    first / 1_000_000L,
+                    Math.max(0.001, (lastCompletion - first) / 1_000_000_000.0));
+        }
+
+        private List<SteadySample> mergeMonitorSamples(ExternalHttpResults externalResults)
+                throws IOException {
+            requirePath(monitorOutputPath, "--monitor-output");
+            List<ExternalHttpResult> resultsByCompletion = new ArrayList<>(externalResults.results());
+            resultsByCompletion.sort((left, right) ->
+                    Long.compare(left.completionEpochNanos(), right.completionEpochNanos()));
+            List<SteadySample> samples = new ArrayList<>();
+            int completedResponses = 0;
+            long accepted = 0;
+            long failures = 0;
+            List<String> lines = Files.readAllLines(monitorOutputPath, StandardCharsets.UTF_8);
+            for (int lineNumber = 1; lineNumber < lines.size(); lineNumber++) {
+                String line = lines.get(lineNumber);
+                if (line.isBlank()) {
+                    continue;
+                }
+                String[] values = line.split(",", -1);
+                if (values.length != 7) {
+                    throw new IOException("invalid external monitor CSV row: " + line);
+                }
+                long sampleEpochMillis = Long.parseLong(values[0]);
+                long sampleEpochNanos = Math.multiplyExact(sampleEpochMillis, 1_000_000L);
+                while (completedResponses < resultsByCompletion.size()
+                        && resultsByCompletion.get(completedResponses).completionEpochNanos()
+                        <= sampleEpochNanos) {
+                    if (resultsByCompletion.get(completedResponses).accepted()) {
+                        accepted++;
+                    } else {
+                        failures++;
+                    }
+                    completedResponses++;
+                }
+                samples.add(new SteadySample(
+                        (sampleEpochNanos - externalResults.results().get(0).requestEpochNanos())
+                                / 1_000_000_000.0,
+                        accepted,
+                        failures,
+                        Long.parseLong(values[1]),
+                        Long.parseLong(values[2]),
+                        Long.parseLong(values[3]),
+                        Long.parseLong(values[4]),
+                        Long.parseLong(values[5]),
+                        Long.parseLong(values[6])));
+            }
+            return List.copyOf(samples);
+        }
+
+        private ExternalHttpMatchedManifest readManifest() throws IOException {
+            return objectMapper.readValue(manifestPath.toFile(), ExternalHttpMatchedManifest.class);
+        }
+
+        private void validateManifest(ExternalHttpMatchedManifest manifest) {
+            if (manifest.manifestSchemaVersion() != ExternalHttpMatchedManifest.SCHEMA_VERSION
+                    || !ExternalHttpMatchedManifest.CONTRACT.equals(manifest.benchmarkContract())
+                    || !config.common().runId().equals(manifest.runId())
+                    || !config.common().marketId().equals(manifest.marketId())
+                    || config.targetOrderTps() != manifest.targetTotalOrderTps()
+                    || config.warmupSeconds() != manifest.warmupSeconds()
+                    || config.durationSeconds() != manifest.measurementSeconds()
+                    || config.sampleIntervalSeconds() != manifest.sampleIntervalSeconds()
+                    || config.workloadSeed() != manifest.workloadSeed()
+                    || !config.arrivalPattern().externalName().equals(manifest.arrivalPattern())
+                    || config.common().usersPerSide() != manifest.usersPerSide()
+                    || config.common().events() * 2L != manifest.expectedHttpOrders()
+                    || config.common().events() != manifest.expectedTrades()
+                    || manifest.buyers().size() != manifest.usersPerSide()
+                    || manifest.sellers().size() != manifest.usersPerSide()) {
+                throw new IllegalStateException("external lifecycle arguments do not match prepared manifest");
+            }
+        }
+
+        private void validateMarket(Config common) {
+            if (!HTTP_MARKET_ID.equals(common.marketId())) {
+                throw new IllegalArgumentException(
+                        "Order HTTP currently assigns market " + HTTP_MARKET_ID + "; --market-id must match");
+            }
+        }
+
+        private Path requiredPath(String name) {
+            Path path = pathArg(name, "");
+            requirePath(path, name);
+            return path;
+        }
+
+        private Path pathArg(String name, String defaultValue) {
+            String value = SteadyStateConfig.stringArg(args, name, defaultValue);
+            return value.isBlank() ? null : Path.of(value);
+        }
+
+        private static void requirePath(Path path, String name) {
+            if (path == null) {
+                throw new IllegalArgumentException(name + " is required");
+            }
+        }
+
+        private static void createParent(Path path) throws IOException {
+            if (path.getParent() != null) {
+                Files.createDirectories(path.getParent());
+            }
+        }
+
+        private static long epochNanos(String timestamp) {
+            Instant instant = OffsetDateTime.parse(timestamp).toInstant();
+            return Math.addExact(
+                    Math.multiplyExact(instant.getEpochSecond(), 1_000_000_000L),
+                    instant.getNano());
+        }
+
+        private static String sha256(Path path) throws IOException {
+            try {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                try (var input = Files.newInputStream(path)) {
+                    byte[] buffer = new byte[64 * 1_024];
+                    int read;
+                    while ((read = input.read(buffer)) >= 0) {
+                        digest.update(buffer, 0, read);
+                    }
+                }
+                return HexFormat.of().formatHex(digest.digest());
+            } catch (NoSuchAlgorithmException impossible) {
+                throw new IllegalStateException("SHA-256 unavailable", impossible);
+            }
+        }
+
+        private static ExternalHttpMatchedManifest.BalanceSnapshot balanceSnapshot(RoleBalances source) {
+            return new ExternalHttpMatchedManifest.BalanceSnapshot(
+                    source.availableAmount(),
+                    source.lockedAmount(),
+                    source.availableCurrency(),
+                    source.lockedCurrency());
+        }
+
+        private static RoleBalances roleBalances(ExternalHttpMatchedManifest.BalanceSnapshot source) {
+            return new RoleBalances(
+                    source.availableAmount(),
+                    source.lockedAmount(),
+                    source.availableCurrency(),
+                    source.lockedCurrency());
+        }
+
+        private static ExternalHttpMatchedManifest.DatabaseBaselineSnapshot baselineSnapshot(
+                SteadyDatabaseBaseline source) {
+            return new ExternalHttpMatchedManifest.DatabaseBaselineSnapshot(
+                    source.submitted(),
+                    source.reservationClaims(),
+                    source.confirmed(),
+                    source.matchedOrders(),
+                    source.matchTrades(),
+                    source.orderTrades(),
+                    source.walletTrades());
+        }
+
+        private static SteadyDatabaseBaseline baseline(
+                ExternalHttpMatchedManifest.DatabaseBaselineSnapshot source) {
+            return new SteadyDatabaseBaseline(
+                    source.submitted(),
+                    source.reservationClaims(),
+                    source.confirmed(),
+                    source.matchedOrders(),
+                    source.matchTrades(),
+                    source.orderTrades(),
+                    source.walletTrades());
+        }
+
+        private record ExternalHttpResult(
+                long requestEpochNanos,
+                long completionEpochNanos,
+                boolean accepted) {
+        }
+
+        private record ExternalHttpResults(
+                SteadyHttpCounters counters,
+                List<ExternalHttpResult> results,
+                long firstRequestEpochMillis,
+                double responseCompletionSeconds) {
         }
     }
 
@@ -2411,7 +3026,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 List<UUID> users = "BUY".equals(side) ? buyers : sellers;
                 int userIndex = scheduledOrder.userSequence();
                 throttle(nextSendAtNanos, orderIntervalNanos);
-                base.submitSteadyOrder(
+                base.submitLegacySteadyOrder(
                         executor,
                         inFlight,
                         done,
@@ -2785,7 +3400,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             }
         }
 
-        private void recordException(String side, Exception exception) {
+        private void recordFailure(String side, Throwable exception) {
             int failures = otherFailures.incrementAndGet();
             if (failures <= 10) {
                 System.err.printf("%s steady HTTP request failed: %s%n", side, exception.getMessage());
@@ -3158,6 +3773,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     arrivalPattern,
                     workloadSeed,
                     runtimeProfile,
+                    "legacy-sync",
                     sampleOutput);
         }
     }
@@ -3176,6 +3792,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             BalancedOrderSchedule.ArrivalPattern arrivalPattern,
             long workloadSeed,
             String runtimeProfile,
+            String httpDriverMode,
             String sampleOutput) {
 
         private static SteadyStateConfig from(String[] args) {
@@ -3221,6 +3838,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (sampleIntervalSeconds <= 0 || progressIntervalSeconds <= 0) {
                 throw new IllegalArgumentException("sample and progress intervals must be positive");
             }
+            String httpDriverMode = stringArg(args, "--http-driver-mode", "legacy-sync");
+            if (!PreparedHttpLoadDriver.MODE.equals(httpDriverMode)
+                    && !"legacy-sync".equals(httpDriverMode)
+                    && !"external-vegeta".equals(httpDriverMode)) {
+                throw new IllegalArgumentException(
+                        "--http-driver-mode must be prepared-sync, legacy-sync, or external-vegeta");
+            }
             return new SteadyStateConfig(
                     common,
                     targetOrderTps,
@@ -3239,7 +3863,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                             stringArg(args, "--arrival-pattern", "shuffled")),
                     longArg(args, "--workload-seed", 20260804L),
                     stringArg(args, "--runtime-profile", "canonical"),
+                    httpDriverMode,
                     stringArg(args, "--sample-output", ""));
+        }
+
+        private boolean usesPreparedDriver() {
+            return PreparedHttpLoadDriver.MODE.equals(httpDriverMode);
         }
 
         private static int intArg(String[] args, String name, int defaultValue) {

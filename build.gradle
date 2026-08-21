@@ -101,6 +101,41 @@ tasks.register('httpMatchedSteadyStateLoadTest', JavaExec) {
     mainClass = 'com.eap.eap_order.loadtest.HttpMatchedSteadyStateLoadGenerator'
 }
 
+tasks.register('httpMatchedExternalPrepare', JavaExec) {
+    group = 'verification'
+    description = 'Prepare users, baselines, manifest, and finite Vegeta targets for external open-loop HTTP load.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedExternalPrepareLoadGenerator'
+}
+
+tasks.register('httpMatchedExternalMonitor', JavaExec) {
+    group = 'verification'
+    description = 'Collect low-frequency durable completion and queue samples during external HTTP load.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedExternalMonitor'
+}
+
+tasks.register('httpMatchedExternalVerify', JavaExec) {
+    group = 'verification'
+    description = 'Verify Vegeta HTTP results, full convergence, assets, trade IDs, and queue drain.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpMatchedExternalVerifyLoadGenerator'
+}
+
+tasks.register('writeLoadTestRuntimeClasspath') {
+    group = 'verification'
+    description = 'Write the test runtime classpath for low-overhead direct load-test helper JVMs.'
+    doLast {
+        def output = providers.gradleProperty('loadTestClasspathOutput').getOrNull()
+        if (output == null || output.isBlank()) {
+            throw new GradleException('-PloadTestClasspathOutput is required')
+        }
+        def outputFile = file(output)
+        outputFile.parentFile.mkdirs()
+        outputFile.text = sourceSets.test.runtimeClasspath.asPath
+    }
+}
+
 tasks.register('httpMatchedResetLoadTest', JavaExec) {
     group = 'verification'
     description = 'Reset HTTP matched-trade databases, queues, and Redis before services start.'
@@ -113,6 +148,13 @@ tasks.register('httpMatchedStaircaseLoadTest', JavaExec) {
     description = 'Ramp balanced mixed-side HTTP traffic through configurable stages and find the sustained capacity knee.'
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.eap.eap_order.loadtest.HttpMatchedStaircaseLoadGenerator'
+}
+
+tasks.register('preparedHttpLoadDriverCalibration', JavaExec) {
+    group = 'verification'
+    description = 'Calibrate the prepared synchronous HTTP driver against an in-process no-op endpoint.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.PreparedHttpLoadDriverCalibration'
 }
 
 tasks.register('orderDbCeilingProbe', JavaExec) {

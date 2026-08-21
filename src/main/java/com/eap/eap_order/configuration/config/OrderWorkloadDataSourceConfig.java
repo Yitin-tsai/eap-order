@@ -115,6 +115,7 @@ public class OrderWorkloadDataSourceConfig {
         dataSource.setJdbcUrl(jdbcUrl);
         dataSource.setUsername(username);
         dataSource.setPassword(password);
+        dataSource.addDataSourceProperty("ApplicationName", poolName);
         dataSource.setMaximumPoolSize(maximumPoolSize);
         dataSource.setMinimumIdle(minimumIdle);
         return dataSource;
