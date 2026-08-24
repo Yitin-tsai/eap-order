@@ -57,8 +57,6 @@ eap:
         single-round-trip-enabled: ${EAP_ORDER_ASSET_RESERVATION_CONFIRMED_SINGLE_ROUND_TRIP_ENABLED:true}
       asset-reservation-failed:
         concurrency: ${EAP_ORDER_ASSET_RESERVATION_FAILED_CONCURRENCY:4}
-      order-matched:
-        concurrency: ${EAP_ORDER_MATCHED_CONCURRENCY:16}
       trade-executed:
         concurrency: ${EAP_ORDER_TRADE_EXECUTED_CONCURRENCY:12}
         batch-size: ${EAP_ORDER_TRADE_EXECUTED_BATCH_SIZE:50}

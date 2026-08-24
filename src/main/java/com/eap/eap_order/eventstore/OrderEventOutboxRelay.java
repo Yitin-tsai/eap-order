@@ -318,12 +318,15 @@ public class OrderEventOutboxRelay {
                 for (OutboxRow row : chunk) {
                     results.add(publishOne(row, operations));
                 }
-                if (batchConfirmEnabled && !results.isEmpty()) {
+                List<PublishResult> enqueued = results.stream()
+                        .filter(PublishResult::succeeded)
+                        .toList();
+                if (batchConfirmEnabled && !enqueued.isEmpty()) {
                     Instant confirmStartedAt = Instant.now();
                     operations.waitForConfirmsOrDie(confirmTimeoutMs);
                     Duration confirmDuration = Duration.between(confirmStartedAt, Instant.now());
-                    recordBatchConfirm(results.size(), confirmDuration);
-                    for (PublishResult result : results) {
+                    recordBatchConfirm(enqueued.size(), confirmDuration);
+                    for (PublishResult result : enqueued) {
                         if (result.correlation().getReturned() != null) {
                             throw new AmqpException(
                                     "Unroutable Order integration event: " + result.row().eventId());
@@ -385,7 +388,8 @@ public class OrderEventOutboxRelay {
     }
 
     private Message toJsonMessage(OutboxRow row) {
-        if (!"com.eap.common.event.OrderSubmittedEvent".equals(row.messageType())) {
+        if (!"com.eap.common.event.OrderSubmittedEvent".equals(row.messageType())
+                && !"com.eap.common.event.OrderCancellationRequestedEvent".equals(row.messageType())) {
             throw new IllegalArgumentException("Unsupported Order outbox message type: " + row.messageType());
         }
         MessageProperties properties = new MessageProperties();

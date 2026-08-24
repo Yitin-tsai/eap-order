@@ -1,8 +1,10 @@
 package com.eap.eap_order.eventstore;
 
 import com.eap.common.event.OrderSubmittedEvent;
+import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +31,8 @@ import java.util.concurrent.TimeUnit;
 
 import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus.APPLIED;
 import static com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus.DUPLICATE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_CANCELLATION_REQUESTED_KEY;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_EXCHANGE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -46,6 +50,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
                 "spring.liquibase.change-log=classpath:db/changelog/db.changelog-master.xml",
                 "spring.liquibase.drop-first=false",
                 "spring.rabbitmq.listener.simple.auto-startup=false",
+                "eap.scheduling.enabled=false",
                 "eap.wallet.base-url=http://localhost:8081/eap-wallet",
                 "eap.matchEngine.base-url=http://localhost:8082/match-engine",
                 "eap.order.listeners.asset-reservation-confirmed.single-round-trip-enabled=true"
@@ -358,24 +363,85 @@ class OrderEventAppenderPostgresIT {
     }
 
     @Test
-    void appendCancellationIfCurrentStateAllows_openOrderShouldCancelAndUpdateCommandState() {
+    void appendCancellationRequestIfCurrentStateAllows_openOrderShouldPersistIntentWithoutChangingState() {
         UUID aggregateId = aggregateId();
         UUID userId = UUID.randomUUID();
         seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
         seedMatchingState(aggregateId, userId, "OPEN", 10);
 
-        OrderEventAppendResult result =
-                appender.appendCancellationIfCurrentStateAllows(cancelCommand(aggregateId, userId));
+        OrderEventAppendResult result = appender.appendCancellationRequestIfCurrentStateAllows(
+                cancellationRequestCommand(aggregateId, userId, LocalDateTime.now()));
 
         assertFalse(result.duplicate());
         assertEquals(3, result.aggregateVersion());
         assertEquals(1, count("order_event_store", aggregateId));
         assertEquals(3L, currentVersion(aggregateId));
-        assertMatchingState(aggregateId, 10, 0, "CANCELLED");
+        assertMatchingState(aggregateId, 10, 0, "OPEN");
     }
 
     @Test
-    void appendCancellationIfCurrentStateAllows_matchedCommandStateShouldRejectEvenWhenStreamHeadIsOpen() {
+    void appendCancellationRequestIfCurrentStateAllows_matchingProjectionAheadShouldNotRegress() {
+        UUID aggregateId = aggregateId();
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
+        seedMatchingState(aggregateId, userId, "PARTIALLY_MATCHED", 6);
+
+        appender.appendCancellationRequestIfCurrentStateAllows(
+                cancellationRequestCommand(aggregateId, userId, LocalDateTime.now()));
+
+        assertMatchingState(aggregateId, 6, 4, "PARTIALLY_MATCHED");
+        assertStreamHeadState(aggregateId, 6, "PARTIALLY_MATCHED");
+        assertEquals(10, jdbc.queryForObject("""
+                SELECT (payload_canonical::jsonb ->> 'originalAmount')::integer
+                FROM order_service.order_event_store
+                WHERE aggregate_id = ? AND event_type = 'OrderCancellationRequestedV1'
+                """, Integer.class, aggregateId));
+        assertEquals(10, jdbc.queryForObject("""
+                SELECT (payload::jsonb ->> 'originalAmount')::integer
+                FROM order_service.order_event_outbox
+                WHERE aggregate_id = ? AND routing_key = 'order.cancellation.requested'
+                """, Integer.class, aggregateId));
+    }
+
+    @Test
+    void appendCancellationRequestIfCurrentStateAllows_retryWithNewTimestampShouldBeDuplicate() {
+        UUID aggregateId = aggregateId();
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
+        seedMatchingState(aggregateId, userId, "OPEN", 10);
+
+        OrderEventAppendResult first = appender.appendCancellationRequestIfCurrentStateAllows(
+                cancellationRequestCommand(aggregateId, userId, LocalDateTime.now()));
+        OrderEventAppendResult retry = appender.appendCancellationRequestIfCurrentStateAllows(
+                cancellationRequestCommand(aggregateId, userId, LocalDateTime.now().plusSeconds(1)));
+
+        assertFalse(first.duplicate());
+        assertTrue(retry.duplicate());
+        assertEquals(first.globalPosition(), retry.globalPosition());
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertMatchingState(aggregateId, 10, 0, "OPEN");
+    }
+
+    @Test
+    void appendCancellationRequestIfCurrentStateAllows_retryFromDifferentUserShouldReject() {
+        UUID aggregateId = aggregateId();
+        UUID ownerId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, ownerId, "OPEN", 10);
+        seedMatchingState(aggregateId, ownerId, "OPEN", 10);
+
+        appender.appendCancellationRequestIfCurrentStateAllows(
+                cancellationRequestCommand(aggregateId, ownerId, LocalDateTime.now()));
+
+        assertThrows(IllegalArgumentException.class, () ->
+                appender.appendCancellationRequestIfCurrentStateAllows(
+                        cancellationRequestCommand(aggregateId, UUID.randomUUID(), LocalDateTime.now().plusSeconds(1))));
+
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertMatchingState(aggregateId, 10, 0, "OPEN");
+    }
+
+    @Test
+    void appendCancellationRequestIfCurrentStateAllows_matchedCommandStateShouldReject() {
         UUID aggregateId = aggregateId();
         UUID userId = UUID.randomUUID();
         seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
@@ -383,7 +449,8 @@ class OrderEventAppenderPostgresIT {
         seedOrderProjection(aggregateId, 2, userId, "OPEN", 10);
 
         assertThrows(IllegalStateException.class, () ->
-                appender.appendCancellationIfCurrentStateAllows(cancelCommand(aggregateId, userId)));
+                appender.appendCancellationRequestIfCurrentStateAllows(
+                        cancellationRequestCommand(aggregateId, userId, LocalDateTime.now())));
 
         assertEquals(0, count("order_event_store", aggregateId));
         assertEquals(2L, currentVersion(aggregateId));
@@ -391,7 +458,7 @@ class OrderEventAppenderPostgresIT {
     }
 
     @Test
-    void appendCancellationIfCurrentStateAllows_wrongUserShouldRejectWithoutAppend() {
+    void appendCancellationRequestIfCurrentStateAllows_wrongUserShouldRejectWithoutAppend() {
         UUID aggregateId = aggregateId();
         UUID ownerId = UUID.randomUUID();
         UUID actorId = UUID.randomUUID();
@@ -399,11 +466,70 @@ class OrderEventAppenderPostgresIT {
         seedMatchingState(aggregateId, ownerId, "OPEN", 10);
 
         assertThrows(IllegalArgumentException.class, () ->
-                appender.appendCancellationIfCurrentStateAllows(cancelCommand(aggregateId, actorId)));
+                appender.appendCancellationRequestIfCurrentStateAllows(
+                        cancellationRequestCommand(aggregateId, actorId, LocalDateTime.now())));
 
         assertEquals(0, count("order_event_store", aggregateId));
         assertEquals(2L, currentVersion(aggregateId));
         assertMatchingState(aggregateId, 10, 0, "OPEN");
+    }
+
+    @Test
+    void appendCancellationAcceptedIfReady_exactRemainderShouldCancel() {
+        UUID aggregateId = aggregateId();
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
+        seedMatchingState(aggregateId, userId, "PARTIALLY_MATCHED", 6);
+        OrderEventAppendCommand request = cancellationRequestCommand(
+                aggregateId, userId, LocalDateTime.now().minusSeconds(1));
+        appender.appendCancellationRequestIfCurrentStateAllows(request);
+
+        OrderEventAppendResult result = appender.appendCancellationAcceptedIfReady(
+                cancellationAcceptedCommand(aggregateId, userId, LocalDateTime.now()),
+                request.eventId(),
+                6);
+
+        assertFalse(result.duplicate());
+        assertEquals(4, result.aggregateVersion());
+        assertMatchingState(aggregateId, 6, 4, "CANCELLED");
+        assertStreamHeadState(aggregateId, 6, "CANCELLED");
+    }
+
+    @Test
+    void appendCancellationAcceptedIfReady_tradeProjectionBehindShouldWait() {
+        UUID aggregateId = aggregateId();
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
+        seedMatchingState(aggregateId, userId, "OPEN", 10);
+        OrderEventAppendCommand request = cancellationRequestCommand(
+                aggregateId, userId, LocalDateTime.now().minusSeconds(1));
+        appender.appendCancellationRequestIfCurrentStateAllows(request);
+
+        assertThrows(CancellationPrerequisiteNotReadyException.class, () ->
+                appender.appendCancellationAcceptedIfReady(
+                        cancellationAcceptedCommand(aggregateId, userId, LocalDateTime.now()),
+                        request.eventId(),
+                        6));
+
+        assertEquals(1, count("order_event_store", aggregateId));
+        assertMatchingState(aggregateId, 10, 0, "OPEN");
+    }
+
+    @Test
+    void appendCancellationAcceptedIfReady_withoutPersistedRequestShouldReject() {
+        UUID aggregateId = aggregateId();
+        UUID userId = UUID.randomUUID();
+        seedStreamHead(aggregateId, 2, userId, "OPEN", 6);
+        seedMatchingState(aggregateId, userId, "OPEN", 6);
+
+        assertThrows(IllegalStateException.class, () ->
+                appender.appendCancellationAcceptedIfReady(
+                        cancellationAcceptedCommand(aggregateId, userId, LocalDateTime.now()),
+                        UUID.randomUUID(),
+                        6));
+
+        assertEquals(0, count("order_event_store", aggregateId));
+        assertMatchingState(aggregateId, 6, 4, "OPEN");
     }
 
     @Test
@@ -681,19 +807,49 @@ class OrderEventAppenderPostgresIT {
         );
     }
 
-    private OrderEventAppendCommand cancelCommand(UUID aggregateId, UUID userId) {
-        LocalDateTime cancelledAt = LocalDateTime.now();
+    private OrderEventAppendCommand cancellationRequestCommand(
+            UUID aggregateId,
+            UUID userId,
+            LocalDateTime requestedAt) {
+        UUID cancellationId = UUID.nameUUIDFromBytes(
+                (aggregateId + ":CANCELLATION_REQUESTED").getBytes(StandardCharsets.UTF_8));
         return new OrderEventAppendCommand(
                 aggregateId,
                 0,
-                UUID.nameUUIDFromBytes((aggregateId + ":CANCELLED").getBytes(StandardCharsets.UTF_8)),
+                cancellationId,
+                "OrderCancellationRequestedV1",
+                new OrderCancellationRequestedV1(
+                        cancellationId, aggregateId, userId, null, requestedAt),
+                Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
+                1,
+                requestedAt,
+                new OrderIntegrationEvent(
+                        ORDER_EXCHANGE,
+                        ORDER_CANCELLATION_REQUESTED_KEY,
+                        OrderCancellationRequestedEvent.builder()
+                                .cancellationId(cancellationId)
+                                .orderId(aggregateId)
+                                .userId(userId)
+                                .requestedAt(requestedAt)
+                                .build())
+        );
+    }
+
+    private OrderEventAppendCommand cancellationAcceptedCommand(
+            UUID aggregateId,
+            UUID userId,
+            LocalDateTime cancelledAt) {
+        return new OrderEventAppendCommand(
+                aggregateId,
+                0,
+                UUID.nameUUIDFromBytes(
+                        (aggregateId + ":CANCELLATION_ACCEPTED").getBytes(StandardCharsets.UTF_8)),
                 "OrderCancelledV1",
                 new OrderCancelledV1(aggregateId, userId, cancelledAt),
                 Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
                 1,
                 cancelledAt,
-                null
-        );
+                null);
     }
 
     private OrderTradeApplication tradeApplication(
@@ -784,6 +940,16 @@ class OrderEventAppenderPostgresIT {
                 """, orderId);
         assertEquals(remainingAmount, ((Number) row.get("remaining_amount")).intValue());
         assertEquals(matchedAmount, ((Number) row.get("matched_amount")).intValue());
+        assertEquals(status, row.get("status"));
+    }
+
+    private void assertStreamHeadState(UUID orderId, int remainingAmount, String status) {
+        Map<String, Object> row = jdbc.queryForMap("""
+                SELECT remaining_amount, status
+                FROM order_service.order_stream_heads
+                WHERE aggregate_id = ?
+                """, orderId);
+        assertEquals(remainingAmount, ((Number) row.get("remaining_amount")).intValue());
         assertEquals(status, row.get("status"));
     }
 

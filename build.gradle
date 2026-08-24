@@ -94,6 +94,13 @@ tasks.register('httpMatchedTradeCompletionLoadTest', JavaExec) {
     mainClass = 'com.eap.eap_order.loadtest.HttpMatchedTradeCompletionLoadGenerator'
 }
 
+tasks.register('httpCancellationLifecycleLoadTest', JavaExec) {
+    group = 'verification'
+    description = 'Verify HTTP cancellation through real RabbitMQ across Order, MatchEngine, and Wallet.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.eap.eap_order.loadtest.HttpCancellationLifecycleLoadGenerator'
+}
+
 tasks.register('httpMatchedSteadyStateLoadTest', JavaExec) {
     group = 'verification'
     description = 'Run sustained balanced mixed-side HTTP traffic and verify throughput, backlog stability, and convergence.'

@@ -94,8 +94,6 @@ eap:
         single-round-trip-enabled: false
       asset-reservation-failed:
         concurrency: 4
-      order-matched:
-        concurrency: 4
       trade-executed:
         concurrency: 4
         batch-size: 1

@@ -4,6 +4,7 @@ import com.eap.eap_order.domain.ordersourcing.OrderAggregate;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -55,6 +56,7 @@ public class OrderEventStreamReader {
             case "OrderAssetReservationConfirmedV1" -> OrderAssetReservationConfirmedV1.class;
             case "OrderAssetReservationFailedV1" -> OrderAssetReservationFailedV1.class;
             case "OrderMatchedV1" -> OrderMatchedV1.class;
+            case "OrderCancellationRequestedV1" -> OrderCancellationRequestedV1.class;
             case "OrderCancelledV1" -> OrderCancelledV1.class;
             default -> throw new IllegalArgumentException("Unsupported Order event type: " + event.eventType());
         };

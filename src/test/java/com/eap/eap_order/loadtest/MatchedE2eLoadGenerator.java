@@ -69,9 +69,11 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CLEARED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CREATED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.TRADE_EXCHANGE;
@@ -79,6 +81,7 @@ import static com.eap.common.constants.RabbitMQConstants.TRADE_EXECUTED_KEY;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_AUCTION_BID_SUBMITTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_AUCTION_CLEARED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_SUBMITTED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_CANCELLATION_RESULT_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_TRADE_EXECUTED_QUEUE;
 
 public class MatchedE2eLoadGenerator {
@@ -1858,6 +1861,12 @@ public class MatchedE2eLoadGenerator {
 
     private static void truncateOrderTestData(JdbcTemplate jdbcTemplate) {
         jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                    IF to_regclass('order_service.order_cancellation_result_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE order_service.order_cancellation_result_inbox;
+                    END IF;
+                END $$;
                 TRUNCATE TABLE
                     order_service.match_history,
                     order_service.order_trade_execution_inbox,
@@ -1874,6 +1883,12 @@ public class MatchedE2eLoadGenerator {
 
     private static void truncateWalletTestData(JdbcTemplate jdbcTemplate) {
         jdbcTemplate.execute("""
+                DO $$
+                BEGIN
+                    IF to_regclass('wallet_service.order_cancellation_applications') IS NOT NULL THEN
+                        TRUNCATE TABLE wallet_service.order_cancellation_applications;
+                    END IF;
+                END $$;
                 TRUNCATE TABLE
                     wallet_service.trade_settlements,
                     wallet_service.outbox,
@@ -1894,6 +1909,9 @@ public class MatchedE2eLoadGenerator {
                     IF to_regclass('match_engine.reservation_cleanup_tasks') IS NOT NULL THEN
                         TRUNCATE TABLE match_engine.reservation_cleanup_tasks RESTART IDENTITY CASCADE;
                     END IF;
+                    IF to_regclass('match_engine.order_cancellations') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.order_cancellations RESTART IDENTITY CASCADE;
+                    END IF;
                 END $$;
                 """);
         jdbcTemplate.execute("""
@@ -1907,10 +1925,13 @@ public class MatchedE2eLoadGenerator {
     private static void purgeQueues(RabbitAdmin rabbitAdmin) {
         purgeIfPresent(rabbitAdmin, WALLET_ORDER_SUBMITTED_QUEUE);
         purgeIfPresent(rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+        purgeIfPresent(rabbitAdmin, MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_ORDER_CONFIRMED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_ORDER_FAILED_QUEUE);
+        purgeIfPresent(rabbitAdmin, ORDER_ORDER_CANCELLATION_RESULT_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
         purgeIfPresent(rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
+        purgeIfPresent(rabbitAdmin, WALLET_ORDER_CANCELLATION_RESULT_QUEUE);
         purgeIfPresent(rabbitAdmin, WALLET_AUCTION_BID_SUBMITTED_QUEUE);
         purgeIfPresent(rabbitAdmin, WALLET_AUCTION_CLEARED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_AUCTION_CLEARED_QUEUE);
@@ -1941,6 +1962,8 @@ public class MatchedE2eLoadGenerator {
         }
         redisTemplate.delete(keys);
         deleteRedisKeys(redisTemplate, "order:reservation:*");
+        deleteRedisKeys(redisTemplate, "order:cancellation:*");
+        deleteRedisKeys(redisTemplate, "order:cancellation-intent:*");
     }
 
     private static OrderSubmittedEvent submitted(UUID orderId, UUID userId, String side, long sequence, String marketId) {

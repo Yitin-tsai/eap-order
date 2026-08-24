@@ -1,6 +1,5 @@
 package com.eap.eap_order.controller;
 
-import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.dto.*;
 import com.eap.eap_order.application.AuctionStatusService;
 import com.eap.eap_order.application.OrderEventSourcingService;
@@ -122,7 +121,7 @@ public class McpApiController {
     }
 
     @Operation(summary = "取消訂單", description = "根據訂單ID取消訂單")
-    @ApiResponse(responseCode = "200", description = "取消成功")
+    @ApiResponse(responseCode = "202", description = "取消請求已受理")
     @DeleteMapping("/orders/{orderId}")
     public ResponseEntity<CancelOrderResponse> cancelOrder(
             @Parameter(description = "訂單ID") @PathVariable String orderId,
@@ -133,15 +132,10 @@ public class McpApiController {
         try {
             UUID orderUuid = UUID.fromString(orderId);
             UUID userUuid = UUID.fromString(userId);
-            orderEventSourcingService.assertCancellationAllowed(orderUuid, userUuid);
-
-            OrderCancelEvent cancelEvent = OrderCancelEvent.builder()
-                .orderId(orderUuid)
-                .build();
-            eapMatchEngine.cancelOrder(cancelEvent);
-            orderEventSourcingService.cancel(orderUuid, userUuid);
+            UUID cancellationId = orderEventSourcingService.requestCancellation(orderUuid, userUuid);
             
-            return ResponseEntity.ok(CancelOrderResponse.success(orderId));
+            return ResponseEntity.accepted().body(
+                    CancelOrderResponse.accepted(orderId, cancellationId.toString()));
             
         } catch (Exception e) {
             log.error("取消訂單失敗: {}", e.getMessage());

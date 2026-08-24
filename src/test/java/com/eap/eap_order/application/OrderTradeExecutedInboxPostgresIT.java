@@ -26,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
                 "spring.liquibase.enabled=true",
                 "spring.liquibase.change-log=classpath:db/changelog/db.changelog-master.xml",
                 "spring.rabbitmq.listener.simple.auto-startup=false",
+                "eap.scheduling.enabled=false",
                 "eap.wallet.base-url=http://localhost:8081/eap-wallet",
                 "eap.matchEngine.base-url=http://localhost:8082/match-engine",
                 "eap.order.trade-execution-reconciler.initial-delay-ms=3600000",

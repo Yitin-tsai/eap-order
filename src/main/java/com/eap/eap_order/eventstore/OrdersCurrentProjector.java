@@ -137,6 +137,7 @@ public class OrdersCurrentProjector {
                 case "OrderAssetReservationFailedV1" -> updateStatus(event, "REJECTED");
                 case "OrderMatchedV1" -> applyMatched(
                         event, objectMapper.readValue(event.payload(), OrderMatchedV1.class));
+                case "OrderCancellationRequestedV1" -> advanceVersion(event);
                 case "OrderCancelledV1" -> updateStatus(event, "CANCELLED");
                 default -> throw new IllegalArgumentException("Unsupported projection event: " + event.eventType());
             }
@@ -167,6 +168,15 @@ public class OrdersCurrentProjector {
                 SET status = ?, aggregate_version = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE order_id = ? AND aggregate_version = ?
                 """, status, event.aggregateVersion(), event.aggregateId(), event.aggregateVersion() - 1);
+        ensureAppliedOrAlreadyProjected(event, updated);
+    }
+
+    private void advanceVersion(ProjectionEvent event) {
+        int updated = jdbc.update("""
+                UPDATE order_service.orders_current
+                SET aggregate_version = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = ? AND aggregate_version = ?
+                """, event.aggregateVersion(), event.aggregateId(), event.aggregateVersion() - 1);
         ensureAppliedOrAlreadyProjected(event, updated);
     }
 
@@ -261,6 +271,10 @@ public class OrdersCurrentProjector {
                         int remainingAmount = current.remainingAmount() - matched.amount();
                         String status = remainingAmount == 0 ? "MATCHED" : "PARTIALLY_MATCHED";
                         snapshot = current.withAmounts(matchedAmount, remainingAmount, status, event.aggregateVersion());
+                    }
+                    case "OrderCancellationRequestedV1" -> {
+                        ProjectionSnapshot current = requireSnapshot(failedEvent, snapshot);
+                        snapshot = current.withStatus(current.status(), event.aggregateVersion());
                     }
                     case "OrderCancelledV1" -> {
                         snapshot = requireSnapshot(failedEvent, snapshot).withStatus("CANCELLED", event.aggregateVersion());

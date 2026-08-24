@@ -40,9 +40,12 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_SUBMITTED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_CANCELLATION_RESULT_QUEUE;
 
 public class OrderHttpLoadGenerator {
 
@@ -58,6 +61,9 @@ public class OrderHttpLoadGenerator {
             ORDER_ORDER_CONFIRMED_QUEUE,
             ORDER_ORDER_FAILED_QUEUE,
             MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
+            MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE,
+            ORDER_ORDER_CANCELLATION_RESULT_QUEUE,
+            WALLET_ORDER_CANCELLATION_RESULT_QUEUE,
             DEAD_LETTER_QUEUE
     );
 
@@ -715,6 +721,12 @@ public class OrderHttpLoadGenerator {
         try (Connection connection = DriverManager.getConnection(
                 config.orderJdbcUrl(), config.orderJdbcUser(), config.orderJdbcPassword());
              PreparedStatement statement = connection.prepareStatement("""
+                     DO $$
+                     BEGIN
+                         IF to_regclass('order_service.order_cancellation_result_inbox') IS NOT NULL THEN
+                             TRUNCATE TABLE order_service.order_cancellation_result_inbox;
+                         END IF;
+                     END $$;
                      TRUNCATE TABLE
                          order_service.match_history,
                          order_service.order_trade_execution_inbox,
@@ -736,6 +748,12 @@ public class OrderHttpLoadGenerator {
         try (Connection connection = DriverManager.getConnection(
                 config.walletJdbcUrl(), config.walletJdbcUser(), config.walletJdbcPassword());
              PreparedStatement statement = connection.prepareStatement("""
+                     DO $$
+                     BEGIN
+                         IF to_regclass('wallet_service.order_cancellation_applications') IS NOT NULL THEN
+                             TRUNCATE TABLE wallet_service.order_cancellation_applications;
+                         END IF;
+                     END $$;
                      TRUNCATE TABLE
                          wallet_service.trade_settlements,
                          wallet_service.outbox,

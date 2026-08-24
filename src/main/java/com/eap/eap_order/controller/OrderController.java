@@ -1,12 +1,11 @@
 package com.eap.eap_order.controller;
 
-import com.eap.common.event.OrderCancelEvent;
 import com.eap.eap_order.application.OrderQueryService;
+import com.eap.common.dto.CancelOrderResponse;
 import com.eap.eap_order.application.OrderSubmissionResult;
 import com.eap.eap_order.application.OrderSubmissionMetrics;
 import com.eap.eap_order.application.PlaceBuyOrderService;
 import com.eap.eap_order.application.PlaceSellOrderService;
-import com.eap.eap_order.application.OutBound.EapMatchEngine;
 import com.eap.eap_order.controller.dto.req.CancelOrderReq;
 import com.eap.eap_order.configuration.ratelimit.RateLimit;
 import com.eap.eap_order.controller.dto.req.PlaceBuyOrderReq;
@@ -48,8 +47,6 @@ public class OrderController {
     protected OrderQueryService orderQueryService;
     @Autowired
     private OrderSubmissionMetrics orderSubmissionMetrics;
-    @Autowired
-    private EapMatchEngine eapMatchEngine;
     @Autowired
     private OrderEventSourcingService orderEventSourcingService;
 
@@ -170,27 +167,27 @@ public class OrderController {
     }
 
     @Operation(operationId = "cancel-order", summary = "取消訂單", description = "用戶取消未完成的訂單")
-    @ApiResponse(responseCode = "200", description = "取消成功")
+    @ApiResponse(responseCode = "202", description = "取消請求已受理")
     @ApiResponse(responseCode = "400", description = "請求錯誤")
+    @ApiResponse(responseCode = "429", description = "取消請求速率超過限制")
     @PostMapping("/user-orders/cancel")
-    public ResponseEntity<Void> cancelOrder(
+    @RateLimit(key = "#request.userId", limit = 5, window = 1)
+    public ResponseEntity<CancelOrderResponse> cancelOrder(
             
             @Parameter(description = "取消訂單請求") @Valid @RequestBody CancelOrderReq request) {
 
         log.info("取消訂單請求: {}", request);
 
        try {
-           orderEventSourcingService.assertCancellationAllowed(request.getOrderId(), request.getUserId());
+           UUID cancellationId = orderEventSourcingService.requestCancellation(
+                   request.getOrderId(), request.getUserId());
+           return ResponseEntity.accepted().body(CancelOrderResponse.accepted(
+                   request.getOrderId().toString(), cancellationId.toString()));
        } catch (IllegalArgumentException | IllegalStateException e) {
            log.warn("取消訂單被拒絕: {}", e.getMessage());
-           return ResponseEntity.badRequest().build();
+           return ResponseEntity.badRequest().body(CancelOrderResponse.failure(
+                   request.getOrderId().toString(), e.getMessage()));
        }
-
-       OrderCancelEvent cancelEvent = OrderCancelEvent.builder().orderId(request.getOrderId()).build();
-       eapMatchEngine.cancelOrder(cancelEvent);
-       orderEventSourcingService.cancel(request.getOrderId(), request.getUserId());
-
-       return ResponseEntity.ok().build();
     }
 
 }

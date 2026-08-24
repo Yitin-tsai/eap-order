@@ -40,6 +40,14 @@ final class RabbitManagementClient {
     }
 
     QueueSnapshot readQueues(List<String> queueNames) {
+        return readQueues(queueNames, false);
+    }
+
+    QueueSnapshot readQueuesAllowMissing(List<String> queueNames) {
+        return readQueues(queueNames, true);
+    }
+
+    private QueueSnapshot readQueues(List<String> queueNames, boolean missingAsEmpty) {
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(queueCollectionUri(managementUrl, vhost))
@@ -67,7 +75,11 @@ final class RabbitManagementClient {
             for (String queueName : queueNames) {
                 QueueDepth depth = allDepths.get(queueName);
                 if (depth == null) {
-                    failures++;
+                    if (missingAsEmpty) {
+                        selectedDepths.put(queueName, new QueueDepth(0, 0));
+                    } else {
+                        failures++;
+                    }
                 } else {
                     selectedDepths.put(queueName, depth);
                     backlog += depth.ready() + depth.unacked();
@@ -89,13 +101,17 @@ final class RabbitManagementClient {
                     .DELETE()
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            if (!isIdempotentPurgeStatus(response.statusCode())) {
                 throw new IllegalStateException(
                         "queue purge failed: vhost=" + vhost
                                 + ", queue=" + queueName
                                 + ", status=" + response.statusCode());
             }
         }
+    }
+
+    static boolean isIdempotentPurgeStatus(int statusCode) {
+        return (statusCode >= 200 && statusCode < 300) || statusCode == 404;
     }
 
     static URI queueCollectionUri(String managementUrl, String vhost) {

@@ -18,6 +18,13 @@ TradeExecutedEvent
   -> idempotently append command-side trade application events
   -> retry from the inbox when command state is not ready yet
 
+cancel HTTP request
+  -> append OrderCancellationRequestedV1 + outbox atomically with immutable original amount
+  -> return 202 + cancellationId while MatchEngine arbitrates against matching
+OrderCancellationResultEvent
+  -> persist durable inbox before ACK
+  -> apply CANCELLED only when earlier trade applications have caught up
+
 order event stream
   -> asynchronously rebuild orders_current projection
 ```
@@ -45,7 +52,8 @@ AuctionCreatedEvent / AuctionClearedEvent
 | CDA order IDs, market sequence allocation, order lifecycle events | Wallet balances and reservations |
 | Order submission and integration-event outbox | Price-time matching decisions |
 | Durable `TradeExecuted` inbox and `order_trade_applications` | The authoritative `TradeExecuted` fact |
-| Rebuildable current-order projection and audit/replay APIs | Cross-service completion state |
+| Durable cancellation intent and result inbox | Cancellation arbitration and asset release |
+| Rebuildable current-order projection and audit-trail APIs | Cross-service completion state |
 | TDA bid entry and auction status/result views | TDA asset reservation and auction clearing |
 
 Order does not publish a per-trade completion callback to MatchEngine. Full-flow verification compares Order's durable trade applications with MatchEngine and Wallet outside the transaction path.
@@ -56,7 +64,8 @@ Order does not publish a per-trade completion callback to MatchEngine. Full-flow
 - RabbitMQ consumers ACK only after durable local handling.
 - `trade_id` and database constraints make repeated `TradeExecutedEvent` delivery idempotent.
 - Projection-lagged events remain in a durable inbox and are reconciled without broker requeue storms.
-- API rate limiting and queue-aware backpressure protect the asynchronous pipeline.
+- A cancellation result cannot override an earlier trade; it waits until the command-side remainder equals MatchEngine's cancelled remainder.
+- User-keyed order and cancellation rate limits plus queue-aware backpressure demonstrate bounded admission for the asynchronous pipeline. In this learning project, `userId` is the domain identity and an extension point for future quota policies; implementing a production authentication or gateway boundary is outside the current scope.
 - TDA direct publication and caught listener failures are explicit gaps and are not described as transactional-outbox or retry protected.
 
 ## Run

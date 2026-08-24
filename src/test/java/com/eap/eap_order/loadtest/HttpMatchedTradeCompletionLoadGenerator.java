@@ -46,10 +46,13 @@ import java.util.concurrent.atomic.AtomicLongArray;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_SUBMITTED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_CANCELLATION_RESULT_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_TRADE_EXECUTED_QUEUE;
 import static com.eap.eap_order.loadtest.RabbitManagementClient.QueueDepth;
 import static com.eap.eap_order.loadtest.RabbitManagementClient.QueueSnapshot;
@@ -66,8 +69,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             ORDER_ORDER_CONFIRMED_QUEUE,
             ORDER_ORDER_FAILED_QUEUE,
             MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
+            MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE,
             ORDER_TRADE_EXECUTED_QUEUE,
             WALLET_TRADE_EXECUTED_QUEUE,
+            ORDER_ORDER_CANCELLATION_RESULT_QUEUE,
+            WALLET_ORDER_CANCELLATION_RESULT_QUEUE,
             DEAD_LETTER_QUEUE
     );
 
@@ -677,6 +683,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     orderbookKey(config.marketId(), "buy"),
                     orderbookKey(config.marketId(), "sell"));
             deleteRedisKeys(config, "order:reservation:*");
+            deleteRedisKeys(config, "order:cancellation:*");
+            deleteRedisKeys(config, "order:cancellation-intent:*");
         }
         awaitResetQueueQuiescence(rabbit, 10);
     }
@@ -695,7 +703,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         QueueSnapshot latest = new QueueSnapshot(Long.MAX_VALUE, CHAIN_QUEUES.size(), Map.of());
         while (System.nanoTime() < deadline) {
             rabbit.purgeQueues(CHAIN_QUEUES);
-            latest = rabbit.readQueues(CHAIN_QUEUES);
+            latest = rabbit.readQueuesAllowMissing(CHAIN_QUEUES);
             if (latest.backlog() == 0 && latest.readFailures() == 0) {
                 consecutiveEmptySamples++;
                 if (consecutiveEmptySamples >= 3) {
@@ -711,6 +719,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
     private static void truncateOrderData(Config config) throws Exception {
         execute(config.orderJdbcUrl(), config.jdbcUser(), config.jdbcPassword(), """
+                DO $$
+                BEGIN
+                    IF to_regclass('order_service.order_cancellation_result_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE order_service.order_cancellation_result_inbox;
+                    END IF;
+                END $$;
                 TRUNCATE TABLE
                     order_service.match_history,
                     order_service.order_trade_execution_inbox,
@@ -728,6 +742,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
     private static void truncateWalletData(Config config) throws Exception {
         execute(config.walletJdbcUrl(), config.jdbcUser(), config.jdbcPassword(), """
+                DO $$
+                BEGIN
+                    IF to_regclass('wallet_service.order_cancellation_applications') IS NOT NULL THEN
+                        TRUNCATE TABLE wallet_service.order_cancellation_applications;
+                    END IF;
+                END $$;
                 TRUNCATE TABLE
                     wallet_service.trade_settlements,
                     wallet_service.outbox,
@@ -747,6 +767,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     END IF;
                     IF to_regclass('match_engine.reservation_cleanup_tasks') IS NOT NULL THEN
                         TRUNCATE TABLE match_engine.reservation_cleanup_tasks RESTART IDENTITY CASCADE;
+                    END IF;
+                    IF to_regclass('match_engine.order_cancellations') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.order_cancellations RESTART IDENTITY CASCADE;
                     END IF;
                 END $$;
                 TRUNCATE TABLE

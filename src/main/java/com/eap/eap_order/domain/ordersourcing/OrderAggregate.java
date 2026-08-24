@@ -95,6 +95,8 @@ public class OrderAggregate {
             status = matchedAmount == originalAmount
                     ? OrderLifecycleStatus.MATCHED
                     : OrderLifecycleStatus.PARTIALLY_MATCHED;
+        } else if (event instanceof OrderCancellationRequestedV1) {
+            // Cancellation intent does not change matchability until MatchEngine arbitrates it.
         } else if (event instanceof OrderCancelledV1) {
             status = OrderLifecycleStatus.CANCELLED;
         } else {

@@ -425,4 +425,33 @@
         </addColumn>
     </changeSet>
 
+    <changeSet id="order-es-026" author="eap">
+        <comment>Keep cancellation results durable while waiting for earlier TradeExecuted events</comment>
+        <sql>
+            CREATE TABLE order_service.order_cancellation_result_inbox (
+                cancellation_id UUID PRIMARY KEY,
+                order_id UUID NOT NULL,
+                payload TEXT NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                claimed_by VARCHAR(80),
+                claim_until TIMESTAMP,
+                received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TIMESTAMP,
+                last_error TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_cancellation_result_inbox_status
+                    CHECK (status IN ('PENDING', 'PENDING_PREREQUISITE', 'IN_PROGRESS',
+                                      'APPLIED', 'FAILED_RETRYABLE', 'FAILED_PERMANENT')),
+                CONSTRAINT ck_order_cancellation_result_inbox_attempt
+                    CHECK (attempt_count &gt;= 0)
+            );
+            CREATE INDEX idx_order_cancellation_result_inbox_retry
+                ON order_service.order_cancellation_result_inbox(status, next_retry_at, updated_at)
+                WHERE status IN ('PENDING', 'PENDING_PREREQUISITE',
+                                 'FAILED_RETRYABLE', 'IN_PROGRESS');
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

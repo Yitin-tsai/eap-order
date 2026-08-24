@@ -20,6 +20,7 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  * - order.confirmed events (for status updates after wallet validation)
  * - trade.executed events (for matched order-state application)
  * - order.failed events (for failure handling)
+ * - order.cancellation.result events (for the final cancellation decision)
  * 
  * This module publishes:
  * - order.submitted events (initial order placement)
@@ -85,6 +86,13 @@ public class RabbitMQConfig {
   }
 
   @Bean
+  public Queue orderOrderCancellationResultQueue() {
+    return QueueBuilder.durable(ORDER_ORDER_CANCELLATION_RESULT_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
   public Binding orderOrderConfirmedBinding(@Qualifier("orderOrderConfirmedQueue") Queue orderOrderConfirmedQueue,
       @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderConfirmedQueue).to(orderExchange).with(ORDER_CONFIRMED_KEY);
@@ -101,6 +109,13 @@ public class RabbitMQConfig {
   public Binding orderOrderFailedBinding(@Qualifier("orderOrderFailedQueue") Queue orderOrderFailedQueue,
       @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(orderOrderFailedQueue).to(orderExchange).with(ORDER_FAILED_KEY);
+  }
+
+  @Bean
+  public Binding orderOrderCancellationResultBinding(
+      @Qualifier("orderOrderCancellationResultQueue") Queue queue,
+      @Qualifier("orderExchange") TopicExchange orderExchange) {
+    return BindingBuilder.bind(queue).to(orderExchange).with(ORDER_CANCELLATION_RESULT_KEY);
   }
 
   // --- Auction Exchange and Queues ---

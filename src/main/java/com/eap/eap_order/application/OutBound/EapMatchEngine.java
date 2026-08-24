@@ -4,7 +4,6 @@ import com.eap.common.dto.AuctionBidRequest;
 import com.eap.common.dto.AuctionBidResponse;
 import com.eap.common.dto.AuctionConfigDto;
 import com.eap.common.dto.AuctionStatusDto;
-import com.eap.common.event.OrderCancelEvent;
 import com.eap.common.event.OrderConfirmedEvent;
 import com.eap.common.dto.OrderBookResponseDto;
 import com.eap.common.dto.MarketSummaryDto;
@@ -16,9 +15,6 @@ import java.util.List;
 
 @FeignClient(name = "eap-matchEngine", url = "${eap.matchEngine.base-url}")
 public interface EapMatchEngine {
-
-    @DeleteMapping("/v1/order/cancel")
-    boolean cancelOrder(OrderCancelEvent event);
 
     @GetMapping("/v1/order/query")
     ResponseEntity<List<OrderConfirmedEvent>> queryOrder(@RequestParam("userId") String userId);

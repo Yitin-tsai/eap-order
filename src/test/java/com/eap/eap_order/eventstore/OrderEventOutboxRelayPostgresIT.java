@@ -73,6 +73,43 @@ class OrderEventOutboxRelayPostgresIT {
     }
 
     @Test
+    void cancellationRequest_shouldBePublishedAndMarkedSent() throws Exception {
+        RabbitTemplate rabbitTemplate = successfulRabbitTemplate();
+        UUID aggregateId = insertOutbox(
+                "PENDING",
+                0,
+                false,
+                "order.cancellation.requested",
+                "com.eap.common.event.OrderCancellationRequestedEvent");
+
+        relay(rabbitTemplate).relay();
+
+        await(Duration.ofSeconds(5), () -> status(aggregateId).equals("SENT"));
+        verify(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
+    }
+
+    @Test
+    void unsupportedMessageType_shouldRetainOriginalFailureForDiagnosis() throws Exception {
+        RabbitTemplate rabbitTemplate = successfulRabbitTemplate();
+        UUID aggregateId = insertOutbox(
+                "PENDING",
+                0,
+                false,
+                "order.unsupported",
+                "com.eap.common.event.UnsupportedEvent");
+
+        relay(rabbitTemplate).relay();
+
+        await(Duration.ofSeconds(5), () -> status(aggregateId).equals("PENDING")
+                && attemptCount(aggregateId) == 1);
+        assertTrue(jdbc.queryForObject("""
+                SELECT last_error LIKE 'IllegalArgumentException: Unsupported Order outbox message type:%'
+                FROM order_service.order_event_outbox
+                WHERE aggregate_id = ?
+                """, Boolean.class, aggregateId));
+    }
+
+    @Test
     void staleInFlightBatch_shouldBeReclaimedAndMarkedSent() throws Exception {
         RabbitTemplate rabbitTemplate = successfulRabbitTemplate();
         UUID aggregateId = insertOutbox("IN_FLIGHT", 0, true);
@@ -139,6 +176,20 @@ class OrderEventOutboxRelayPostgresIT {
     }
 
     private UUID insertOutbox(String status, int attemptCount, boolean stale) {
+        return insertOutbox(
+                status,
+                attemptCount,
+                stale,
+                "order.submitted",
+                "com.eap.common.event.OrderSubmittedEvent");
+    }
+
+    private UUID insertOutbox(
+            String status,
+            int attemptCount,
+            boolean stale,
+            String routingKey,
+            String messageType) {
         UUID aggregateId = UUID.randomUUID();
         UUID eventId = UUID.randomUUID();
         aggregateIds.add(aggregateId);
@@ -146,11 +197,11 @@ class OrderEventOutboxRelayPostgresIT {
                 INSERT INTO order_service.order_event_outbox
                     (event_id, aggregate_id, exchange_name, routing_key, message_type, payload,
                      status, attempt_count, next_retry_at, created_at, updated_at)
-                VALUES (?, ?, 'order.exchange', 'order.submitted',
-                        'com.eap.common.event.OrderSubmittedEvent', '{}'::jsonb,
+                VALUES (?, ?, 'order.exchange', ?, ?, '{}'::jsonb,
                         ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
                         CURRENT_TIMESTAMP - (? * INTERVAL '1 second'))
-                """, eventId, aggregateId, status, attemptCount, stale ? 10 : 0);
+                """, eventId, aggregateId, routingKey, messageType,
+                status, attemptCount, stale ? 10 : 0);
         return aggregateId;
     }
 

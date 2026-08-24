@@ -1,6 +1,8 @@
 package com.eap.eap_order.application;
 
 import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderCancellationRequestedEvent;
+import com.eap.common.event.OrderCancellationResultEvent;
 import com.eap.common.event.OrderFailedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
 import com.eap.common.event.TradeExecutedEvent;
@@ -8,6 +10,7 @@ import com.eap.eap_order.domain.ordersourcing.OrderAggregate;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.eap.eap_order.eventstore.OrderEventAppendCommand;
@@ -32,6 +35,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static com.eap.common.constants.RabbitMQConstants.ORDER_EXCHANGE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_CANCELLATION_REQUESTED_KEY;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_SUBMITTED_KEY;
 
 @Service
@@ -283,23 +287,64 @@ public class OrderEventSourcingService {
         }
     }
 
-    public void cancel(UUID orderId, UUID userId) {
-        LocalDateTime occurredAt = LocalDateTime.now();
-        OrderCancelledV1 event = new OrderCancelledV1(orderId, userId, occurredAt);
-        appender.appendCancellationIfCurrentStateAllows(new OrderEventAppendCommand(
+    public UUID requestCancellation(UUID orderId, UUID userId) {
+        LocalDateTime requestedAt = LocalDateTime.now();
+        UUID cancellationId = eventId(orderId, "CANCELLATION_REQUESTED");
+        OrderCancellationRequestedV1 event = new OrderCancellationRequestedV1(
+                cancellationId, orderId, userId, null, requestedAt);
+        OrderCancellationRequestedEvent integrationEvent = OrderCancellationRequestedEvent.builder()
+                .cancellationId(cancellationId)
+                .orderId(orderId)
+                .userId(userId)
+                .requestedAt(requestedAt)
+                .build();
+        appender.appendCancellationRequestIfCurrentStateAllows(new OrderEventAppendCommand(
                 orderId,
                 0,
-                eventId(orderId, "CANCELLED"),
-                "OrderCancelledV1",
+                cancellationId,
+                "OrderCancellationRequestedV1",
                 event,
                 Map.of("correlationId", orderId.toString(), "userId", userId.toString()),
                 1,
-                occurredAt,
-                null));
+                requestedAt,
+                new OrderIntegrationEvent(
+                        ORDER_EXCHANGE,
+                        ORDER_CANCELLATION_REQUESTED_KEY,
+                        integrationEvent)));
+        return cancellationId;
     }
 
-    public void assertCancellationAllowed(UUID orderId, UUID userId) {
-        appender.assertCancellationAllowed(orderId, userId);
+    public void applyCancellationResult(OrderCancellationResultEvent result) {
+        if (OrderCancellationResultEvent.ALREADY_MATCHED.equals(result.getOutcome())) {
+            return;
+        }
+        if (OrderCancellationResultEvent.NOT_OPEN.equals(result.getOutcome())) {
+            throw new IllegalStateException(
+                    "MatchEngine reported an order with neither an open remainder nor a durable trade: orderId="
+                            + result.getOrderId() + ", cancellationId=" + result.getCancellationId());
+        }
+        if (!result.cancelled()) {
+            throw new IllegalArgumentException("Unknown cancellation outcome: " + result.getOutcome());
+        }
+        LocalDateTime cancelledAt = result.getDecidedAt() == null
+                ? LocalDateTime.now()
+                : result.getDecidedAt();
+        OrderCancelledV1 event = new OrderCancelledV1(
+                result.getOrderId(), result.getUserId(), cancelledAt);
+        appender.appendCancellationAcceptedIfReady(new OrderEventAppendCommand(
+                result.getOrderId(),
+                0,
+                eventId(result.getOrderId(), "CANCELLATION_RESULT:" + result.getCancellationId()),
+                "OrderCancelledV1",
+                event,
+                Map.of(
+                        "correlationId", result.getCancellationId().toString(),
+                        "userId", result.getUserId().toString()),
+                1,
+                cancelledAt,
+                null),
+                result.getCancellationId(),
+                result.getCancelledAmount());
     }
 
     private void append(

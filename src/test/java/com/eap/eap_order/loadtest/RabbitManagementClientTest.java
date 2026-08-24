@@ -33,4 +33,12 @@ class RabbitManagementClientTest {
         assertEquals(7, snapshot.readFailures());
         assertTrue(snapshot.depths().isEmpty());
     }
+
+    @Test
+    void idempotentPurgeStatus_acceptsMissingQueueButRejectsBrokerFailure() {
+        assertTrue(RabbitManagementClient.isIdempotentPurgeStatus(204));
+        assertTrue(RabbitManagementClient.isIdempotentPurgeStatus(404));
+        assertTrue(!RabbitManagementClient.isIdempotentPurgeStatus(401));
+        assertTrue(!RabbitManagementClient.isIdempotentPurgeStatus(500));
+    }
 }

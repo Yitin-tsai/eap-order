@@ -1,8 +1,10 @@
 package com.eap.eap_order.eventstore;
 
+import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -34,6 +36,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -373,14 +376,18 @@ public class OrderEventAppender {
         }
     }
 
-    public OrderEventAppendResult appendCancellationIfCurrentStateAllows(OrderEventAppendCommand command) {
+    public OrderEventAppendResult appendCancellationRequestIfCurrentStateAllows(
+            OrderEventAppendCommand command) {
         return commandTransactionTemplate.execute(status ->
-                appendCancellationIfCurrentStateAllowsInTransaction(command));
+                appendCancellationRequestIfCurrentStateAllowsInTransaction(command));
     }
 
-    public void assertCancellationAllowed(UUID orderId, UUID userId) {
-        commandTransactionTemplate.executeWithoutResult(status ->
-                assertCancellationAllowedInTransaction(orderId, userId));
+    public OrderEventAppendResult appendCancellationAcceptedIfReady(
+            OrderEventAppendCommand command,
+            UUID cancellationId,
+            int cancelledAmount) {
+        return consumerTransactionTemplate.execute(status ->
+                appendCancellationAcceptedIfReadyInTransaction(command, cancellationId, cancelledAmount));
     }
 
     public TradeExecutionAppendResult appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
@@ -622,28 +629,218 @@ public class OrderEventAppender {
         );
     }
 
-    private OrderEventAppendResult appendCancellationIfCurrentStateAllowsInTransaction(
+    private OrderEventAppendResult appendCancellationRequestIfCurrentStateAllowsInTransaction(
             OrderEventAppendCommand draftCommand) {
-        if (!(draftCommand.payload() instanceof OrderCancelledV1 cancelled)) {
-            throw new IllegalArgumentException("Cancellation command must contain OrderCancelledV1 payload");
+        if (!(draftCommand.payload() instanceof OrderCancellationRequestedV1 requested)) {
+            throw new IllegalArgumentException(
+                    "Cancellation request command must contain OrderCancellationRequestedV1 payload");
         }
-        assertCancellationAllowedInTransaction(draftCommand.aggregateId(), cancelled.userId());
-
+        OrderEventAppendResult existing = existingCancellationRequestResultIfPresent(
+                draftCommand, commandJdbc);
+        if (existing != null) {
+            return existing;
+        }
+        MatchingState state = assertCancellationAllowedInTransaction(
+                draftCommand.aggregateId(), requested.userId());
         StreamHead head = lockHead(commandJdbc, draftCommand.aggregateId());
-        OrderEventAppendCommand command = new OrderEventAppendCommand(
-                draftCommand.aggregateId(),
-                head.currentVersion(),
-                draftCommand.eventId(),
-                draftCommand.eventType(),
-                draftCommand.payload(),
-                draftCommand.metadata(),
-                draftCommand.schemaVersion(),
-                draftCommand.occurredAt(),
-                draftCommand.integrationEvent());
-        return appendInTransactionWithLockedHead(command, commandJdbc, head);
+        OrderEventAppendCommand command = withExpectedVersion(
+                withCancellationOriginalAmount(draftCommand, state.originalAmount()),
+                head.currentVersion());
+        return appendInTransactionWithLockedHead(
+                command, commandJdbc, alignHeadWithMatchingState(head, state));
     }
 
-    private void assertCancellationAllowedInTransaction(UUID orderId, UUID actorUserId) {
+    private OrderEventAppendCommand withCancellationOriginalAmount(
+            OrderEventAppendCommand command,
+            int originalAmount) {
+        if (!(command.payload() instanceof OrderCancellationRequestedV1 requested)
+                || command.integrationEvent() == null
+                || !(command.integrationEvent().payload() instanceof OrderCancellationRequestedEvent integration)) {
+            throw new IllegalArgumentException(
+                    "Cancellation request command must contain matching domain and integration events");
+        }
+        if (!Objects.equals(requested.cancellationId(), integration.getCancellationId())
+                || !Objects.equals(requested.orderId(), integration.getOrderId())
+                || !Objects.equals(requested.userId(), integration.getUserId())
+                || !Objects.equals(requested.requestedAt(), integration.getRequestedAt())) {
+            throw new IllegalArgumentException(
+                    "Cancellation domain and integration event identities must match");
+        }
+        OrderCancellationRequestedV1 enrichedRequest = new OrderCancellationRequestedV1(
+                requested.cancellationId(),
+                requested.orderId(),
+                requested.userId(),
+                originalAmount,
+                requested.requestedAt());
+        OrderCancellationRequestedEvent enrichedIntegration = OrderCancellationRequestedEvent.builder()
+                .cancellationId(integration.getCancellationId())
+                .orderId(integration.getOrderId())
+                .userId(integration.getUserId())
+                .originalAmount(originalAmount)
+                .requestedAt(integration.getRequestedAt())
+                .build();
+        return new OrderEventAppendCommand(
+                command.aggregateId(),
+                command.expectedVersion(),
+                command.eventId(),
+                command.eventType(),
+                enrichedRequest,
+                command.metadata(),
+                command.schemaVersion(),
+                command.occurredAt(),
+                new OrderIntegrationEvent(
+                        command.integrationEvent().exchange(),
+                        command.integrationEvent().routingKey(),
+                        enrichedIntegration));
+    }
+
+    private OrderEventAppendResult appendCancellationAcceptedIfReadyInTransaction(
+            OrderEventAppendCommand draftCommand,
+            UUID cancellationId,
+            int cancelledAmount) {
+        if (!(draftCommand.payload() instanceof OrderCancelledV1 cancelled)) {
+            throw new IllegalArgumentException(
+                    "Accepted cancellation command must contain OrderCancelledV1 payload");
+        }
+        if (cancelledAmount <= 0) {
+            throw new IllegalArgumentException("Accepted cancellation amount must be positive");
+        }
+        assertCancellationRequestMatches(draftCommand, cancelled, cancellationId);
+        OrderEventAppendResult existing = existingResultIfPresent(draftCommand, consumerJdbc);
+        if (existing != null) {
+            return existing;
+        }
+
+        MatchingState state = lockMatchingState(consumerJdbc, draftCommand.aggregateId());
+        if (state == null) {
+            state = lockStreamHeadAsMatchingState(consumerJdbc, draftCommand.aggregateId());
+        }
+        if (state == null) {
+            throw new CancellationPrerequisiteNotReadyException(
+                    "Order command state is not ready for cancellation: orderId=" + draftCommand.aggregateId());
+        }
+        if (!cancelled.userId().equals(state.userId())) {
+            throw new IllegalStateException("Cancellation result user does not own Order state: orderId="
+                    + draftCommand.aggregateId());
+        }
+        if (state.remainingAmount() > cancelledAmount) {
+            throw new CancellationPrerequisiteNotReadyException(
+                    "Order is waiting for earlier TradeExecuted application before cancellation: orderId="
+                            + draftCommand.aggregateId() + ", currentRemaining=" + state.remainingAmount()
+                            + ", cancelledAmount=" + cancelledAmount);
+        }
+        if (state.remainingAmount() < cancelledAmount) {
+            throw new IllegalStateException("Cancellation amount exceeds current Order remainder: orderId="
+                    + draftCommand.aggregateId() + ", currentRemaining=" + state.remainingAmount()
+                    + ", cancelledAmount=" + cancelledAmount);
+        }
+        if (!state.canCancel()) {
+            throw new IllegalStateException("Cannot apply accepted cancellation in status " + state.status()
+                    + " for orderId=" + draftCommand.aggregateId());
+        }
+
+        StreamHead head = lockHead(consumerJdbc, draftCommand.aggregateId());
+        OrderEventAppendCommand command = withExpectedVersion(draftCommand, head.currentVersion());
+        return appendInTransactionWithLockedHead(
+                command, consumerJdbc, alignHeadWithMatchingState(head, state));
+    }
+
+    private void assertCancellationRequestMatches(
+            OrderEventAppendCommand resultCommand,
+            OrderCancelledV1 cancelled,
+            UUID cancellationId) {
+        if (cancellationId == null) {
+            throw new IllegalArgumentException("Cancellation result requires cancellationId");
+        }
+        ExistingEvent requestEvent = findByEventId(consumerJdbc, cancellationId);
+        if (requestEvent == null) {
+            throw new IllegalStateException("Cancellation result has no persisted request: cancellationId="
+                    + cancellationId + ", orderId=" + resultCommand.aggregateId());
+        }
+        if (!resultCommand.aggregateId().equals(requestEvent.aggregateId())
+                || !"OrderCancellationRequestedV1".equals(requestEvent.eventType())) {
+            throw new IllegalStateException("Cancellation result does not match the persisted request identity: "
+                    + cancellationId);
+        }
+        OrderCancellationRequestedV1 request = deserializeCancellationRequest(requestEvent.payloadCanonical());
+        if (!cancellationId.equals(request.cancellationId())
+                || !resultCommand.aggregateId().equals(request.orderId())
+                || !cancelled.userId().equals(request.userId())) {
+            throw new IllegalStateException("Cancellation result conflicts with the persisted request: "
+                    + cancellationId);
+        }
+    }
+
+    private OrderEventAppendCommand withExpectedVersion(
+            OrderEventAppendCommand command,
+            long expectedVersion) {
+        return new OrderEventAppendCommand(
+                command.aggregateId(),
+                expectedVersion,
+                command.eventId(),
+                command.eventType(),
+                command.payload(),
+                command.metadata(),
+                command.schemaVersion(),
+                command.occurredAt(),
+                command.integrationEvent());
+    }
+
+    private OrderEventAppendResult existingResultIfPresent(
+            OrderEventAppendCommand command,
+            NamedParameterJdbcTemplate jdbc) {
+        ExistingEvent existing = findByEventId(jdbc, command.eventId());
+        if (existing == null) {
+            return null;
+        }
+        return existingAppendResult(
+                command,
+                existing,
+                serialize(command.payload()),
+                serialize(command.metadata()));
+    }
+
+    private OrderEventAppendResult existingCancellationRequestResultIfPresent(
+            OrderEventAppendCommand command,
+            NamedParameterJdbcTemplate jdbc) {
+        ExistingEvent existing = findByEventId(jdbc, command.eventId());
+        if (existing == null) {
+            return null;
+        }
+        if (!command.aggregateId().equals(existing.aggregateId())
+                || !command.eventType().equals(existing.eventType())) {
+            throw new OrderEventIdentityConflictException(command.eventId());
+        }
+        if (!(command.payload() instanceof OrderCancellationRequestedV1 requested)) {
+            throw new IllegalArgumentException(
+                    "Cancellation request command must contain OrderCancellationRequestedV1 payload");
+        }
+        OrderCancellationRequestedV1 persisted = deserializeCancellationRequest(existing.payloadCanonical());
+        if (!requested.cancellationId().equals(persisted.cancellationId())
+                || !requested.orderId().equals(persisted.orderId())
+                || !requested.userId().equals(persisted.userId())) {
+            throw new IllegalArgumentException(
+                    "Cancellation request identity conflicts with the persisted request: orderId="
+                            + command.aggregateId());
+        }
+        return new OrderEventAppendResult(
+                existing.aggregateId(),
+                command.eventId(),
+                existing.aggregateVersion(),
+                existing.globalPosition(),
+                existing.hash(),
+                true);
+    }
+
+    private OrderCancellationRequestedV1 deserializeCancellationRequest(String payload) {
+        try {
+            return canonicalObjectMapper.readValue(payload, OrderCancellationRequestedV1.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot deserialize persisted cancellation request", e);
+        }
+    }
+
+    private MatchingState assertCancellationAllowedInTransaction(UUID orderId, UUID actorUserId) {
         MatchingState state = lockMatchingState(commandJdbc, orderId);
         if (state == null) {
             state = lockStreamHeadAsMatchingState(commandJdbc, orderId);
@@ -658,6 +855,16 @@ public class OrderEventAppender {
             throw new IllegalStateException("Cannot cancel order in status " + state.status()
                     + " with remainingAmount=" + state.remainingAmount());
         }
+        return state;
+    }
+
+    private StreamHead alignHeadWithMatchingState(StreamHead head, MatchingState state) {
+        return new StreamHead(
+                head.currentVersion(),
+                head.lastHash(),
+                state.userId(),
+                state.remainingAmount(),
+                state.status());
     }
 
     private TradeExecutionAppendResult appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsentInTransaction(
@@ -2189,6 +2396,10 @@ public class OrderEventAppender {
             int remainingAmount,
             int matchedAmount,
             String status) {
+
+        private int originalAmount() {
+            return Math.addExact(remainingAmount, matchedAmount);
+        }
 
         private boolean canMatch(int quantity) {
             return ("OPEN".equals(status) || "PARTIALLY_MATCHED".equals(status))
