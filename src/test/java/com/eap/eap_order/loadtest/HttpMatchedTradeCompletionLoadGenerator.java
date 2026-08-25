@@ -2223,7 +2223,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             Config common = config.common();
             System.out.println("{");
             System.out.println("  \"benchmarkSchemaVersion\": 2,");
-            String benchmarkContract = "external-vegeta".equals(config.httpDriverMode())
+            String benchmarkContract = config.httpDriverMode().startsWith("external-")
                     ? ExternalHttpMatchedManifest.CONTRACT
                     : "http-matched-steady-state-chain";
             System.out.printf("  \"benchmarkContract\": \"%s\",%n", benchmarkContract);
@@ -2237,7 +2237,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"measurementSeconds\": %d,%n", config.durationSeconds());
             System.out.printf("  \"targetTotalOrderTps\": %d,%n", config.targetOrderTps());
             System.out.printf("  \"httpDriverMode\": \"%s\",%n", config.httpDriverMode());
-            if ("external-vegeta".equals(config.httpDriverMode())) {
+            if (config.httpDriverMode().startsWith("external-")) {
                 System.out.println("  \"loadGeneratorMaxInFlight\": null,");
             } else {
                 System.out.printf("  \"loadGeneratorMaxInFlight\": %d,%n", common.maxInFlight());
@@ -2346,14 +2346,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         private final Path monitorOutputPath;
         private final Path monitorReadyPath;
         private final Path monitorStopPath;
-        private final Path vegetaResultsPath;
+        private final Path externalResultsPath;
 
         private ExternalSteadyStateRunner(String[] args) {
             this.args = args.clone();
             this.config = SteadyStateConfig.from(args);
-            if (!"external-vegeta".equals(config.httpDriverMode())) {
+            if (!"external-vegeta".equals(config.httpDriverMode())
+                    && !"external-k6".equals(config.httpDriverMode())) {
                 throw new IllegalArgumentException(
-                        "external lifecycle requires --http-driver-mode external-vegeta");
+                        "external lifecycle requires --http-driver-mode external-vegeta or external-k6");
             }
             this.base = new SteadyStateRunner(config);
             this.manifestPath = requiredPath("--manifest");
@@ -2361,7 +2362,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             this.monitorOutputPath = pathArg("--monitor-output", "");
             this.monitorReadyPath = pathArg("--monitor-ready", "");
             this.monitorStopPath = pathArg("--monitor-stop", "");
-            this.vegetaResultsPath = pathArg("--vegeta-results", "");
+            this.externalResultsPath = pathArg(
+                    "--external-results",
+                    SteadyStateConfig.stringArg(args, "--vegeta-results", ""));
         }
 
         private void prepare() throws Exception {
@@ -2397,7 +2400,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         common.events(),
                         config.arrivalPattern(),
                         config.workloadSeed());
-                writeVegetaTargets(orders);
+                writeExternalTargets(orders);
                 ExternalHttpMatchedManifest manifest = new ExternalHttpMatchedManifest(
                         ExternalHttpMatchedManifest.SCHEMA_VERSION,
                         ExternalHttpMatchedManifest.CONTRACT,
@@ -2467,17 +2470,17 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         }
 
         private void verify() throws Exception {
-            requirePath(vegetaResultsPath, "--vegeta-results");
+            requirePath(externalResultsPath, "--external-results");
             requirePath(targetsPath, "--targets");
             requirePath(monitorOutputPath, "--monitor-output");
             ExternalHttpMatchedManifest manifest = readManifest();
             validateManifest(manifest);
             if (!Files.isRegularFile(targetsPath)
                     || !manifest.targetsSha256().equals(sha256(targetsPath))) {
-                throw new IllegalStateException("prepared Vegeta target checksum does not match manifest");
+                throw new IllegalStateException("prepared HTTP target checksum does not match manifest");
             }
 
-            ExternalHttpResults externalResults = readVegetaResults(manifest);
+            ExternalHttpResults externalResults = readExternalResults(manifest);
             SteadyHttpCounters counters = externalResults.counters();
             List<SteadySample> samples = mergeMonitorSamples(externalResults);
             SteadyWindow steadyWindow = base.deriveSteadyWindow(samples);
@@ -2531,7 +2534,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             }
         }
 
-        private void writeVegetaTargets(List<PreparedHttpLoadDriver.PreparedOrder> orders)
+        private void writeExternalTargets(List<PreparedHttpLoadDriver.PreparedOrder> orders)
                 throws IOException {
             createParent(targetsPath);
             try (BufferedWriter writer = Files.newBufferedWriter(targetsPath, StandardCharsets.UTF_8)) {
@@ -2569,34 +2572,49 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             writer.flush();
         }
 
-        private ExternalHttpResults readVegetaResults(ExternalHttpMatchedManifest manifest)
+        private ExternalHttpResults readExternalResults(ExternalHttpMatchedManifest manifest)
                 throws IOException {
             SteadyHttpCounters counters = new SteadyHttpCounters();
             List<ExternalHttpResult> results = new ArrayList<>();
-            try (var reader = Files.newBufferedReader(vegetaResultsPath, StandardCharsets.UTF_8)) {
+            try (var reader = Files.newBufferedReader(externalResultsPath, StandardCharsets.UTF_8)) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     if (line.isBlank()) {
                         continue;
                     }
                     JsonNode result = objectMapper.readTree(line);
-                    String url = result.path("url").asText();
+                    boolean k6Result = "external-k6".equals(config.httpDriverMode());
+                    if (k6Result && (!"Point".equals(result.path("type").asText())
+                            || !"http_req_duration".equals(result.path("metric").asText()))) {
+                        continue;
+                    }
+                    JsonNode data = k6Result ? result.path("data") : result;
+                    JsonNode tags = data.path("tags");
+                    String url = k6Result ? tags.path("url").asText() : data.path("url").asText();
                     String side;
                     if (url.endsWith("/bid/buy")) {
                         side = "BUY";
                     } else if (url.endsWith("/bid/sell")) {
                         side = "SELL";
                     } else {
-                        throw new IOException("unexpected Vegeta target URL: " + url);
+                        throw new IOException("unexpected external HTTP target URL: " + url);
                     }
-                    int status = result.path("code").asInt();
-                    long latencyNanos = result.path("latency").asLong();
-                    long requestEpochNanos = epochNanos(result.path("timestamp").asText());
+                    int status = k6Result
+                            ? tags.path("status").asInt()
+                            : data.path("code").asInt();
+                    long latencyNanos = k6Result
+                            ? Math.max(0L, Math.round(data.path("value").asDouble() * 1_000_000.0))
+                            : data.path("latency").asLong();
+                    long recordedEpochNanos = epochNanos(
+                            k6Result ? data.path("time").asText() : data.path("timestamp").asText());
+                    long requestEpochNanos = k6Result
+                            ? Math.subtractExact(recordedEpochNanos, latencyNanos)
+                            : recordedEpochNanos;
                     counters.recordResponse(
                             side,
                             status,
                             latencyNanos,
-                            result.path("error").asText());
+                            k6Result ? tags.path("error").asText() : data.path("error").asText());
                     results.add(new ExternalHttpResult(
                             requestEpochNanos,
                             Math.addExact(requestEpochNanos, Math.max(0, latencyNanos)),
@@ -2609,11 +2627,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 counters.recordUnscheduled(Math.toIntExact(missing));
             } else if (missing < 0) {
                 for (long extra = 0; extra < -missing; extra++) {
-                    counters.recordResponse("UNKNOWN", 0, 0, "extra Vegeta result");
+                    counters.recordResponse("UNKNOWN", 0, 0, "extra external HTTP result");
                 }
             }
             if (results.isEmpty()) {
-                throw new IllegalStateException("Vegeta result file contains no requests");
+                throw new IllegalStateException("external HTTP result file contains no requests");
             }
             long first = results.get(0).requestEpochNanos();
             long lastCompletion = results.stream()
@@ -3864,9 +3882,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             String httpDriverMode = stringArg(args, "--http-driver-mode", "legacy-sync");
             if (!PreparedHttpLoadDriver.MODE.equals(httpDriverMode)
                     && !"legacy-sync".equals(httpDriverMode)
-                    && !"external-vegeta".equals(httpDriverMode)) {
+                    && !"external-vegeta".equals(httpDriverMode)
+                    && !"external-k6".equals(httpDriverMode)) {
                 throw new IllegalArgumentException(
-                        "--http-driver-mode must be prepared-sync, legacy-sync, or external-vegeta");
+                        "--http-driver-mode must be prepared-sync, legacy-sync, external-vegeta, or external-k6");
             }
             return new SteadyStateConfig(
                     common,
