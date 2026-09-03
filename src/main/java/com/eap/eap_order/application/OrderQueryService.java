@@ -16,14 +16,23 @@ import lombok.extern.slf4j.Slf4j;
 public class OrderQueryService {
 
     private static final String USER_ORDER_SELECT = """
-            SELECT order_id,
-                   price,
-                   CASE WHEN status = 'MATCHED' THEN matched_amount ELSE remaining_amount END AS display_amount,
-                   side,
-                   to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS update_time,
-                   status
-            FROM order_service.orders_current
-            WHERE user_id = ?
+            SELECT current_order.order_id,
+                   current_order.price,
+                   CASE WHEN COALESCE(matching.status, current_order.status) = 'MATCHED'
+                        THEN COALESCE(matching.matched_amount, current_order.matched_amount)
+                        ELSE COALESCE(matching.remaining_amount, current_order.remaining_amount)
+                   END AS display_amount,
+                   current_order.side,
+                   to_char(GREATEST(current_order.updated_at,
+                                    COALESCE(matching.updated_at, current_order.updated_at)),
+                           'YYYY-MM-DD HH24:MI:SS') AS update_time,
+                   COALESCE(matching.status, current_order.status) AS status,
+                   COALESCE(matching.asset_reservation_status,
+                            current_order.asset_reservation_status) AS asset_reservation_status
+            FROM order_service.orders_current current_order
+            LEFT JOIN order_service.order_matching_state matching
+                   ON matching.order_id = current_order.order_id
+            WHERE current_order.user_id = ?
             """;
 
     @Autowired
@@ -36,7 +45,7 @@ public class OrderQueryService {
      * Redis orderbook indexes are matching state, not the user-order read model.
      */
     public ListUserOrderRes getUserOrderList(String userId) {
-        return safeQuery(userId, "ORDER BY updated_at DESC", "user orders");
+        return safeQuery(userId, "ORDER BY update_time DESC", "user orders");
     }
 
     /**
@@ -44,8 +53,9 @@ public class OrderQueryService {
      */
     public ListUserOrderRes getUserPendingOrders(String userId) {
         return safeQuery(userId, """
-                AND status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
-                ORDER BY updated_at DESC
+                AND COALESCE(matching.status, current_order.status)
+                    IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                ORDER BY update_time DESC
                 """, "user pending orders");
     }
 
@@ -54,8 +64,8 @@ public class OrderQueryService {
      */
     public ListUserOrderRes getUserMatchedOrders(String userId) {
         return safeQuery(userId, """
-                AND status = 'MATCHED'
-                ORDER BY updated_at DESC
+                AND COALESCE(matching.status, current_order.status) = 'MATCHED'
+                ORDER BY update_time DESC
                 """, "user matched orders");
     }
 
@@ -82,6 +92,7 @@ public class OrderQueryService {
                         .type(rs.getString("side"))
                         .updateTime(rs.getString("update_time"))
                         .status(rs.getString("status"))
+                        .assetReservationStatus(rs.getString("asset_reservation_status"))
                         .build(),
                 userUuid);
     }

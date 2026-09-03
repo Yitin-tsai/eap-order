@@ -3,7 +3,9 @@ package com.eap.eap_order.eventstore;
 import com.eap.common.event.OrderSubmittedEvent;
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
-import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationAcceptedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationCompletedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import org.junit.jupiter.api.AfterEach;
@@ -475,7 +477,7 @@ class OrderEventAppenderPostgresIT {
     }
 
     @Test
-    void appendCancellationAcceptedIfReady_exactRemainderShouldCancel() {
+    void appendCancellationAcceptedIfReady_exactRemainderShouldWaitForWalletRelease() {
         UUID aggregateId = aggregateId();
         UUID userId = UUID.randomUUID();
         seedStreamHead(aggregateId, 2, userId, "OPEN", 10);
@@ -485,13 +487,23 @@ class OrderEventAppenderPostgresIT {
         appender.appendCancellationRequestIfCurrentStateAllows(request);
 
         OrderEventAppendResult result = appender.appendCancellationAcceptedIfReady(
-                cancellationAcceptedCommand(aggregateId, userId, LocalDateTime.now()),
+                cancellationAcceptedCommand(aggregateId, userId, request.eventId(), LocalDateTime.now()),
                 request.eventId(),
                 6);
 
         assertFalse(result.duplicate());
         assertEquals(4, result.aggregateVersion());
-        assertMatchingState(aggregateId, 6, 4, "CANCELLED");
+        assertMatchingState(aggregateId, 6, 4, "CANCELLING");
+        assertStreamHeadState(aggregateId, 6, "CANCELLING");
+
+        OrderEventAppendResult completed = appender.appendCancellationCompletedIfReady(
+                cancellationCompletedCommand(aggregateId, userId, request.eventId(), LocalDateTime.now()),
+                request.eventId(),
+                6);
+
+        assertFalse(completed.duplicate());
+        assertEquals(5, completed.aggregateVersion());
+        assertMatchingState(aggregateId, 6, 4, "CANCELLED", "RELEASED");
         assertStreamHeadState(aggregateId, 6, "CANCELLED");
     }
 
@@ -507,7 +519,7 @@ class OrderEventAppenderPostgresIT {
 
         assertThrows(CancellationPrerequisiteNotReadyException.class, () ->
                 appender.appendCancellationAcceptedIfReady(
-                        cancellationAcceptedCommand(aggregateId, userId, LocalDateTime.now()),
+                        cancellationAcceptedCommand(aggregateId, userId, request.eventId(), LocalDateTime.now()),
                         request.eventId(),
                         6));
 
@@ -522,10 +534,12 @@ class OrderEventAppenderPostgresIT {
         seedStreamHead(aggregateId, 2, userId, "OPEN", 6);
         seedMatchingState(aggregateId, userId, "OPEN", 6);
 
+        UUID missingCancellationId = UUID.randomUUID();
         assertThrows(IllegalStateException.class, () ->
                 appender.appendCancellationAcceptedIfReady(
-                        cancellationAcceptedCommand(aggregateId, userId, LocalDateTime.now()),
-                        UUID.randomUUID(),
+                        cancellationAcceptedCommand(
+                                aggregateId, userId, missingCancellationId, LocalDateTime.now()),
+                        missingCancellationId,
                         6));
 
         assertEquals(0, count("order_event_store", aggregateId));
@@ -563,6 +577,70 @@ class OrderEventAppenderPostgresIT {
         assertEquals(2L, currentVersion(sellerOrderId));
         assertMatchingState(buyerOrderId, 6, 4, "PARTIALLY_MATCHED");
         assertMatchingState(sellerOrderId, 6, 4, "PARTIALLY_MATCHED");
+    }
+
+    @Test
+    void appendTradeBeforeReservationConfirmation_lateConfirmationShouldNotRegressExecutionState() {
+        UUID buyerOrderId = aggregateId();
+        UUID sellerOrderId = aggregateId();
+        UUID buyerUserId = UUID.randomUUID();
+        UUID sellerUserId = UUID.randomUUID();
+        appendInitialSubmission(buyerOrderId, buyerUserId, 10);
+        appendInitialSubmission(sellerOrderId, sellerUserId, 10);
+        LocalDateTime appliedAt = LocalDateTime.now();
+
+        OrderEventAppender.TradeExecutionAppendResult tradeResult =
+                appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
+                        matchedCommandWithoutOutbox(buyerOrderId, "trade-before-confirmation"),
+                        4,
+                        matchedCommandWithoutOutbox(sellerOrderId, "trade-before-confirmation"),
+                        4,
+                        tradeApplication("trade-before-confirmation", buyerOrderId, sellerOrderId, 4, appliedAt));
+
+        assertEquals(APPLIED, tradeResult.status());
+        assertMatchingState(buyerOrderId, 6, 4, "PARTIALLY_MATCHED", "SUCCEEDED");
+        assertMatchingState(sellerOrderId, 6, 4, "PARTIALLY_MATCHED", "SUCCEEDED");
+
+        appender.appendFromConsumer(assetReservationConfirmedCommand(buyerOrderId, buyerUserId));
+        appender.appendFromConsumer(assetReservationConfirmedCommand(sellerOrderId, sellerUserId));
+
+        assertEquals(2L, currentVersion(buyerOrderId));
+        assertEquals(2L, currentVersion(sellerOrderId));
+        assertMatchingState(buyerOrderId, 6, 4, "PARTIALLY_MATCHED", "SUCCEEDED");
+        assertMatchingState(sellerOrderId, 6, 4, "PARTIALLY_MATCHED", "SUCCEEDED");
+        assertStreamHeadState(buyerOrderId, 6, "PARTIALLY_MATCHED");
+        assertStreamHeadState(sellerOrderId, 6, "PARTIALLY_MATCHED");
+    }
+
+    @Test
+    void appendReservationFailureAfterTrade_shouldRejectContradictionWithoutRegressingState() {
+        UUID buyerOrderId = aggregateId();
+        UUID sellerOrderId = aggregateId();
+        UUID buyerUserId = UUID.randomUUID();
+        UUID sellerUserId = UUID.randomUUID();
+        appendInitialSubmission(buyerOrderId, buyerUserId, 10);
+        appendInitialSubmission(sellerOrderId, sellerUserId, 10);
+        appender.appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
+                matchedCommandWithoutOutbox(buyerOrderId, "trade-before-rejection"),
+                4,
+                matchedCommandWithoutOutbox(sellerOrderId, "trade-before-rejection"),
+                4,
+                tradeApplication("trade-before-rejection", buyerOrderId, sellerOrderId, 4, LocalDateTime.now()));
+        OrderEventAppendCommand rejection = command(
+                buyerOrderId,
+                1,
+                UUID.nameUUIDFromBytes((buyerOrderId + ":REJECTED").getBytes(StandardCharsets.UTF_8)),
+                "OrderAssetReservationFailedV1",
+                new OrderAssetReservationFailedV1(
+                        buyerOrderId, buyerUserId, "contradictory", "TEST", LocalDateTime.now()),
+                null);
+
+        assertThrows(AssetReservationResultContradictionException.class,
+                () -> appender.appendFromConsumer(rejection));
+
+        assertEquals(1L, currentVersion(buyerOrderId));
+        assertEquals(1, count("order_event_store", buyerOrderId));
+        assertMatchingState(buyerOrderId, 6, 4, "PARTIALLY_MATCHED", "SUCCEEDED");
     }
 
     @Test
@@ -838,17 +916,40 @@ class OrderEventAppenderPostgresIT {
     private OrderEventAppendCommand cancellationAcceptedCommand(
             UUID aggregateId,
             UUID userId,
+            UUID cancellationId,
             LocalDateTime cancelledAt) {
         return new OrderEventAppendCommand(
                 aggregateId,
                 0,
                 UUID.nameUUIDFromBytes(
                         (aggregateId + ":CANCELLATION_ACCEPTED").getBytes(StandardCharsets.UTF_8)),
-                "OrderCancelledV1",
-                new OrderCancelledV1(aggregateId, userId, cancelledAt),
+                "OrderCancellationAcceptedV1",
+                new OrderCancellationAcceptedV1(
+                        cancellationId,
+                        aggregateId, userId, 6, cancelledAt),
                 Map.of("correlationId", aggregateId.toString(), "userId", userId.toString()),
                 1,
                 cancelledAt,
+                null);
+    }
+
+    private OrderEventAppendCommand cancellationCompletedCommand(
+            UUID aggregateId,
+            UUID userId,
+            UUID cancellationId,
+            LocalDateTime completedAt) {
+        return new OrderEventAppendCommand(
+                aggregateId,
+                0,
+                UUID.nameUUIDFromBytes(
+                        (aggregateId + ":ASSET_RESERVATION_RELEASED:" + cancellationId)
+                                .getBytes(StandardCharsets.UTF_8)),
+                "OrderCancellationCompletedV1",
+                new OrderCancellationCompletedV1(
+                        cancellationId, aggregateId, userId, 6, completedAt),
+                Map.of("correlationId", cancellationId.toString(), "userId", userId.toString()),
+                1,
+                completedAt,
                 null);
     }
 
@@ -892,8 +993,9 @@ class OrderEventAppenderPostgresIT {
     private void seedMatchingState(UUID aggregateId, UUID userId, String status, int remainingAmount) {
         jdbc.update("""
                 INSERT INTO order_service.order_matching_state
-                    (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (order_id, user_id, remaining_amount, matched_amount, status,
+                     asset_reservation_status, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'SUCCEEDED', CURRENT_TIMESTAMP)
                 """, aggregateId, userId, remainingAmount, 10 - remainingAmount, status);
     }
 
@@ -901,9 +1003,9 @@ class OrderEventAppenderPostgresIT {
         jdbc.update("""
                 INSERT INTO order_service.orders_current
                     (order_id, user_id, market_id, market_sequence, side, price,
-                     original_amount, remaining_amount, matched_amount, status,
+                     original_amount, remaining_amount, matched_amount, status, asset_reservation_status,
                      aggregate_version, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SUCCEEDED', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, aggregateId, userId, "TEST-MARKET", 1L, "BUY", 20,
                 10, remainingAmount, 10 - remainingAmount, status, version);
     }
@@ -933,14 +1035,24 @@ class OrderEventAppenderPostgresIT {
     }
 
     private void assertMatchingState(UUID orderId, int remainingAmount, int matchedAmount, String status) {
+        assertMatchingState(orderId, remainingAmount, matchedAmount, status, "SUCCEEDED");
+    }
+
+    private void assertMatchingState(
+            UUID orderId,
+            int remainingAmount,
+            int matchedAmount,
+            String status,
+            String assetReservationStatus) {
         Map<String, Object> row = jdbc.queryForMap("""
-                SELECT remaining_amount, matched_amount, status
+                SELECT remaining_amount, matched_amount, status, asset_reservation_status
                 FROM order_service.order_matching_state
                 WHERE order_id = ?
                 """, orderId);
         assertEquals(remainingAmount, ((Number) row.get("remaining_amount")).intValue());
         assertEquals(matchedAmount, ((Number) row.get("matched_amount")).intValue());
         assertEquals(status, row.get("status"));
+        assertEquals(assetReservationStatus, row.get("asset_reservation_status"));
     }
 
     private void assertStreamHeadState(UUID orderId, int remainingAmount, String status) {

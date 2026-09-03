@@ -39,10 +39,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_SUBMITTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_CANCELLATION_RESULT_QUEUE;
@@ -54,13 +54,14 @@ public class OrderHttpLoadGenerator {
     private static final String DEFAULT_MATCH_ENGINE_URL = "http://localhost:8082/match-engine";
     private static final String DEFAULT_ORDER_JDBC_URL = "jdbc:postgresql://localhost:15432/eap_order_db";
     private static final String DEFAULT_WALLET_JDBC_URL = "jdbc:postgresql://localhost:15433/eap_wallet_db";
+    private static final String DEFAULT_MATCH_JDBC_URL = "jdbc:postgresql://localhost:15434/eap_match_db";
     private static final String DEFAULT_RABBIT_MANAGEMENT_URL = "http://localhost:15672";
     private static final String ORDER_SUBMITTED_EVENT_STORE_RELAY = "order_submitted_event_store_relay";
     private static final List<String> ORDER_ADMISSION_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
-            ORDER_ORDER_CONFIRMED_QUEUE,
+            ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             ORDER_ORDER_FAILED_QUEUE,
-            MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
+            MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE,
             ORDER_ORDER_CANCELLATION_RESULT_QUEUE,
             WALLET_ORDER_CANCELLATION_RESULT_QUEUE,
@@ -394,7 +395,8 @@ public class OrderHttpLoadGenerator {
                 ? readTimerMetric(config, httpClient, config.walletUrl(), "eap_wallet_outbox_batch_duration", "")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot matchListener = config.orderAdmissionGate()
-                ? readTimerMetric(config, httpClient, config.matchEngineUrl(), "match_engine_order_confirmed_listener_duration", "")
+                ? readTimerMetric(config, httpClient, config.matchEngineUrl(),
+                        "match_engine_asset_reservation_succeeded_listener_duration", "")
                 : PrometheusTimerSnapshot.empty();
         PrometheusTimerSnapshot matchTryMatch = config.orderAdmissionGate()
                 ? readTimerMetric(config, httpClient, config.matchEngineUrl(), "match_engine_try_match_duration", "")
@@ -452,6 +454,13 @@ public class OrderHttpLoadGenerator {
                 admission.assetReservationConfirmedRows() / Math.max(admission.assetReservationConfirmedReachedSeconds(), 0.001));
         System.out.printf("  \"orderAssetReservationConfirmedLagSeconds\": %.2f,%n",
                 positiveDelta(admission.assetReservationConfirmedReachedSeconds(), admission.walletOrderSubmissionClaimReachedSeconds()));
+        System.out.printf("  \"matchAdmissionInboxRows\": %d,%n", admission.matchAdmissionInboxRows());
+        System.out.printf("  \"matchAdmissionInboxAppliedRows\": %d,%n",
+                admission.matchAdmissionInboxAppliedRows());
+        System.out.printf("  \"matchAdmissionInboxNonAppliedRows\": %d,%n",
+                admission.matchAdmissionInboxNonAppliedRows());
+        System.out.printf("  \"matchAdmissionInboxAppliedReachedSeconds\": %.2f,%n",
+                admission.matchAdmissionInboxAppliedReachedSeconds());
         System.out.printf("  \"matchEngineOrderbookAdmissionCount\": %d,%n", admission.orderbookAdmissionCount());
         System.out.printf("  \"matchEngineOrderbookAdmissionReachedSeconds\": %.2f,%n", admission.orderbookAdmissionReachedSeconds());
         System.out.printf("  \"matchEngineOrderbookAdmissionTps\": %.2f,%n",
@@ -668,9 +677,9 @@ public class OrderHttpLoadGenerator {
         System.out.printf("  \"walletOutboxBatchCount\": %.0f,%n", walletOutboxBatch.count());
         System.out.printf("  \"walletOutboxBatchSumSeconds\": %.6f,%n", walletOutboxBatch.sumSeconds());
         System.out.printf("  \"walletOutboxBatchMeanMs\": %.3f,%n", walletOutboxBatch.meanMillis());
-        System.out.printf("  \"matchEngineOrderConfirmedListenerCount\": %.0f,%n", matchListener.count());
-        System.out.printf("  \"matchEngineOrderConfirmedListenerSumSeconds\": %.6f,%n", matchListener.sumSeconds());
-        System.out.printf("  \"matchEngineOrderConfirmedListenerMeanMs\": %.3f,%n", matchListener.meanMillis());
+        System.out.printf("  \"matchEngineOrderAssetReservationSucceededListenerCount\": %.0f,%n", matchListener.count());
+        System.out.printf("  \"matchEngineOrderAssetReservationSucceededListenerSumSeconds\": %.6f,%n", matchListener.sumSeconds());
+        System.out.printf("  \"matchEngineOrderAssetReservationSucceededListenerMeanMs\": %.3f,%n", matchListener.meanMillis());
         System.out.printf("  \"matchEngineTryMatchCount\": %.0f,%n", matchTryMatch.count());
         System.out.printf("  \"matchEngineTryMatchSumSeconds\": %.6f,%n", matchTryMatch.sumSeconds());
         System.out.printf("  \"matchEngineTryMatchMeanMs\": %.3f,%n", matchTryMatch.meanMillis());
@@ -707,6 +716,7 @@ public class OrderHttpLoadGenerator {
         purgeQueues(config, httpClient, objectMapper);
         truncateOrderAdmissionOrderData(config);
         truncateOrderAdmissionWalletData(config);
+        truncateOrderAdmissionMatchData(config);
         purgeQueues(config, httpClient, objectMapper);
         if (config.flushRedisOnReset()) {
             redisCommand(config, command("FLUSHDB"));
@@ -766,6 +776,21 @@ public class OrderHttpLoadGenerator {
         }
     }
 
+    private static void truncateOrderAdmissionMatchData(Config config) throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                config.matchJdbcUrl(), config.matchJdbcUser(), config.matchJdbcPassword());
+             PreparedStatement statement = connection.prepareStatement("""
+                     DO $$
+                     BEGIN
+                         IF to_regclass('match_engine.order_admission_inbox') IS NOT NULL THEN
+                             TRUNCATE TABLE match_engine.order_admission_inbox RESTART IDENTITY CASCADE;
+                         END IF;
+                     END $$;
+                     """)) {
+            statement.execute();
+        }
+    }
+
     private static void purgeQueues(Config config, HttpClient httpClient, ObjectMapper objectMapper) {
         for (String queue : ORDER_ADMISSION_QUEUES) {
             purgeQueue(config, httpClient, queue);
@@ -808,6 +833,9 @@ public class OrderHttpLoadGenerator {
         long orderSubmittedPublicationRows = 0;
         long walletOrderSubmissionClaimRows = 0;
         long assetReservationConfirmedRows = 0;
+        long matchAdmissionInboxRows = 0;
+        long matchAdmissionInboxAppliedRows = 0;
+        long matchAdmissionInboxNonAppliedRows = 0;
         long orderbookAdmissionCount = 0;
         long finalQueueBacklog = Long.MAX_VALUE;
         long queueMetricsReadFailures = 0;
@@ -824,6 +852,7 @@ public class OrderHttpLoadGenerator {
         double orderSubmittedPublicationReachedSeconds = 0;
         double walletOrderSubmissionClaimReachedSeconds = 0;
         double assetReservationConfirmedReachedSeconds = 0;
+        double matchAdmissionInboxAppliedReachedSeconds = 0;
         double orderbookAdmissionReachedSeconds = 0;
         double queueDrainReachedSeconds = 0;
         while (System.nanoTime() < deadlineNanos) {
@@ -855,6 +884,15 @@ public class OrderHttpLoadGenerator {
             if (assetReservationConfirmedRows == config.events() && assetReservationConfirmedReachedSeconds == 0) {
                 assetReservationConfirmedReachedSeconds = elapsedSince(startedAtNanos);
             }
+            MatchAdmissionInboxSnapshot matchInbox = countMatchAdmissionInbox(config, orderIds);
+            matchAdmissionInboxRows = matchInbox.rows();
+            matchAdmissionInboxAppliedRows = matchInbox.appliedRows();
+            matchAdmissionInboxNonAppliedRows = matchInbox.nonAppliedRows();
+            if (matchAdmissionInboxAppliedRows == config.events()
+                    && matchAdmissionInboxNonAppliedRows == 0
+                    && matchAdmissionInboxAppliedReachedSeconds == 0) {
+                matchAdmissionInboxAppliedReachedSeconds = elapsedSince(startedAtNanos);
+            }
             orderbookAdmissionCount = redisZcard(config, orderbookKey(config.marketId(), config.side().toLowerCase(Locale.ROOT)));
             if (orderbookAdmissionCount == config.events() && orderbookAdmissionReachedSeconds == 0) {
                 orderbookAdmissionReachedSeconds = elapsedSince(startedAtNanos);
@@ -879,6 +917,9 @@ public class OrderHttpLoadGenerator {
                     && orderSubmittedPublicationRows == config.events()
                     && walletOrderSubmissionClaimRows == config.events()
                     && assetReservationConfirmedRows == config.events()
+                    && matchAdmissionInboxRows == config.events()
+                    && matchAdmissionInboxAppliedRows == config.events()
+                    && matchAdmissionInboxNonAppliedRows == 0
                     && orderbookAdmissionCount == config.events();
             if (durableFactsReached
                     && finalQueueBacklog == 0
@@ -901,6 +942,9 @@ public class OrderHttpLoadGenerator {
                 orderSubmittedPublicationRows,
                 walletOrderSubmissionClaimRows,
                 assetReservationConfirmedRows,
+                matchAdmissionInboxRows,
+                matchAdmissionInboxAppliedRows,
+                matchAdmissionInboxNonAppliedRows,
                 orderbookAdmissionCount,
                 finalQueueBacklog,
                 queueMetricsReadFailures,
@@ -910,6 +954,7 @@ public class OrderHttpLoadGenerator {
                 orderSubmittedPublicationReachedSeconds,
                 walletOrderSubmissionClaimReachedSeconds,
                 assetReservationConfirmedReachedSeconds,
+                matchAdmissionInboxAppliedReachedSeconds,
                 orderbookAdmissionReachedSeconds,
                 queueDrainReachedSeconds,
                 lastNonZeroQueues,
@@ -1001,6 +1046,35 @@ public class OrderHttpLoadGenerator {
             statement.setArray(1, sqlArray);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next() ? resultSet.getLong(1) : 0;
+            } finally {
+                sqlArray.free();
+            }
+        }
+    }
+
+    private static MatchAdmissionInboxSnapshot countMatchAdmissionInbox(
+            Config config,
+            List<UUID> orderIds) throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                config.matchJdbcUrl(), config.matchJdbcUser(), config.matchJdbcPassword());
+             PreparedStatement statement = connection.prepareStatement("""
+                     SELECT count(*) AS rows,
+                            count(*) FILTER (WHERE status = 'APPLIED') AS applied_rows,
+                            count(*) FILTER (WHERE status != 'APPLIED') AS non_applied_rows
+                     FROM match_engine.order_admission_inbox
+                     WHERE order_id = ANY(?)
+                     """)) {
+            UUID[] uuidArray = orderIds.toArray(UUID[]::new);
+            Array sqlArray = connection.createArrayOf("uuid", uuidArray);
+            statement.setArray(1, sqlArray);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return new MatchAdmissionInboxSnapshot(0, 0, 0);
+                }
+                return new MatchAdmissionInboxSnapshot(
+                        resultSet.getLong("rows"),
+                        resultSet.getLong("applied_rows"),
+                        resultSet.getLong("non_applied_rows"));
             } finally {
                 sqlArray.free();
             }
@@ -1366,6 +1440,15 @@ public class OrderHttpLoadGenerator {
         if (admission.assetReservationConfirmedRows() != config.events()) {
             reasons.add("order_asset_reservation_confirmed_not_equal_events");
         }
+        if (admission.matchAdmissionInboxRows() != config.events()) {
+            reasons.add("match_admission_inbox_rows_not_equal_events");
+        }
+        if (admission.matchAdmissionInboxAppliedRows() != config.events()) {
+            reasons.add("match_admission_inbox_applied_not_equal_events");
+        }
+        if (admission.matchAdmissionInboxNonAppliedRows() != 0) {
+            reasons.add("match_admission_inbox_debt_not_zero");
+        }
         if (admission.orderbookAdmissionCount() != config.events()) {
             reasons.add("match_engine_orderbook_admission_not_equal_events");
         }
@@ -1469,6 +1552,9 @@ public class OrderHttpLoadGenerator {
             long orderSubmittedPublicationRows,
             long walletOrderSubmissionClaimRows,
             long assetReservationConfirmedRows,
+            long matchAdmissionInboxRows,
+            long matchAdmissionInboxAppliedRows,
+            long matchAdmissionInboxNonAppliedRows,
             long orderbookAdmissionCount,
             long finalQueueBacklog,
             long queueMetricsReadFailures,
@@ -1478,6 +1564,7 @@ public class OrderHttpLoadGenerator {
             double orderSubmittedPublicationReachedSeconds,
             double walletOrderSubmissionClaimReachedSeconds,
             double assetReservationConfirmedReachedSeconds,
+            double matchAdmissionInboxAppliedReachedSeconds,
             double orderbookAdmissionReachedSeconds,
             double queueDrainReachedSeconds,
             String lastNonZeroQueues,
@@ -1487,10 +1574,16 @@ public class OrderHttpLoadGenerator {
             double elapsedSeconds) {
         static AdmissionSnapshot disabled(double elapsedSeconds) {
             return new AdmissionSnapshot(
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0,
                     "", 0, List.of(), Map.of(), elapsedSeconds);
         }
+    }
+
+    private record MatchAdmissionInboxSnapshot(
+            long rows,
+            long appliedRows,
+            long nonAppliedRows) {
     }
 
     private record Config(
@@ -1518,6 +1611,9 @@ public class OrderHttpLoadGenerator {
             String walletJdbcUrl,
             String walletJdbcUser,
             String walletJdbcPassword,
+            String matchJdbcUrl,
+            String matchJdbcUser,
+            String matchJdbcPassword,
             String redisHost,
             int redisPort,
             String rabbitManagementUrl,
@@ -1561,6 +1657,9 @@ public class OrderHttpLoadGenerator {
                     stringArg(args, "--wallet-jdbc-url", DEFAULT_WALLET_JDBC_URL),
                     stringArg(args, "--wallet-jdbc-user", "admin"),
                     stringArg(args, "--wallet-jdbc-password", "admin123"),
+                    stringArg(args, "--match-jdbc-url", DEFAULT_MATCH_JDBC_URL),
+                    stringArg(args, "--match-jdbc-user", "admin"),
+                    stringArg(args, "--match-jdbc-password", "admin123"),
                     stringArg(args, "--redis-host", "localhost"),
                     intArg(args, "--redis-port", 6379),
                     stringArg(args, "--rabbit-management-url", DEFAULT_RABBIT_MANAGEMENT_URL),

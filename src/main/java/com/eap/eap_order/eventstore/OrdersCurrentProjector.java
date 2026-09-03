@@ -133,12 +133,14 @@ public class OrdersCurrentProjector {
             switch (event.eventType()) {
                 case "OrderSubmissionRequestedV1" -> applyRequested(
                         event, objectMapper.readValue(event.payload(), OrderSubmissionRequestedV1.class));
-                case "OrderAssetReservationConfirmedV1" -> updateStatus(event, "OPEN");
-                case "OrderAssetReservationFailedV1" -> updateStatus(event, "REJECTED");
+                case "OrderAssetReservationConfirmedV1" -> applyAssetReservationConfirmed(event);
+                case "OrderAssetReservationFailedV1" -> applyAssetReservationFailed(event);
                 case "OrderMatchedV1" -> applyMatched(
                         event, objectMapper.readValue(event.payload(), OrderMatchedV1.class));
                 case "OrderCancellationRequestedV1" -> advanceVersion(event);
-                case "OrderCancelledV1" -> updateStatus(event, "CANCELLED");
+                case "OrderCancellationAcceptedV1" -> updateStatus(event, "CANCELLING");
+                case "OrderCancellationCompletedV1" -> applyCancellationCompleted(event);
+                case "OrderCancelledV1" -> applyCancellationCompleted(event);
                 default -> throw new IllegalArgumentException("Unsupported projection event: " + event.eventType());
             }
         } catch (Exception e) {
@@ -151,9 +153,9 @@ public class OrdersCurrentProjector {
         int inserted = jdbc.update("""
                 INSERT INTO order_service.orders_current
                     (order_id, user_id, market_id, market_sequence, side, price,
-                     original_amount, remaining_amount, matched_amount, status,
+                     original_amount, remaining_amount, matched_amount, status, asset_reservation_status,
                      aggregate_version, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'PENDING_ASSET_CHECK', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'PENDING_ASSET_CHECK', 'PENDING', ?, ?, ?)
                 ON CONFLICT (order_id) DO NOTHING
                 """, requested.orderId(), requested.userId(), requested.marketId(),
                 requested.marketSequence(), requested.side(), requested.price(),
@@ -171,6 +173,39 @@ public class OrdersCurrentProjector {
         ensureAppliedOrAlreadyProjected(event, updated);
     }
 
+    private void applyAssetReservationConfirmed(ProjectionEvent event) {
+        int updated = jdbc.update("""
+                UPDATE order_service.orders_current
+                SET asset_reservation_status = 'SUCCEEDED',
+                    status = CASE WHEN status = 'PENDING_ASSET_CHECK' THEN 'OPEN' ELSE status END,
+                    aggregate_version = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = ? AND aggregate_version = ?
+                """, event.aggregateVersion(), event.aggregateId(), event.aggregateVersion() - 1);
+        ensureAppliedOrAlreadyProjected(event, updated);
+    }
+
+    private void applyAssetReservationFailed(ProjectionEvent event) {
+        int updated = jdbc.update("""
+                UPDATE order_service.orders_current
+                SET asset_reservation_status = 'REJECTED',
+                    status = 'REJECTED',
+                    aggregate_version = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = ? AND aggregate_version = ?
+                """, event.aggregateVersion(), event.aggregateId(), event.aggregateVersion() - 1);
+        ensureAppliedOrAlreadyProjected(event, updated);
+    }
+
+    private void applyCancellationCompleted(ProjectionEvent event) {
+        int updated = jdbc.update("""
+                UPDATE order_service.orders_current
+                SET asset_reservation_status = 'RELEASED',
+                    status = 'CANCELLED',
+                    aggregate_version = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE order_id = ? AND aggregate_version = ?
+                """, event.aggregateVersion(), event.aggregateId(), event.aggregateVersion() - 1);
+        ensureAppliedOrAlreadyProjected(event, updated);
+    }
+
     private void advanceVersion(ProjectionEvent event) {
         int updated = jdbc.update("""
                 UPDATE order_service.orders_current
@@ -185,6 +220,7 @@ public class OrdersCurrentProjector {
                 UPDATE order_service.orders_current
                 SET matched_amount = matched_amount + ?,
                     remaining_amount = remaining_amount - ?,
+                    asset_reservation_status = 'SUCCEEDED',
                     status = CASE WHEN remaining_amount - ? = 0 THEN 'MATCHED'
                                   ELSE 'PARTIALLY_MATCHED' END,
                     aggregate_version = ?, updated_at = CURRENT_TIMESTAMP
@@ -255,14 +291,15 @@ public class OrdersCurrentProjector {
                                 requested.amount(),
                                 0,
                                 "PENDING_ASSET_CHECK",
+                                "PENDING",
                                 event.aggregateVersion(),
                                 requested.createdAt());
                     }
                     case "OrderAssetReservationConfirmedV1" -> {
-                        snapshot = requireSnapshot(failedEvent, snapshot).withStatus("OPEN", event.aggregateVersion());
+                        snapshot = requireSnapshot(failedEvent, snapshot).withReservationConfirmed(event.aggregateVersion());
                     }
                     case "OrderAssetReservationFailedV1" -> {
-                        snapshot = requireSnapshot(failedEvent, snapshot).withStatus("REJECTED", event.aggregateVersion());
+                        snapshot = requireSnapshot(failedEvent, snapshot).withReservationRejected(event.aggregateVersion());
                     }
                     case "OrderMatchedV1" -> {
                         OrderMatchedV1 matched = objectMapper.readValue(event.payload(), OrderMatchedV1.class);
@@ -276,8 +313,16 @@ public class OrdersCurrentProjector {
                         ProjectionSnapshot current = requireSnapshot(failedEvent, snapshot);
                         snapshot = current.withStatus(current.status(), event.aggregateVersion());
                     }
+                    case "OrderCancellationAcceptedV1" -> {
+                        snapshot = requireSnapshot(failedEvent, snapshot)
+                                .withStatus("CANCELLING", event.aggregateVersion());
+                    }
+                    case "OrderCancellationCompletedV1" -> {
+                        snapshot = requireSnapshot(failedEvent, snapshot)
+                                .withReservationReleased(event.aggregateVersion());
+                    }
                     case "OrderCancelledV1" -> {
-                        snapshot = requireSnapshot(failedEvent, snapshot).withStatus("CANCELLED", event.aggregateVersion());
+                        snapshot = requireSnapshot(failedEvent, snapshot).withReservationReleased(event.aggregateVersion());
                     }
                     default -> throw new IllegalArgumentException("Unsupported projection event: " + event.eventType());
                 }
@@ -302,19 +347,21 @@ public class OrdersCurrentProjector {
         jdbc.update("""
                 INSERT INTO order_service.orders_current
                     (order_id, user_id, market_id, market_sequence, side, price,
-                     original_amount, remaining_amount, matched_amount, status,
+                     original_amount, remaining_amount, matched_amount, status, asset_reservation_status,
                      aggregate_version, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT (order_id) DO UPDATE
                 SET remaining_amount = EXCLUDED.remaining_amount,
                     matched_amount = EXCLUDED.matched_amount,
                     status = EXCLUDED.status,
+                    asset_reservation_status = EXCLUDED.asset_reservation_status,
                     aggregate_version = EXCLUDED.aggregate_version,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE order_service.orders_current.aggregate_version < EXCLUDED.aggregate_version
                 """, snapshot.orderId(), snapshot.userId(), snapshot.marketId(), snapshot.marketSequence(),
                 snapshot.side(), snapshot.price(), snapshot.originalAmount(), snapshot.remainingAmount(),
-                snapshot.matchedAmount(), snapshot.status(), snapshot.aggregateVersion(), snapshot.createdAt());
+                snapshot.matchedAmount(), snapshot.status(), snapshot.assetReservationStatus(),
+                snapshot.aggregateVersion(), snapshot.createdAt());
     }
 
     private void repairStaleProjections() {
@@ -357,17 +404,39 @@ public class OrdersCurrentProjector {
             int remainingAmount,
             int matchedAmount,
             String status,
+            String assetReservationStatus,
             long aggregateVersion,
             java.time.LocalDateTime createdAt) {
 
         ProjectionSnapshot withStatus(String status, long aggregateVersion) {
             return new ProjectionSnapshot(orderId, userId, marketId, marketSequence, side, price,
-                    originalAmount, remainingAmount, matchedAmount, status, aggregateVersion, createdAt);
+                    originalAmount, remainingAmount, matchedAmount, status, assetReservationStatus,
+                    aggregateVersion, createdAt);
         }
 
         ProjectionSnapshot withAmounts(int matchedAmount, int remainingAmount, String status, long aggregateVersion) {
             return new ProjectionSnapshot(orderId, userId, marketId, marketSequence, side, price,
-                    originalAmount, remainingAmount, matchedAmount, status, aggregateVersion, createdAt);
+                    originalAmount, remainingAmount, matchedAmount, status, "SUCCEEDED",
+                    aggregateVersion, createdAt);
+        }
+
+        ProjectionSnapshot withReservationConfirmed(long aggregateVersion) {
+            String nextStatus = "PENDING_ASSET_CHECK".equals(status) ? "OPEN" : status;
+            return new ProjectionSnapshot(orderId, userId, marketId, marketSequence, side, price,
+                    originalAmount, remainingAmount, matchedAmount, nextStatus, "SUCCEEDED",
+                    aggregateVersion, createdAt);
+        }
+
+        ProjectionSnapshot withReservationRejected(long aggregateVersion) {
+            return new ProjectionSnapshot(orderId, userId, marketId, marketSequence, side, price,
+                    originalAmount, remainingAmount, matchedAmount, "REJECTED", "REJECTED",
+                    aggregateVersion, createdAt);
+        }
+
+        ProjectionSnapshot withReservationReleased(long aggregateVersion) {
+            return new ProjectionSnapshot(orderId, userId, marketId, marketSequence, side, price,
+                    originalAmount, remainingAmount, matchedAmount, "CANCELLED", "RELEASED",
+                    aggregateVersion, createdAt);
         }
     }
 

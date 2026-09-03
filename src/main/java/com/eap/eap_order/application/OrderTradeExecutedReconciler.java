@@ -40,7 +40,36 @@ public class OrderTradeExecutedReconciler {
             fixedDelayString = "${eap.order.trade-execution-reconciler.poll-interval-ms:100}",
             initialDelayString = "${eap.order.trade-execution-reconciler.initial-delay-ms:500}")
     public void reconcile() {
+        inbox.markAlreadyApplied();
         List<InboxEntry> pending = inbox.claimRetryable(batchSize, owner, leaseMs);
+        if (pending.isEmpty()) {
+            return;
+        }
+        List<TradeExecutedEvent> events = pending.stream()
+                .map(InboxEntry::event)
+                .toList();
+        try {
+            orderEventSourcingService.applyTrades(events);
+            int applied = inbox.markApplied(pending, owner);
+            if (applied != pending.size()) {
+                log.warn("Lost one or more TradeExecuted inbox leases before batch APPLIED: expected={}, actual={}",
+                        pending.size(), applied);
+            }
+            return;
+        } catch (TradeProjectionNotReadyException e) {
+            // The projection checkpoint advances in batches. Retrying the same prerequisite-lagged
+            // rows one by one turns a temporary ordering gap into thousands of tiny transactions.
+            for (InboxEntry entry : pending) {
+                inbox.reschedule(entry, owner, "PENDING_PREREQUISITE", e,
+                        retryDelayMs(entry.attemptCount()));
+            }
+            return;
+        } catch (Exception batchFailure) {
+            log.debug("TradeExecuted retry batch needs per-event isolation: size={}", pending.size(), batchFailure);
+        }
+
+        // A permanent contradiction or an unknown technical failure may affect only one event.
+        // Isolate it so a poison event cannot block the rest of the claimed batch.
         for (InboxEntry entry : pending) {
             TradeExecutedEvent event = entry.event();
             try {
@@ -49,7 +78,8 @@ public class OrderTradeExecutedReconciler {
                     log.warn("Lost TradeExecuted inbox lease before marking applied: tradeId={}", event.getTradeId());
                 }
             } catch (TradeProjectionNotReadyException e) {
-                inbox.reschedule(entry, owner, "PENDING_PREREQUISITE", e, retryDelayMs(entry.attemptCount()));
+                inbox.reschedule(entry, owner, "PENDING_PREREQUISITE", e,
+                        retryDelayMs(entry.attemptCount()));
             } catch (TradeApplicationRejectedException e) {
                 log.error("Permanently rejecting TradeExecuted event: tradeId={}", event.getTradeId(), e);
                 inbox.markClaimedPermanentFailure(entry, owner, e);

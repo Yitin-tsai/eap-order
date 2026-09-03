@@ -19,9 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = {
-                "spring.datasource.url=jdbc:postgresql://localhost:5432/eapdb",
-                "spring.datasource.username=admin",
-                "spring.datasource.password=admin123",
+                "spring.datasource.url=${EAP_ORDER_POSTGRES_IT_URL:jdbc:postgresql://localhost:5432/eapdb}",
+                "spring.datasource.username=${EAP_ORDER_POSTGRES_IT_USER:admin}",
+                "spring.datasource.password=${EAP_ORDER_POSTGRES_IT_PASSWORD:admin123}",
                 "spring.jpa.hibernate.ddl-auto=validate",
                 "spring.liquibase.enabled=true",
                 "spring.liquibase.change-log=classpath:db/changelog/db.changelog-master.xml",
@@ -41,11 +41,16 @@ class OrderTradeExecutedInboxPostgresIT {
     private JdbcTemplate jdbc;
 
     private final List<String> tradeIds = new ArrayList<>();
+    private final List<UUID> orderIds = new ArrayList<>();
 
     @AfterEach
     void cleanUp() {
         for (String tradeId : tradeIds) {
             jdbc.update("DELETE FROM order_service.order_trade_execution_inbox WHERE trade_id = ?", tradeId);
+        }
+        for (UUID orderId : orderIds) {
+            jdbc.update("DELETE FROM order_service.order_matching_state WHERE order_id = ?", orderId);
+            jdbc.update("DELETE FROM order_service.order_stream_heads WHERE aggregate_id = ?", orderId);
         }
     }
 
@@ -53,6 +58,8 @@ class OrderTradeExecutedInboxPostgresIT {
     void claimRetryable_shouldLeaseRescheduleAndApplyWithoutDuplicateClaim() {
         TradeExecutedEvent event = event();
         inbox.markPending(List.of(event), new TradeProjectionNotReadyException("lag"));
+        assertTrue(inbox.claimRetryable(10, "too-early-worker", 30_000).isEmpty());
+        insertReadyMatchingStates(event);
 
         List<OrderTradeExecutedInbox.InboxEntry> firstClaim = inbox.claimRetryable(10, "worker-1", 30_000);
 
@@ -82,10 +89,23 @@ class OrderTradeExecutedInboxPostgresIT {
         assertEquals(event.getTradeId(), claimed.get(0).event().getTradeId());
     }
 
+    @Test
+    void claimPending_whenSubmissionHeadsExistShouldNotWaitForReservationConfirmation() {
+        TradeExecutedEvent event = event();
+        insertPendingSubmissionHeads(event);
+        inbox.markPending(List.of(event), new TradeProjectionNotReadyException("confirmation overtaken"));
+
+        List<OrderTradeExecutedInbox.InboxEntry> claimed =
+                inbox.claimRetryable(10, "worker", 30_000);
+
+        assertEquals(1, claimed.size());
+        assertEquals(event.getTradeId(), claimed.get(0).event().getTradeId());
+    }
+
     private TradeExecutedEvent event() {
         String tradeId = "inbox-it-" + UUID.randomUUID();
         tradeIds.add(tradeId);
-        return TradeExecutedEvent.builder()
+        TradeExecutedEvent event = TradeExecutedEvent.builder()
                 .tradeId(tradeId)
                 .legacyMatchId(1)
                 .buyerOrderId(UUID.randomUUID())
@@ -94,5 +114,30 @@ class OrderTradeExecutedInboxPostgresIT {
                 .quantity(10)
                 .occurredAt(LocalDateTime.now())
                 .build();
+        orderIds.add(event.getBuyerOrderId());
+        orderIds.add(event.getSellerOrderId());
+        return event;
+    }
+
+    private void insertReadyMatchingStates(TradeExecutedEvent event) {
+        for (UUID orderId : List.of(event.getBuyerOrderId(), event.getSellerOrderId())) {
+            jdbc.update("""
+                    INSERT INTO order_service.order_matching_state
+                        (order_id, user_id, remaining_amount, matched_amount, status,
+                         asset_reservation_status, updated_at)
+                    VALUES (?, ?, ?, 0, 'OPEN', 'SUCCEEDED', CURRENT_TIMESTAMP)
+                    """, orderId, UUID.randomUUID(), event.getQuantity());
+        }
+    }
+
+    private void insertPendingSubmissionHeads(TradeExecutedEvent event) {
+        for (UUID orderId : List.of(event.getBuyerOrderId(), event.getSellerOrderId())) {
+            jdbc.update("""
+                    INSERT INTO order_service.order_stream_heads
+                        (aggregate_id, current_version, last_hash, user_id,
+                         remaining_amount, status, updated_at)
+                    VALUES (?, 1, ?, ?, ?, 'PENDING_ASSET_CHECK', CURRENT_TIMESTAMP)
+                    """, orderId, "0".repeat(64), UUID.randomUUID(), event.getQuantity());
+        }
     }
 }

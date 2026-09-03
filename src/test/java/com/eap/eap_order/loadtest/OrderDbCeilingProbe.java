@@ -25,8 +25,9 @@ public class OrderDbCeilingProbe {
 
     private static final String SEED_MATCHING_STATE_SQL = """
             INSERT INTO order_service.order_matching_state
-                (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-            VALUES (?, ?, ?, 0, 'OPEN', CURRENT_TIMESTAMP)
+                (order_id, user_id, remaining_amount, matched_amount, status,
+                 asset_reservation_status, updated_at)
+            VALUES (?, ?, ?, 0, 'OPEN', 'SUCCEEDED', CURRENT_TIMESTAMP)
             ON CONFLICT (order_id) DO UPDATE
             SET user_id = EXCLUDED.user_id,
                 remaining_amount = EXCLUDED.remaining_amount,

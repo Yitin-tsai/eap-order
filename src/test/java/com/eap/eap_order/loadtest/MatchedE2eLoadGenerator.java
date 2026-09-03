@@ -1,6 +1,6 @@
 package com.eap.eap_order.loadtest;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.OrderSubmittedEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_order.EapOrderApplication;
@@ -68,11 +68,11 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CLEARED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_AUCTION_CREATED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
@@ -359,8 +359,9 @@ public class MatchedE2eLoadGenerator {
                     """, eventRows);
             orderJdbc.batchUpdate("""
                     INSERT INTO order_service.order_matching_state
-                        (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-                    VALUES (?, ?, ?, 0, 'OPEN', CURRENT_TIMESTAMP)
+                        (order_id, user_id, remaining_amount, matched_amount, status,
+                         asset_reservation_status, updated_at)
+                    VALUES (?, ?, ?, 0, 'OPEN', 'SUCCEEDED', CURRENT_TIMESTAMP)
                     """, matchingStateRows);
         }
     }
@@ -472,13 +473,13 @@ public class MatchedE2eLoadGenerator {
         cleanupRedis(config, pairs, redisTemplate);
 
         System.out.printf("publishing %d resting SELL confirmations directly to %s%n",
-                config.events(), MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+                config.events(), MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         PublishResult sellPublish = publishToMatchEngine(config, objectMapper, pairs, true);
         SellBookWaitResult sellBookWait = waitForRedisSellBook(config, redisTemplate, rabbitAdmin);
         double orderbookAdmissionSeconds = sellPublish.elapsedSeconds() + sellBookWait.elapsedSeconds();
 
         System.out.printf("publishing %d incoming BUY confirmations directly to %s%n",
-                config.events(), MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+                config.events(), MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         long started = System.nanoTime();
         PublishResult buyPublish = publishBuyToMatchEngine(config, objectMapper, pairs);
         WaitResult waitResult = waitForDownstream(config, orderJdbc, walletJdbc, matchJdbc, rabbitAdmin, started);
@@ -1108,7 +1109,7 @@ public class MatchedE2eLoadGenerator {
             RabbitAdmin rabbitAdmin) throws Exception {
         purgeQueues(rabbitAdmin);
         PublishResult publish = publishBuyToMatchEngine(config, objectMapper, pairs);
-        QueueDepth queueDepth = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+        QueueDepth queueDepth = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         printPublishOnlyResult(config, publish, queueDepth);
         purgeQueues(rabbitAdmin);
 
@@ -1156,7 +1157,7 @@ public class MatchedE2eLoadGenerator {
         AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder()
                 .contentType("application/json")
                 .deliveryMode(2)
-                .headers(Map.of("__TypeId__", OrderConfirmedEvent.class.getName()))
+                .headers(Map.of("__TypeId__", OrderAssetReservationSucceededEvent.class.getName()))
                 .build();
 
         List<Connection> connections = new ArrayList<>();
@@ -1315,12 +1316,12 @@ public class MatchedE2eLoadGenerator {
                 long sendStarted = System.nanoTime();
                 long sequenceNumber = -1L;
                 try {
-                    OrderConfirmedEvent event = sell ? pair.sellConfirmed(config.marketId()) : pair.buyConfirmed(config.marketId());
+                    OrderAssetReservationSucceededEvent event = sell ? pair.sellConfirmed(config.marketId()) : pair.buyConfirmed(config.marketId());
                     byte[] body = objectMapper.writeValueAsBytes(event);
                     sequenceNumber = channel.getNextPublishSeqNo();
                     outstandingPublishes.put(sequenceNumber, sendStarted);
                     attempted.incrementAndGet();
-                    channel.basicPublish("", MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, true, properties, body);
+                    channel.basicPublish("", MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE, true, properties, body);
                     long sendElapsed = System.nanoTime() - sendStarted;
                     updateMax(lastSendCompletedNanos, System.nanoTime());
                     sendNanos.add(sendElapsed);
@@ -1444,7 +1445,7 @@ public class MatchedE2eLoadGenerator {
                 config.marketId(), config.events(), latestSellBookSize, zsetSize(redisTemplate, buyBookKey));
         System.err.printf("[DIAG] redis.sellBookKey=%s redis.buyBookKey=%s%n", sellBookKey, buyBookKey);
         System.err.printf("[DIAG] queue.%s.ready=%d%n",
-                MATCH_ENGINE_ORDER_CONFIRMED_QUEUE, queueReady(rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE));
+                MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE, queueReady(rabbitAdmin, MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE));
         System.err.printf("[DIAG] queue.%s.ready=%d%n",
                 ORDER_TRADE_EXECUTED_QUEUE, queueReady(rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE));
         System.err.printf("[DIAG] queue.%s.ready=%d%n",
@@ -1630,7 +1631,8 @@ public class MatchedE2eLoadGenerator {
     }
 
     private static WaitResult queueSnapshot(Config config, RabbitAdmin rabbitAdmin) {
-        QueueDepth matchEngineOrderConfirmed = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+        QueueDepth matchEngineAssetReservationSucceeded = queueDepth(
+                config, rabbitAdmin, MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         QueueDepth orderTradeExecuted = queueDepth(config, rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
         QueueDepth walletTradeExecuted = queueDepth(config, rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
         return new WaitResult(
@@ -1646,10 +1648,10 @@ public class MatchedE2eLoadGenerator {
                 -1,
                 -1,
                 -1,
-                matchEngineOrderConfirmed.ready(),
+                matchEngineAssetReservationSucceeded.ready(),
                 orderTradeExecuted.ready(),
                 walletTradeExecuted.ready(),
-                matchEngineOrderConfirmed.unacked(),
+                matchEngineAssetReservationSucceeded.unacked(),
                 orderTradeExecuted.unacked(),
                 walletTradeExecuted.unacked(),
                 -1,
@@ -1720,7 +1722,8 @@ public class MatchedE2eLoadGenerator {
             JdbcTemplate walletJdbc,
             JdbcTemplate matchJdbc,
             RabbitAdmin rabbitAdmin) {
-        QueueDepth matchEngineOrderConfirmed = queueDepth(config, rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+        QueueDepth matchEngineAssetReservationSucceeded = queueDepth(
+                config, rabbitAdmin, MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         QueueDepth orderTradeExecuted = queueDepth(config, rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
         QueueDepth walletTradeExecuted = queueDepth(config, rabbitAdmin, WALLET_TRADE_EXECUTED_QUEUE);
         long orderCommandMatchedRows = countOrderCommandMatchedRows(orderJdbc);
@@ -1748,10 +1751,10 @@ public class MatchedE2eLoadGenerator {
                 count(walletJdbc, "SELECT COALESCE(sum(locked_amount), 0) FROM wallet_service.wallets"),
                 count(walletJdbc, "SELECT COALESCE(sum(available_amount), 0) FROM wallet_service.wallets"),
                 count(walletJdbc, "SELECT COALESCE(sum(available_currency), 0) FROM wallet_service.wallets"),
-                matchEngineOrderConfirmed.ready(),
+                matchEngineAssetReservationSucceeded.ready(),
                 orderTradeExecuted.ready(),
                 walletTradeExecuted.ready(),
-                matchEngineOrderConfirmed.unacked(),
+                matchEngineAssetReservationSucceeded.unacked(),
                 orderTradeExecuted.unacked(),
                 walletTradeExecuted.unacked(),
                 -1,
@@ -1912,6 +1915,9 @@ public class MatchedE2eLoadGenerator {
                     IF to_regclass('match_engine.order_cancellations') IS NOT NULL THEN
                         TRUNCATE TABLE match_engine.order_cancellations RESTART IDENTITY CASCADE;
                     END IF;
+                    IF to_regclass('match_engine.order_admission_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.order_admission_inbox RESTART IDENTITY CASCADE;
+                    END IF;
                 END $$;
                 """);
         jdbcTemplate.execute("""
@@ -1924,9 +1930,9 @@ public class MatchedE2eLoadGenerator {
 
     private static void purgeQueues(RabbitAdmin rabbitAdmin) {
         purgeIfPresent(rabbitAdmin, WALLET_ORDER_SUBMITTED_QUEUE);
-        purgeIfPresent(rabbitAdmin, MATCH_ENGINE_ORDER_CONFIRMED_QUEUE);
+        purgeIfPresent(rabbitAdmin, MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         purgeIfPresent(rabbitAdmin, MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE);
-        purgeIfPresent(rabbitAdmin, ORDER_ORDER_CONFIRMED_QUEUE);
+        purgeIfPresent(rabbitAdmin, ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_ORDER_FAILED_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_ORDER_CANCELLATION_RESULT_QUEUE);
         purgeIfPresent(rabbitAdmin, ORDER_TRADE_EXECUTED_QUEUE);
@@ -1979,8 +1985,8 @@ public class MatchedE2eLoadGenerator {
                 .build();
     }
 
-    private static OrderConfirmedEvent confirmed(OrderSubmittedEvent submitted) {
-        return OrderConfirmedEvent.builder()
+    private static OrderAssetReservationSucceededEvent confirmed(OrderSubmittedEvent submitted) {
+        return OrderAssetReservationSucceededEvent.builder()
                 .orderId(submitted.getOrderId())
                 .userId(submitted.getUserId())
                 .marketId(submitted.getMarketId())
@@ -2554,11 +2560,11 @@ public class MatchedE2eLoadGenerator {
             long buySequence,
             long sellSequence) {
 
-        OrderConfirmedEvent buyConfirmed(String marketId) {
+        OrderAssetReservationSucceededEvent buyConfirmed(String marketId) {
             return confirmed(submitted(buyOrderId, buyerId, "BUY", buySequence, marketId));
         }
 
-        OrderConfirmedEvent sellConfirmed(String marketId) {
+        OrderAssetReservationSucceededEvent sellConfirmed(String marketId) {
             return confirmed(submitted(sellOrderId, sellerId, "SELL", sellSequence, marketId));
         }
     }
@@ -2703,7 +2709,7 @@ public class MatchedE2eLoadGenerator {
     private static class QueueDrainTracker {
 
         private final List<MutableQueueDrainState> queues = List.of(
-                new MutableQueueDrainState(MATCH_ENGINE_ORDER_CONFIRMED_QUEUE),
+                new MutableQueueDrainState(MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE),
                 new MutableQueueDrainState(ORDER_TRADE_EXECUTED_QUEUE),
                 new MutableQueueDrainState(WALLET_TRADE_EXECUTED_QUEUE));
         private String lastNonZeroQueue = "none";

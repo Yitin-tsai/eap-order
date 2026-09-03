@@ -1,6 +1,6 @@
 # Order Service Event Sourcing Design
 
-> Current status (2026-08-07): this document contains the migration history. The current command path appends order lifecycle events and an integration outbox atomically. `TradeExecutedEvent` is first stored in a durable Order inbox, then applied idempotently to command-side order streams. `orders_current` is a rebuildable query projection and must not block trade application. The legacy `OrderMatchedEvent` listener and match-history hot path are retired.
+> Current status (2026-09-02): this document contains the migration history. The current command path appends order lifecycle events and an integration outbox atomically. `TradeExecutedEvent` is applied directly when Order submission heads exist; only a genuine missing prerequisite or technical failure is retained in the durable Order trade inbox. A Trade that overtakes Wallet confirmation infers reservation success and cannot be regressed by the late confirmation. `orders_current` is a rebuildable query projection and must not block trade application. The legacy `OrderMatchedEvent` listener and match-history hot path are retired.
 >
 > Normative current references: [Order README](../README.md) and [EAP architecture](https://github.com/Yitin-tsai/eap-infra/blob/main/docs/architecture.md). Sections below that mention `OrderMatchedV1`, synchronous projection readiness, or legacy match history describe migration history unless explicitly marked current.
 
@@ -12,7 +12,8 @@ HTTP order request
   -> Wallet reservation result appends confirmed/failed lifecycle event
 
 TradeExecutedEvent
-  -> durable order_trade_execution_inbox
+  -> direct idempotent apply when submission heads exist
+  -> durable order_trade_execution_inbox only for missing prerequisites / retryable failures
   -> idempotent order_trade_applications claim
   -> buyer and seller command-stream updates
   -> manual ACK after durable handling
@@ -21,7 +22,7 @@ order event store
   -> asynchronous orders_current projection
 ```
 
-The projection can lag or be rebuilt without changing whether a trade is a durable business fact. A projection-lagged trade remains durable in the inbox and is retried by the reconciler; it is not repeatedly requeued through RabbitMQ.
+The projection can lag or be rebuilt without changing whether a trade is a durable business fact. Order tracks Wallet reservation progress separately from execution status. A valid `TradeExecutedEvent` may advance `PENDING_ASSET_CHECK` directly to `PARTIALLY_MATCHED` or `MATCHED` and set reservation progress to `SUCCEEDED`; a later confirmation is recorded but cannot downgrade execution. Only missing submission state or a technical failure requires inbox reconciliation, and it is not repeatedly requeued through RabbitMQ.
 
 > 歷史段落起點：以下內容從 Phase 1 規劃開始，當時 BUY/SELL write path 尚未切換；現行狀態以上方 Current Command and Projection Boundary 為準。
 > 最後更新：2026-06-26  
@@ -48,7 +49,7 @@ HTTP request
 Wallet 處理完後，Order listener 又同步執行：
 
 ```text
-OrderConfirmedEvent / OrderFailedEvent
+OrderAssetReservationSucceededEvent / OrderFailedEvent
 -> SELECT latest audit FOR UPDATE
 -> compute next hash
 -> INSERT audit event
@@ -380,7 +381,7 @@ Domain event 必須足以重建 Order Aggregate。
 
 ```text
 OrderSubmittedEvent
-OrderConfirmedEvent
+OrderAssetReservationSucceededEvent
 OrderCancelledIntegrationEvent
 ```
 

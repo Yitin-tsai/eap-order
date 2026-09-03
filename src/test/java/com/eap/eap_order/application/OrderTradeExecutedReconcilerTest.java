@@ -10,10 +10,11 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -26,7 +27,24 @@ class OrderTradeExecutedReconcilerTest {
     private OrderEventSourcingService orderEventSourcingService;
 
     @Test
-    void reconcile_shouldContinueAfterOneTradeIsStillWaitingForPrerequisite() {
+    void reconcile_shouldApplyAndAcknowledgeAClaimedBatchTogether() {
+        TradeExecutedEvent first = event("first");
+        TradeExecutedEvent second = event("second");
+        var entries = List.of(
+                new OrderTradeExecutedInbox.InboxEntry(first, 2),
+                new OrderTradeExecutedInbox.InboxEntry(second, 2));
+        when(inbox.claimRetryable(eq(100), anyString(), eq(30_000L))).thenReturn(entries);
+        when(inbox.markApplied(eq(entries), anyString())).thenReturn(2);
+
+        reconciler().reconcile();
+
+        verify(orderEventSourcingService).applyTrades(List.of(first, second));
+        verify(inbox).markApplied(eq(entries), anyString());
+        verify(inbox, never()).markApplied(eq(first), anyString());
+    }
+
+    @Test
+    void reconcile_shouldRescheduleWholeBatchWhenProjectionPrerequisiteIsBehind() {
         TradeExecutedEvent waiting = event("waiting");
         TradeExecutedEvent ready = event("ready");
         var waitingEntry = new OrderTradeExecutedInbox.InboxEntry(waiting, 2);
@@ -34,15 +52,15 @@ class OrderTradeExecutedReconcilerTest {
         when(inbox.claimRetryable(eq(100), anyString(), eq(30_000L)))
                 .thenReturn(List.of(waitingEntry, readyEntry));
         TradeProjectionNotReadyException lag = new TradeProjectionNotReadyException("lag");
-        doThrow(lag).when(orderEventSourcingService).applyTrades(List.of(waiting));
-        when(inbox.markApplied(eq(ready), anyString())).thenReturn(true);
+        doThrow(lag).when(orderEventSourcingService).applyTrades(List.of(waiting, ready));
 
         reconciler().reconcile();
 
         verify(inbox).reschedule(eq(waitingEntry), anyString(),
-                eq("PENDING_PREREQUISITE"), eq(lag), anyLong());
-        verify(orderEventSourcingService).applyTrades(List.of(ready));
-        verify(inbox).markApplied(eq(ready), anyString());
+                eq("PENDING_PREREQUISITE"), eq(lag), eq(200L));
+        verify(inbox).reschedule(eq(readyEntry), anyString(),
+                eq("PENDING_PREREQUISITE"), eq(lag), eq(200L));
+        verify(orderEventSourcingService, never()).applyTrades(List.of(waiting));
     }
 
     @Test
@@ -56,6 +74,7 @@ class OrderTradeExecutedReconcilerTest {
 
         reconciler().reconcile();
 
+        verify(orderEventSourcingService, times(2)).applyTrades(List.of(event));
         verify(inbox).markClaimedPermanentFailure(eq(entry), anyString(), eq(failure));
     }
 

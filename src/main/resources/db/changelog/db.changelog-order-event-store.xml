@@ -454,4 +454,119 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-027" author="eap">
+        <comment>Persist Wallet reservation results before applying them to the Order event stream</comment>
+        <sql>
+            CREATE TABLE order_service.order_asset_reservation_result_inbox (
+                order_id UUID PRIMARY KEY,
+                result_type VARCHAR(20) NOT NULL,
+                payload TEXT NOT NULL,
+                payload_hash VARCHAR(64) NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                claimed_by VARCHAR(80),
+                claim_until TIMESTAMP,
+                received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TIMESTAMP,
+                error_type VARCHAR(80),
+                last_error TEXT,
+                conflict_detected_at TIMESTAMP,
+                conflicting_result_type VARCHAR(20),
+                conflicting_payload TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_asset_reservation_result_type
+                    CHECK (result_type IN ('CONFIRMED', 'FAILED')),
+                CONSTRAINT ck_order_asset_reservation_result_conflict_type
+                    CHECK (conflicting_result_type IS NULL
+                           OR conflicting_result_type IN ('CONFIRMED', 'FAILED')),
+                CONSTRAINT ck_order_asset_reservation_result_status
+                    CHECK (status IN ('PENDING', 'IN_PROGRESS', 'APPLIED',
+                                      'FAILED_RETRYABLE', 'FAILED_PERMANENT')),
+                CONSTRAINT ck_order_asset_reservation_result_attempt
+                    CHECK (attempt_count &gt;= 0),
+                CONSTRAINT ck_order_asset_reservation_result_schema
+                    CHECK (schema_version &gt; 0)
+            );
+
+            CREATE INDEX idx_order_asset_reservation_result_retry
+                ON order_service.order_asset_reservation_result_inbox
+                    (status, next_retry_at, updated_at)
+                WHERE status IN ('PENDING', 'FAILED_RETRYABLE', 'IN_PROGRESS');
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-028" author="eap">
+        <comment>Keep Wallet reservation-release facts durable until Order cancellation is fully complete</comment>
+        <sql>
+            CREATE TABLE order_service.order_asset_reservation_released_inbox (
+                cancellation_id UUID PRIMARY KEY,
+                event_id UUID NOT NULL UNIQUE,
+                order_id UUID NOT NULL UNIQUE,
+                payload TEXT NOT NULL,
+                payload_hash VARCHAR(64) NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                claimed_by VARCHAR(80),
+                claim_until TIMESTAMP,
+                received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TIMESTAMP,
+                error_type VARCHAR(80),
+                last_error TEXT,
+                conflict_detected_at TIMESTAMP,
+                conflicting_payload TEXT,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT ck_order_asset_release_inbox_status
+                    CHECK (status IN ('PENDING', 'PENDING_PREREQUISITE', 'IN_PROGRESS',
+                                      'APPLIED', 'FAILED_RETRYABLE', 'FAILED_PERMANENT')),
+                CONSTRAINT ck_order_asset_release_inbox_attempt CHECK (attempt_count &gt;= 0),
+                CONSTRAINT ck_order_asset_release_inbox_schema CHECK (schema_version &gt; 0)
+            );
+
+            CREATE INDEX idx_order_asset_release_inbox_retry
+                ON order_service.order_asset_reservation_released_inbox
+                    (status, next_retry_at, updated_at)
+                WHERE status IN ('PENDING', 'PENDING_PREREQUISITE',
+                                 'FAILED_RETRYABLE', 'IN_PROGRESS');
+        </sql>
+    </changeSet>
+
+    <changeSet id="order-es-029" author="eap">
+        <comment>Track Wallet reservation progress independently from Order execution status</comment>
+        <sql>
+            ALTER TABLE order_service.order_matching_state
+                ADD COLUMN asset_reservation_status VARCHAR(30);
+            UPDATE order_service.order_matching_state
+            SET asset_reservation_status = CASE
+                WHEN status = 'PENDING_ASSET_CHECK' THEN 'PENDING'
+                WHEN status = 'REJECTED' THEN 'REJECTED'
+                WHEN status = 'CANCELLED' THEN 'RELEASED'
+                ELSE 'SUCCEEDED'
+            END;
+            ALTER TABLE order_service.order_matching_state
+                ALTER COLUMN asset_reservation_status SET NOT NULL;
+            ALTER TABLE order_service.order_matching_state
+                ADD CONSTRAINT ck_order_matching_asset_reservation_status
+                CHECK (asset_reservation_status IN ('PENDING', 'SUCCEEDED', 'REJECTED', 'RELEASED'));
+
+            ALTER TABLE order_service.orders_current
+                ADD COLUMN asset_reservation_status VARCHAR(30);
+            UPDATE order_service.orders_current
+            SET asset_reservation_status = CASE
+                WHEN status = 'PENDING_ASSET_CHECK' THEN 'PENDING'
+                WHEN status = 'REJECTED' THEN 'REJECTED'
+                WHEN status = 'CANCELLED' THEN 'RELEASED'
+                ELSE 'SUCCEEDED'
+            END;
+            ALTER TABLE order_service.orders_current
+                ALTER COLUMN asset_reservation_status SET NOT NULL;
+            ALTER TABLE order_service.orders_current
+                ADD CONSTRAINT ck_orders_current_asset_reservation_status
+                CHECK (asset_reservation_status IN ('PENDING', 'SUCCEEDED', 'REJECTED', 'RELEASED'));
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

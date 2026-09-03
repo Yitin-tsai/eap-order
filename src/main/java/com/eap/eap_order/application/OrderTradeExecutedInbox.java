@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @Component
 public class OrderTradeExecutedInbox {
@@ -45,13 +46,42 @@ public class OrderTradeExecutedInbox {
     public List<InboxEntry> claimRetryable(int limit, String owner, long leaseMs) {
         return jdbc.query("""
                 WITH candidates AS (
-                    SELECT trade_id
-                    FROM order_service.order_trade_execution_inbox
-                    WHERE (status IN ('PENDING_PREREQUISITE', 'FAILED_RETRYABLE')
-                               AND next_retry_at <= CURRENT_TIMESTAMP)
-                       OR (status = 'IN_PROGRESS' AND claim_until <= CURRENT_TIMESTAMP)
-                    ORDER BY next_retry_at, updated_at, trade_id
-                    FOR UPDATE SKIP LOCKED
+                    SELECT inbox.trade_id
+                    FROM order_service.order_trade_execution_inbox AS inbox
+                    WHERE (inbox.status = 'PENDING_PREREQUISITE'
+                               AND inbox.next_retry_at <= CURRENT_TIMESTAMP
+                               AND (
+                                   EXISTS (
+                                       SELECT 1
+                                       FROM order_service.order_matching_state AS buyer
+                                       JOIN order_service.order_matching_state AS seller
+                                         ON seller.order_id = inbox.seller_order_id
+                                       WHERE buyer.order_id = inbox.buyer_order_id
+                                         AND buyer.status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                                         AND seller.status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                                         AND buyer.asset_reservation_status IN ('PENDING', 'SUCCEEDED')
+                                         AND seller.asset_reservation_status IN ('PENDING', 'SUCCEEDED')
+                                         AND buyer.remaining_amount >= inbox.quantity
+                                         AND seller.remaining_amount >= inbox.quantity
+                                   )
+                                   OR EXISTS (
+                                       SELECT 1
+                                       FROM order_service.order_stream_heads AS buyer_head
+                                       JOIN order_service.order_stream_heads AS seller_head
+                                         ON seller_head.aggregate_id = inbox.seller_order_id
+                                       WHERE buyer_head.aggregate_id = inbox.buyer_order_id
+                                         AND buyer_head.status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                                         AND seller_head.status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                                         AND buyer_head.remaining_amount >= inbox.quantity
+                                         AND seller_head.remaining_amount >= inbox.quantity
+                                   )
+                               ))
+                       OR (inbox.status = 'FAILED_RETRYABLE'
+                               AND inbox.next_retry_at <= CURRENT_TIMESTAMP)
+                       OR (inbox.status = 'IN_PROGRESS'
+                               AND inbox.claim_until <= CURRENT_TIMESTAMP)
+                    ORDER BY inbox.next_retry_at, inbox.updated_at, inbox.trade_id
+                    FOR UPDATE OF inbox SKIP LOCKED
                     LIMIT :limit
                 )
                 UPDATE order_service.order_trade_execution_inbox AS inbox
@@ -72,6 +102,23 @@ public class OrderTradeExecutedInbox {
                         rs.getInt("attempt_count")));
     }
 
+    public int markAlreadyApplied() {
+        return jdbc.update("""
+                UPDATE order_service.order_trade_execution_inbox AS inbox
+                SET status = 'APPLIED', applied_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP, last_error = NULL,
+                    claimed_by = NULL, claim_until = NULL
+                FROM order_service.order_trade_applications AS application
+                WHERE application.trade_id = inbox.trade_id
+                  AND application.buyer_order_id = inbox.buyer_order_id
+                  AND application.seller_order_id = inbox.seller_order_id
+                  AND application.price = inbox.deal_price
+                  AND application.quantity = inbox.quantity
+                  AND (inbox.status IN ('PENDING_PREREQUISITE', 'FAILED_RETRYABLE')
+                       OR (inbox.status = 'IN_PROGRESS' AND inbox.claim_until <= CURRENT_TIMESTAMP))
+                """, Map.of());
+    }
+
     public boolean markApplied(TradeExecutedEvent event, String owner) {
         return jdbc.update("""
                 UPDATE order_service.order_trade_execution_inbox
@@ -82,6 +129,33 @@ public class OrderTradeExecutedInbox {
                 """, new MapSqlParameterSource()
                         .addValue("tradeId", event.getTradeId())
                         .addValue("owner", owner)) == 1;
+    }
+
+    public int markApplied(List<InboxEntry> entries, String owner) {
+        if (entries == null || entries.isEmpty()) {
+            return 0;
+        }
+        List<String> tradeIds = entries.stream()
+                .map(InboxEntry::event)
+                .filter(Objects::nonNull)
+                .map(TradeExecutedEvent::getTradeId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        if (tradeIds.isEmpty()) {
+            return 0;
+        }
+        return jdbc.update("""
+                UPDATE order_service.order_trade_execution_inbox
+                SET status = 'APPLIED', applied_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP, last_error = NULL,
+                    claimed_by = NULL, claim_until = NULL
+                WHERE trade_id IN (:tradeIds)
+                  AND status = 'IN_PROGRESS'
+                  AND claimed_by = :owner
+                """, new MapSqlParameterSource()
+                        .addValue("tradeIds", tradeIds)
+                        .addValue("owner", owner));
     }
 
     public void reschedule(

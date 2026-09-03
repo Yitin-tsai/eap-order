@@ -27,9 +27,10 @@ import java.util.concurrent.TimeUnit;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ASSET_RESERVATION_RELEASED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_CANCELLATION_RESULT_QUEUE;
@@ -46,14 +47,15 @@ public final class HttpCancellationLifecycleLoadGenerator {
     private static final String MARKET_ID = "ENERGY-SPOT";
     private static final List<String> CHAIN_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
-            ORDER_ORDER_CONFIRMED_QUEUE,
+            ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             ORDER_ORDER_FAILED_QUEUE,
-            MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
+            MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE,
             ORDER_TRADE_EXECUTED_QUEUE,
             WALLET_TRADE_EXECUTED_QUEUE,
             ORDER_ORDER_CANCELLATION_RESULT_QUEUE,
             WALLET_ORDER_CANCELLATION_RESULT_QUEUE,
+            ORDER_ASSET_RESERVATION_RELEASED_QUEUE,
             DEAD_LETTER_QUEUE);
 
     private HttpCancellationLifecycleLoadGenerator() {
@@ -116,6 +118,13 @@ public final class HttpCancellationLifecycleLoadGenerator {
                     """);
             long walletCancellationApplications = scalarLong(wallet,
                     "SELECT count(*) FROM wallet_service.order_cancellation_applications");
+            long walletReleasePublications = scalarLong(wallet,
+                    "SELECT count(*) FROM wallet_service.order_asset_release_publications");
+            long orderCancellationCompletions = scalarLong(order, """
+                    SELECT count(*)
+                    FROM order_service.order_asset_reservation_released_inbox
+                    WHERE status = 'APPLIED'
+                    """);
             if (orderOutboxDebt != 0 || walletOutboxDebt != 0 || matchOutboxDebt != 0) {
                 throw new IllegalStateException("outbox debt remains: order=" + orderOutboxDebt
                         + ", wallet=" + walletOutboxDebt + ", match=" + matchOutboxDebt);
@@ -133,6 +142,14 @@ public final class HttpCancellationLifecycleLoadGenerator {
                 throw new IllegalStateException(
                         "unexpected Wallet cancellation applications: expected="
                                 + expectedWalletApplications + ", actual=" + walletCancellationApplications);
+            }
+            if (walletReleasePublications != expectedWalletApplications
+                    || orderCancellationCompletions != expectedWalletApplications) {
+                throw new IllegalStateException(
+                        "cancellation completion facts did not converge: expected="
+                                + expectedWalletApplications + ", walletPublications="
+                                + walletReleasePublications + ", orderCompletions="
+                                + orderCancellationCompletions);
             }
 
             Map<String, Object> result = new LinkedHashMap<>();
@@ -156,6 +173,8 @@ public final class HttpCancellationLifecycleLoadGenerator {
             result.put("raceMutualExclusionValid", true);
             result.put("orderCancellationInboxApplied", cancellationInboxApplied);
             result.put("walletCancellationApplications", walletCancellationApplications);
+            result.put("walletReleasePublications", walletReleasePublications);
+            result.put("orderCancellationCompletions", orderCancellationCompletions);
             result.put("orderOutboxDebt", orderOutboxDebt);
             result.put("walletOutboxDebt", walletOutboxDebt);
             result.put("matchOutboxDebt", matchOutboxDebt);

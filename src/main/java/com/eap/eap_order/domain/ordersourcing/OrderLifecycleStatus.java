@@ -7,5 +7,6 @@ public enum OrderLifecycleStatus {
     REJECTED,
     PARTIALLY_MATCHED,
     MATCHED,
+    CANCELLING,
     CANCELLED
 }

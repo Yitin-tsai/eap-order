@@ -43,12 +43,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.ToLongFunction;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CANCELLATION_RESULT_QUEUE;
-import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_CONFIRMED_QUEUE;
+import static com.eap.common.constants.RabbitMQConstants.ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_ORDER_FAILED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.ORDER_TRADE_EXECUTED_QUEUE;
 import static com.eap.common.constants.RabbitMQConstants.WALLET_ORDER_SUBMITTED_QUEUE;
@@ -66,9 +67,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
     private static final String HTTP_MARKET_ID = "ENERGY-SPOT";
     private static final List<String> CHAIN_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
-            ORDER_ORDER_CONFIRMED_QUEUE,
+            ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             ORDER_ORDER_FAILED_QUEUE,
-            MATCH_ENGINE_ORDER_CONFIRMED_QUEUE,
+            MATCH_ENGINE_ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
             MATCH_ENGINE_ORDER_CANCELLATION_REQUESTED_QUEUE,
             ORDER_TRADE_EXECUTED_QUEUE,
             WALLET_TRADE_EXECUTED_QUEUE,
@@ -291,6 +292,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long reservationClaims = countWalletClaims(config, databases.wallet(), sellOrderIds);
             long confirmed = countOrderEvents(
                     config, databases.order(), sellOrderIds, "OrderAssetReservationConfirmedV1");
+            MatchAdmissionInboxSnapshot matchInbox =
+                    matchAdmissionInboxSnapshot(databases.match(), config.marketId());
             long sellBook = redisInteger(config, "ZCARD", orderbookKey(config.marketId(), "sell"));
             QueueSnapshot queues = readQueues(config, httpClient, objectMapper);
             queueReadFailures += queues.readFailures();
@@ -301,6 +304,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     submitted,
                     reservationClaims,
                     confirmed,
+                    matchInbox.rows(),
+                    matchInbox.appliedRows(),
+                    matchInbox.nonAppliedRows(),
                     sellBook,
                     queues.backlog(),
                     queueReadFailures,
@@ -309,6 +315,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (submitted == config.events()
                     && reservationClaims == config.events()
                     && confirmed == config.events()
+                    && matchInbox.rows() == config.events()
+                    && matchInbox.appliedRows() == config.events()
+                    && matchInbox.nonAppliedRows() == 0
                     && sellBook == config.events()
                     && consecutiveDrainedSamples >= 3) {
                 return latest;
@@ -343,6 +352,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long reservationClaims = countWalletClaims(config, databases.wallet(), allOrderIds);
             long confirmed = countOrderEvents(
                     config, databases.order(), allOrderIds, "OrderAssetReservationConfirmedV1");
+            MatchAdmissionInboxSnapshot matchInbox =
+                    matchAdmissionInboxSnapshot(databases.match(), config.marketId());
             long matchedOrders = countMatchedOrders(config, databases.order(), allOrderIds);
             long matchTrades = countMatchTrades(
                     config, databases.match(), config.marketId(), buyOrderIds, sellOrderIds);
@@ -371,6 +382,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             boolean durableCountsReached = submitted == config.events() * 2L
                     && reservationClaims == config.events() * 2L
                     && confirmed == config.events() * 2L
+                    && matchInbox.rows() == config.events() * 2L
+                    && matchInbox.appliedRows() == config.events() * 2L
+                    && matchInbox.nonAppliedRows() == 0
                     && matchedOrders == config.events() * 2L
                     && matchTrades == config.events()
                     && orderTrades == config.events()
@@ -407,6 +421,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     submitted,
                     reservationClaims,
                     confirmed,
+                    matchInbox.rows(),
+                    matchInbox.appliedRows(),
+                    matchInbox.nonAppliedRows(),
                     matchedOrders,
                     matchTrades,
                     orderTrades,
@@ -470,6 +487,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         if (sellAdmission.confirmed() != config.events()) {
             reasons.add("sell_confirmation_count_mismatch");
         }
+        if (sellAdmission.matchAdmissionInboxRows() != config.events()
+                || sellAdmission.matchAdmissionInboxAppliedRows() != config.events()
+                || sellAdmission.matchAdmissionInboxNonAppliedRows() != 0) {
+            reasons.add("sell_match_admission_inbox_not_converged");
+        }
         if (sellAdmission.sellBook() != config.events()) {
             reasons.add("sell_resting_book_count_mismatch");
         }
@@ -484,6 +506,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         }
         if (completion.confirmed() != config.events() * 2L) {
             reasons.add("order_confirmation_count_mismatch");
+        }
+        if (completion.matchAdmissionInboxRows() != config.events() * 2L
+                || completion.matchAdmissionInboxAppliedRows() != config.events() * 2L
+                || completion.matchAdmissionInboxNonAppliedRows() != 0) {
+            reasons.add("match_admission_inbox_not_converged");
         }
         if (completion.matchedOrders() != config.events() * 2L) {
             reasons.add("order_matched_count_mismatch");
@@ -565,6 +592,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         System.out.printf("  \"sellSubmissionRows\": %d,%n", sellAdmission.submitted());
         System.out.printf("  \"sellWalletReservationRows\": %d,%n", sellAdmission.reservationClaims());
         System.out.printf("  \"sellConfirmationRows\": %d,%n", sellAdmission.confirmed());
+        System.out.printf("  \"sellMatchAdmissionInboxRows\": %d,%n",
+                sellAdmission.matchAdmissionInboxRows());
+        System.out.printf("  \"sellMatchAdmissionInboxAppliedRows\": %d,%n",
+                sellAdmission.matchAdmissionInboxAppliedRows());
+        System.out.printf("  \"sellMatchAdmissionInboxNonAppliedRows\": %d,%n",
+                sellAdmission.matchAdmissionInboxNonAppliedRows());
         System.out.printf("  \"sellRestingBookCount\": %d,%n", sellAdmission.sellBook());
         System.out.printf("  \"sellAdmissionSeconds\": %.4f,%n", sellAdmission.elapsedSeconds());
         System.out.printf("  \"sellAdmissionQueueBacklog\": %d,%n", sellAdmission.finalQueueBacklog());
@@ -574,6 +607,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         System.out.printf("  \"orderSubmissionRows\": %d,%n", completion.submitted());
         System.out.printf("  \"walletReservationRows\": %d,%n", completion.reservationClaims());
         System.out.printf("  \"orderConfirmationRows\": %d,%n", completion.confirmed());
+        System.out.printf("  \"matchAdmissionInboxRows\": %d,%n", completion.matchAdmissionInboxRows());
+        System.out.printf("  \"matchAdmissionInboxAppliedRows\": %d,%n",
+                completion.matchAdmissionInboxAppliedRows());
+        System.out.printf("  \"matchAdmissionInboxNonAppliedRows\": %d,%n",
+                completion.matchAdmissionInboxNonAppliedRows());
         System.out.printf("  \"orderMatchedRows\": %d,%n", completion.matchedOrders());
         System.out.printf("  \"matchTradeRows\": %d,%n", completion.matchTrades());
         System.out.printf("  \"orderTradeRows\": %d,%n", completion.orderTrades());
@@ -724,6 +762,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     IF to_regclass('order_service.order_cancellation_result_inbox') IS NOT NULL THEN
                         TRUNCATE TABLE order_service.order_cancellation_result_inbox;
                     END IF;
+                    IF to_regclass('order_service.order_asset_reservation_result_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE order_service.order_asset_reservation_result_inbox;
+                    END IF;
+                    IF to_regclass('order_service.order_asset_reservation_released_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE order_service.order_asset_reservation_released_inbox;
+                    END IF;
                 END $$;
                 TRUNCATE TABLE
                     order_service.match_history,
@@ -746,6 +790,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 BEGIN
                     IF to_regclass('wallet_service.order_cancellation_applications') IS NOT NULL THEN
                         TRUNCATE TABLE wallet_service.order_cancellation_applications;
+                    END IF;
+                    IF to_regclass('wallet_service.message_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE wallet_service.message_inbox;
+                    END IF;
+                    IF to_regclass('wallet_service.order_asset_release_publications') IS NOT NULL THEN
+                        TRUNCATE TABLE wallet_service.order_asset_release_publications;
                     END IF;
                 END $$;
                 TRUNCATE TABLE
@@ -770,6 +820,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     END IF;
                     IF to_regclass('match_engine.order_cancellations') IS NOT NULL THEN
                         TRUNCATE TABLE match_engine.order_cancellations RESTART IDENTITY CASCADE;
+                    END IF;
+                    IF to_regclass('match_engine.order_admission_inbox') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.order_admission_inbox RESTART IDENTITY CASCADE;
                     END IF;
                 END $$;
                 TRUNCATE TABLE
@@ -919,6 +972,29 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             } finally {
                 buyArray.free();
                 sellArray.free();
+            }
+        }
+    }
+
+    private static MatchAdmissionInboxSnapshot matchAdmissionInboxSnapshot(
+            Connection connection,
+            String marketId) throws Exception {
+        try (PreparedStatement statement = connection.prepareStatement("""
+                SELECT count(*) AS rows,
+                       count(*) FILTER (WHERE status = 'APPLIED') AS applied_rows,
+                       count(*) FILTER (WHERE status != 'APPLIED') AS non_applied_rows
+                FROM match_engine.order_admission_inbox
+                WHERE market_id = ?
+                """)) {
+            statement.setString(1, marketId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return new MatchAdmissionInboxSnapshot(0, 0, 0);
+                }
+                return new MatchAdmissionInboxSnapshot(
+                        resultSet.getLong("rows"),
+                        resultSet.getLong("applied_rows"),
+                        resultSet.getLong("non_applied_rows"));
             }
         }
     }
@@ -1204,24 +1280,36 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         List<SteadySample> validSamples = samples.stream()
                 .filter(sample -> sample.queueReadFailures() == 0)
                 .toList();
+        return summarizeBacklog(validSamples, SteadySample::queueBacklog);
+    }
+
+    static BacklogWindow summarizeOrderReservationInboxBacklog(List<SteadySample> samples) {
+        return summarizeBacklog(samples, SteadySample::orderReservationInboxBacklog);
+    }
+
+    private static BacklogWindow summarizeBacklog(
+            List<SteadySample> validSamples,
+            ToLongFunction<SteadySample> valueExtractor) {
         if (validSamples.isEmpty()) {
             return new BacklogWindow(-1, -1, -1, 0, 0);
         }
         SteadySample first = validSamples.get(0);
         SteadySample last = validSamples.get(validSamples.size() - 1);
         long max = validSamples.stream()
-                .mapToLong(SteadySample::queueBacklog)
+                .mapToLong(valueExtractor)
                 .max()
                 .orElse(-1);
         return new BacklogWindow(
-                first.queueBacklog(),
-                last.queueBacklog(),
+                valueExtractor.applyAsLong(first),
+                valueExtractor.applyAsLong(last),
                 max,
-                backlogSlope(validSamples),
+                backlogSlope(validSamples, valueExtractor),
                 validSamples.size());
     }
 
-    private static double backlogSlope(List<SteadySample> samples) {
+    private static double backlogSlope(
+            List<SteadySample> samples,
+            ToLongFunction<SteadySample> valueExtractor) {
         if (samples.size() < 2) {
             return 0;
         }
@@ -1232,7 +1320,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         double sumXY = 0;
         for (SteadySample sample : samples) {
             double x = sample.elapsedSeconds() - origin;
-            double y = sample.queueBacklog();
+            double y = valueExtractor.applyAsLong(sample);
             sumX += x;
             sumY += y;
             sumXX += x * x;
@@ -1653,7 +1741,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         lastProgressBucket = progressBucket;
                         System.out.printf(
                                 "steady progress elapsed=%.1fs accepted=%d completed=%d "
-                                        + "match=%d order=%d wallet=%d queueBacklog=%d failures=%d%n",
+                                        + "match=%d order=%d wallet=%d queueBacklog=%d "
+                                        + "orderReservationInboxBacklog=%d failures=%d%n",
                                 sample.elapsedSeconds(),
                                 sample.httpAccepted(),
                                 sample.completedTrades(),
@@ -1661,6 +1750,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                                 sample.orderTrades(),
                                 sample.walletTrades(),
                                 sample.queueBacklog(),
+                                sample.orderReservationInboxBacklog(),
                                 sample.httpFailures());
                     }
                     nextSampleAt += TimeUnit.SECONDS.toNanos(config.sampleIntervalSeconds());
@@ -1696,6 +1786,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     "SELECT count(*) FROM wallet_service.trade_settlements",
                     common.marketId()), baseline.walletTrades(), "wallet trades");
             QueueSnapshot queues = readQueues(config.common(), httpClient, objectMapper);
+            long orderReservationInboxBacklog = queryLong(
+                    databases.order(),
+                    "SELECT count(*) FROM order_service.order_asset_reservation_result_inbox "
+                            + "WHERE status IN ('PENDING', 'FAILED_RETRYABLE', 'IN_PROGRESS')");
             return new SteadySample(
                     elapsedSince(startedAtNanos),
                     counters.accepted(),
@@ -1705,7 +1799,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     walletTrades,
                     Math.min(matchTrades, Math.min(orderTrades, walletTrades)),
                     queues.backlog(),
-                    queues.readFailures());
+                    queues.readFailures(),
+                    orderReservationInboxBacklog);
         }
 
         private SteadyWindow deriveSteadyWindow(List<SteadySample> samples) {
@@ -1740,6 +1835,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             double completedTps = completed / Math.max(seconds, 0.001);
             double completionToAcceptedRatio = completed / Math.max(accepted / 2.0, 0.001);
             BacklogWindow backlog = summarizeBacklog(windowSamples);
+            BacklogWindow orderReservationInboxBacklog =
+                    summarizeOrderReservationInboxBacklog(windowSamples);
             long queueReadFailures = windowSamples.stream().mapToLong(SteadySample::queueReadFailures).sum();
             return new SteadyWindow(
                     first.elapsedSeconds(),
@@ -1756,6 +1853,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     backlog.end(),
                     backlog.max(),
                     backlog.slopePerSecond(),
+                    orderReservationInboxBacklog.start(),
+                    orderReservationInboxBacklog.end(),
+                    orderReservationInboxBacklog.max(),
+                    orderReservationInboxBacklog.slopePerSecond(),
                     queueReadFailures,
                     windowSamples.size());
         }
@@ -1853,6 +1954,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         databases.order(),
                         "SELECT count(*) FROM order_service.order_event_store WHERE event_type = ?",
                         "OrderAssetReservationConfirmedV1"), baseline.confirmed(), "confirmed orders");
+                OrderProjectionSnapshot orderProjection = orderProjectionSnapshot(
+                        databases.order(), common.marketId());
+                MatchAdmissionInboxSnapshot matchInbox =
+                        matchAdmissionInboxSnapshot(databases.match(), common.marketId());
                 long matchedOrders = runDelta(queryLong(
                         databases.order(),
                         """
@@ -1891,6 +1996,14 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 boolean countsReached = submitted == expectedOutcome.acceptedOrders()
                         && reservationClaims == expectedOutcome.acceptedOrders()
                         && confirmed == expectedOutcome.acceptedOrders()
+                        && orderProjection.rows() == expectedOutcome.acceptedOrders()
+                        && orderProjection.reservationSucceededRows() == expectedOutcome.acceptedOrders()
+                        && orderProjection.userVisibleMatchedRows()
+                        == expectedOutcome.pairableTrades() * 2L
+                        && orderProjection.lagEvents() == 0
+                        && matchInbox.rows() == expectedOutcome.acceptedOrders()
+                        && matchInbox.appliedRows() == expectedOutcome.acceptedOrders()
+                        && matchInbox.nonAppliedRows() == 0
                         && matchedOrders == expectedOutcome.pairableTrades() * 2L
                         && matchTrades == expectedOutcome.pairableTrades()
                         && orderTrades == expectedOutcome.pairableTrades()
@@ -1926,6 +2039,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         submitted,
                         reservationClaims,
                         confirmed,
+                        orderProjection.rows(),
+                        orderProjection.reservationSucceededRows(),
+                        orderProjection.userVisibleMatchedRows(),
+                        orderProjection.checkpoint(),
+                        orderProjection.eventStoreMaxPosition(),
+                        orderProjection.lagEvents(),
+                        matchInbox.rows(),
+                        matchInbox.appliedRows(),
+                        matchInbox.nonAppliedRows(),
                         matchedOrders,
                         matchTrades,
                         orderTrades,
@@ -1946,6 +2068,51 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 TimeUnit.MILLISECONDS.sleep(500);
             }
             return latest;
+        }
+
+        private OrderProjectionSnapshot orderProjectionSnapshot(
+                Connection order,
+                String marketId) throws Exception {
+            try (PreparedStatement statement = order.prepareStatement("""
+                    SELECT count(*) AS projection_rows,
+                           count(*) FILTER (
+                               WHERE oc.asset_reservation_status = 'SUCCEEDED')
+                               AS reservation_succeeded_rows,
+                           count(*) FILTER (
+                               WHERE ms.status = 'MATCHED'
+                                 AND ms.remaining_amount = 0
+                                 AND ms.asset_reservation_status = 'SUCCEEDED')
+                               AS user_visible_matched_rows,
+                           COALESCE((
+                               SELECT last_global_position
+                               FROM order_service.projection_checkpoints
+                               WHERE projection_name = 'orders_current'
+                           ), 0) AS checkpoint,
+                           COALESCE((
+                               SELECT max(global_position)
+                               FROM order_service.order_event_store
+                           ), 0) AS event_store_max_position
+                    FROM order_service.orders_current oc
+                    LEFT JOIN order_service.order_matching_state ms
+                      ON ms.order_id = oc.order_id
+                    WHERE oc.market_id = ?
+                    """)) {
+                statement.setString(1, marketId);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    if (!resultSet.next()) {
+                        return OrderProjectionSnapshot.empty();
+                    }
+                    long checkpoint = resultSet.getLong("checkpoint");
+                    long eventStoreMaxPosition = resultSet.getLong("event_store_max_position");
+                    return new OrderProjectionSnapshot(
+                            resultSet.getLong("projection_rows"),
+                            resultSet.getLong("reservation_succeeded_rows"),
+                            resultSet.getLong("user_visible_matched_rows"),
+                            checkpoint,
+                            eventStoreMaxPosition,
+                            Math.max(0, eventStoreMaxPosition - checkpoint));
+                }
+            }
         }
 
         private static boolean balancesConverged(
@@ -2138,6 +2305,18 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (window.maxBacklog() > config.maxSteadyBacklog()) {
                 reasons.add("steady_queue_backlog_above_limit");
             }
+            if (exceedsMeaningfulBacklogGrowth(
+                    window.orderReservationInboxBacklogSlopePerSecond(),
+                    window.orderReservationInboxBacklogStart(),
+                    window.orderReservationInboxBacklogEnd(),
+                    window.observedSeconds(),
+                    config.targetOrderTps(),
+                    config.maxBacklogGrowthPerSecond())) {
+                reasons.add("steady_order_reservation_inbox_backlog_growing");
+            }
+            if (window.orderReservationInboxBacklogMax() > config.maxSteadyBacklog()) {
+                reasons.add("steady_order_reservation_inbox_backlog_above_limit");
+            }
             if (window.queueReadFailures() != 0) {
                 reasons.add("steady_queue_metrics_read_failures");
             }
@@ -2146,6 +2325,21 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     || completion.confirmed() != expectedOutcome.acceptedOrders()
                     || completion.matchedOrders() != expectedOutcome.pairableTrades() * 2L) {
                 reasons.add("final_order_fact_count_mismatch");
+            }
+            if (completion.orderProjectionRows() != expectedOutcome.acceptedOrders()
+                    || completion.orderProjectionReservationSucceededRows()
+                    != expectedOutcome.acceptedOrders()
+                    || completion.orderProjectionLagEvents() != 0) {
+                reasons.add("order_projection_not_converged");
+            }
+            if (completion.userVisibleMatchedOrderRows()
+                    != expectedOutcome.pairableTrades() * 2L) {
+                reasons.add("order_query_view_not_converged");
+            }
+            if (completion.matchAdmissionInboxRows() != expectedOutcome.acceptedOrders()
+                    || completion.matchAdmissionInboxAppliedRows() != expectedOutcome.acceptedOrders()
+                    || completion.matchAdmissionInboxNonAppliedRows() != 0) {
+                reasons.add("match_admission_inbox_not_converged");
             }
             if (completion.matchTrades() != expectedOutcome.pairableTrades()
                     || completion.orderTrades() != expectedOutcome.pairableTrades()
@@ -2189,12 +2383,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             }
             try (BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8)) {
                 writer.write("elapsed_seconds,http_accepted,http_failures,match_trades,order_trades,"
-                        + "wallet_trades,completed_trades,queue_backlog,queue_read_failures\n");
+                        + "wallet_trades,completed_trades,queue_backlog,queue_read_failures,"
+                        + "order_reservation_inbox_backlog\n");
                 synchronized (samples) {
                     for (SteadySample sample : samples) {
                         writer.write(String.format(
                                 java.util.Locale.ROOT,
-                                "%.4f,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                                "%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
                                 sample.elapsedSeconds(),
                                 sample.httpAccepted(),
                                 sample.httpFailures(),
@@ -2203,7 +2398,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                                 sample.walletTrades(),
                                 sample.completedTrades(),
                                 sample.queueBacklog(),
-                                sample.queueReadFailures()));
+                                sample.queueReadFailures(),
+                                sample.orderReservationInboxBacklog()));
                     }
                 }
             }
@@ -2287,6 +2483,14 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"steadyMaxBacklog\": %d,%n", window.maxBacklog());
             System.out.printf("  \"steadyBacklogSlopePerSecond\": %.4f,%n",
                     window.backlogSlopePerSecond());
+            System.out.printf("  \"steadyOrderReservationInboxBacklogStart\": %d,%n",
+                    window.orderReservationInboxBacklogStart());
+            System.out.printf("  \"steadyOrderReservationInboxBacklogEnd\": %d,%n",
+                    window.orderReservationInboxBacklogEnd());
+            System.out.printf("  \"steadyOrderReservationInboxBacklogMax\": %d,%n",
+                    window.orderReservationInboxBacklogMax());
+            System.out.printf("  \"steadyOrderReservationInboxBacklogSlopePerSecond\": %.4f,%n",
+                    window.orderReservationInboxBacklogSlopePerSecond());
             System.out.printf("  \"minOfferedLoadRatio\": %.4f,%n", config.minOfferedLoadRatio());
             System.out.printf("  \"minCompletionRatio\": %.4f,%n", config.minCompletionRatio());
             System.out.printf("  \"maxBacklogGrowthPerSecond\": %.4f,%n",
@@ -2295,6 +2499,31 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"finalOrderSubmissionRows\": %d,%n", completion.submitted());
             System.out.printf("  \"finalWalletReservationRows\": %d,%n", completion.reservationClaims());
             System.out.printf("  \"finalOrderConfirmationRows\": %d,%n", completion.confirmed());
+            System.out.printf("  \"finalOrderProjectionRows\": %d,%n",
+                    completion.orderProjectionRows());
+            System.out.printf("  \"finalOrderProjectionReservationSucceededRows\": %d,%n",
+                    completion.orderProjectionReservationSucceededRows());
+            System.out.printf("  \"finalUserVisibleMatchedOrderRows\": %d,%n",
+                    completion.userVisibleMatchedOrderRows());
+            System.out.printf("  \"finalOrderProjectionCheckpoint\": %d,%n",
+                    completion.orderProjectionCheckpoint());
+            System.out.printf("  \"finalOrderEventStoreMaxPosition\": %d,%n",
+                    completion.orderEventStoreMaxPosition());
+            System.out.printf("  \"finalOrderProjectionLagEvents\": %d,%n",
+                    completion.orderProjectionLagEvents());
+            System.out.printf("  \"orderReadModelConverged\": %s,%n",
+                    completion.orderProjectionRows() == expectedOutcome.acceptedOrders()
+                            && completion.orderProjectionReservationSucceededRows()
+                            == expectedOutcome.acceptedOrders()
+                            && completion.userVisibleMatchedOrderRows()
+                            == expectedOutcome.pairableTrades() * 2L
+                            && completion.orderProjectionLagEvents() == 0);
+            System.out.printf("  \"matchAdmissionInboxRows\": %d,%n",
+                    completion.matchAdmissionInboxRows());
+            System.out.printf("  \"matchAdmissionInboxAppliedRows\": %d,%n",
+                    completion.matchAdmissionInboxAppliedRows());
+            System.out.printf("  \"matchAdmissionInboxNonAppliedRows\": %d,%n",
+                    completion.matchAdmissionInboxNonAppliedRows());
             System.out.printf("  \"finalMatchedOrderRows\": %d,%n", completion.matchedOrders());
             System.out.printf("  \"finalMatchTradeRows\": %d,%n", completion.matchTrades());
             System.out.printf("  \"finalOrderTradeRows\": %d,%n", completion.orderTrades());
@@ -2448,7 +2677,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             try (DatabaseHandles databases = DatabaseHandles.open(config.common());
                  BufferedWriter writer = Files.newBufferedWriter(monitorOutputPath, StandardCharsets.UTF_8)) {
                 writer.write("epoch_millis,match_trades,order_trades,wallet_trades,completed_trades,"
-                        + "queue_backlog,queue_read_failures\n");
+                        + "queue_backlog,queue_read_failures,order_reservation_inbox_backlog\n");
                 writeMonitorSample(writer, databases, baseline);
                 Files.writeString(monitorReadyPath, "ready\n", StandardCharsets.UTF_8);
                 System.out.printf("external monitor ready: %s%n", monitorReadyPath);
@@ -2561,14 +2790,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     baseline);
             writer.write(String.format(
                     java.util.Locale.ROOT,
-                    "%d,%d,%d,%d,%d,%d,%d%n",
+                    "%d,%d,%d,%d,%d,%d,%d,%d%n",
                     System.currentTimeMillis(),
                     sample.matchTrades(),
                     sample.orderTrades(),
                     sample.walletTrades(),
                     sample.completedTrades(),
                     sample.queueBacklog(),
-                    sample.queueReadFailures()));
+                    sample.queueReadFailures(),
+                    sample.orderReservationInboxBacklog()));
             writer.flush();
         }
 
@@ -2662,7 +2892,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     continue;
                 }
                 String[] values = line.split(",", -1);
-                if (values.length != 7) {
+                if (values.length != 8) {
                     throw new IOException("invalid external monitor CSV row: " + line);
                 }
                 long sampleEpochMillis = Long.parseLong(values[0]);
@@ -2687,7 +2917,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         Long.parseLong(values[3]),
                         Long.parseLong(values[4]),
                         Long.parseLong(values[5]),
-                        Long.parseLong(values[6])));
+                        Long.parseLong(values[6]),
+                        Long.parseLong(values[7])));
             }
             return List.copyOf(samples);
         }
@@ -3183,6 +3414,21 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     || completion.matchedOrders() != expectedOutcome.pairableTrades() * 2L) {
                 reasons.add("final_order_fact_count_mismatch");
             }
+            if (completion.orderProjectionRows() != expectedOutcome.acceptedOrders()
+                    || completion.orderProjectionReservationSucceededRows()
+                    != expectedOutcome.acceptedOrders()
+                    || completion.orderProjectionLagEvents() != 0) {
+                reasons.add("order_projection_not_converged");
+            }
+            if (completion.userVisibleMatchedOrderRows()
+                    != expectedOutcome.pairableTrades() * 2L) {
+                reasons.add("order_query_view_not_converged");
+            }
+            if (completion.matchAdmissionInboxRows() != expectedOutcome.acceptedOrders()
+                    || completion.matchAdmissionInboxAppliedRows() != expectedOutcome.acceptedOrders()
+                    || completion.matchAdmissionInboxNonAppliedRows() != 0) {
+                reasons.add("match_admission_inbox_not_converged");
+            }
             if (completion.matchTrades() != expectedOutcome.pairableTrades()
                     || completion.orderTrades() != expectedOutcome.pairableTrades()
                     || completion.walletTrades() != expectedOutcome.pairableTrades()) {
@@ -3356,6 +3602,31 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"finalOrderSubmissionRows\": %d,%n", completion.submitted());
             System.out.printf("  \"finalWalletReservationRows\": %d,%n", completion.reservationClaims());
             System.out.printf("  \"finalOrderConfirmationRows\": %d,%n", completion.confirmed());
+            System.out.printf("  \"finalOrderProjectionRows\": %d,%n",
+                    completion.orderProjectionRows());
+            System.out.printf("  \"finalOrderProjectionReservationSucceededRows\": %d,%n",
+                    completion.orderProjectionReservationSucceededRows());
+            System.out.printf("  \"finalUserVisibleMatchedOrderRows\": %d,%n",
+                    completion.userVisibleMatchedOrderRows());
+            System.out.printf("  \"finalOrderProjectionCheckpoint\": %d,%n",
+                    completion.orderProjectionCheckpoint());
+            System.out.printf("  \"finalOrderEventStoreMaxPosition\": %d,%n",
+                    completion.orderEventStoreMaxPosition());
+            System.out.printf("  \"finalOrderProjectionLagEvents\": %d,%n",
+                    completion.orderProjectionLagEvents());
+            System.out.printf("  \"orderReadModelConverged\": %s,%n",
+                    completion.orderProjectionRows() == expectedOutcome.acceptedOrders()
+                            && completion.orderProjectionReservationSucceededRows()
+                            == expectedOutcome.acceptedOrders()
+                            && completion.userVisibleMatchedOrderRows()
+                            == expectedOutcome.pairableTrades() * 2L
+                            && completion.orderProjectionLagEvents() == 0);
+            System.out.printf("  \"matchAdmissionInboxRows\": %d,%n",
+                    completion.matchAdmissionInboxRows());
+            System.out.printf("  \"matchAdmissionInboxAppliedRows\": %d,%n",
+                    completion.matchAdmissionInboxAppliedRows());
+            System.out.printf("  \"matchAdmissionInboxNonAppliedRows\": %d,%n",
+                    completion.matchAdmissionInboxNonAppliedRows());
             System.out.printf("  \"finalMatchedOrderRows\": %d,%n", completion.matchedOrders());
             System.out.printf("  \"finalMatchTradeRows\": %d,%n", completion.matchTrades());
             System.out.printf("  \"finalOrderTradeRows\": %d,%n", completion.orderTrades());
@@ -3511,7 +3782,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long walletTrades,
             long completedTrades,
             long queueBacklog,
-            long queueReadFailures) {
+            long queueReadFailures,
+            long orderReservationInboxBacklog) {
     }
 
     record BacklogWindow(
@@ -3537,11 +3809,16 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long endBacklog,
             long maxBacklog,
             double backlogSlopePerSecond,
+            long orderReservationInboxBacklogStart,
+            long orderReservationInboxBacklogEnd,
+            long orderReservationInboxBacklogMax,
+            double orderReservationInboxBacklogSlopePerSecond,
             long queueReadFailures,
             int samples) {
         private static SteadyWindow empty() {
             return new SteadyWindow(
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, Double.POSITIVE_INFINITY,
                     0, 0, 0, Double.POSITIVE_INFINITY, 0, 0);
         }
     }
@@ -3574,6 +3851,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long submitted,
             long reservationClaims,
             long confirmed,
+            long orderProjectionRows,
+            long orderProjectionReservationSucceededRows,
+            long userVisibleMatchedOrderRows,
+            long orderProjectionCheckpoint,
+            long orderEventStoreMaxPosition,
+            long orderProjectionLagEvents,
+            long matchAdmissionInboxRows,
+            long matchAdmissionInboxAppliedRows,
+            long matchAdmissionInboxNonAppliedRows,
             long matchedOrders,
             long matchTrades,
             long orderTrades,
@@ -3590,10 +3876,23 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             double elapsedSeconds) {
         private static SteadyCompletion empty() {
             return new SteadyCompletion(
+                    0, 0, 0, 0, 0, 0, 0, 0, Long.MAX_VALUE,
                     0, 0, 0, 0, 0, 0, 0,
                     RoleBalances.empty(), RoleBalances.empty(),
                     -1, -1, -1, TradeIdDigestCheck.empty(),
                     Long.MAX_VALUE, 0, Map.of(), 0);
+        }
+    }
+
+    private record OrderProjectionSnapshot(
+            long rows,
+            long reservationSucceededRows,
+            long userVisibleMatchedRows,
+            long checkpoint,
+            long eventStoreMaxPosition,
+            long lagEvents) {
+        private static OrderProjectionSnapshot empty() {
+            return new OrderProjectionSnapshot(0, 0, 0, 0, 0, 0);
         }
     }
 
@@ -3956,13 +4255,17 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long submitted,
             long reservationClaims,
             long confirmed,
+            long matchAdmissionInboxRows,
+            long matchAdmissionInboxAppliedRows,
+            long matchAdmissionInboxNonAppliedRows,
             long sellBook,
             long finalQueueBacklog,
             long queueReadFailures,
             long maxQueueBacklog,
             double elapsedSeconds) {
         static SellAdmissionResult empty() {
-            return new SellAdmissionResult(0, 0, 0, 0, Long.MAX_VALUE, 0, 0, 0);
+            return new SellAdmissionResult(
+                    0, 0, 0, 0, 0, 0, 0, Long.MAX_VALUE, 0, 0, 0);
         }
     }
 
@@ -3992,6 +4295,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long submitted,
             long reservationClaims,
             long confirmed,
+            long matchAdmissionInboxRows,
+            long matchAdmissionInboxAppliedRows,
+            long matchAdmissionInboxNonAppliedRows,
             long matchedOrders,
             long matchTrades,
             long orderTrades,
@@ -4010,11 +4316,17 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             double postCompletionVerificationSeconds) {
         static CompletionResult empty() {
             return new CompletionResult(
-                    0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     RoleBalances.empty(), RoleBalances.empty(),
                     -1, -1, -1, TradeIdSetCheck.empty(),
                     Long.MAX_VALUE, 0, 0, Map.of(), 0, 0);
         }
+    }
+
+    private record MatchAdmissionInboxSnapshot(
+            long rows,
+            long appliedRows,
+            long nonAppliedRows) {
     }
 
     private record DatabaseHandles(Connection order, Connection wallet, Connection match)

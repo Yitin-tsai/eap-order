@@ -1,7 +1,7 @@
 package com.eap.eap_order.application.OutBound;
 
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.cloud.openfeign.FeignClient;
 
@@ -9,5 +9,5 @@ import org.springframework.cloud.openfeign.FeignClient;
 public interface EapWallet {
 
     @PostMapping("/v1/wallet/check")
-    public boolean checkWallet(OrderConfirmedEvent event) ;
+    public boolean checkWallet(OrderAssetReservationSucceededEvent event) ;
 }

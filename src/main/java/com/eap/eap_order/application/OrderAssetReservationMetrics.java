@@ -13,6 +13,7 @@ public class OrderAssetReservationMetrics {
     private final Timer listenerTimer;
     private final Timer deserializeTimer;
     private final Timer confirmAllTimer;
+    private final Timer inboxIntakeTimer;
     private final Timer statusUpdateTimer;
     private final Timer ackTimer;
     private final DistributionSummary batchSizeSummary;
@@ -21,15 +22,19 @@ public class OrderAssetReservationMetrics {
         this.listenerTimer = stageTimer(
                 registry,
                 "eap_order_asset_reservation_confirmed_listener_duration",
-                "Wall-clock time spent handling a batch of OrderConfirmedEvent messages in Order service");
+                "Wall-clock time spent handling a batch of OrderAssetReservationSucceededEvent messages in Order service");
         this.deserializeTimer = stageTimer(
                 registry,
                 "eap_order_asset_reservation_confirmed_deserialize_duration",
-                "Time spent deserializing OrderConfirmedEvent messages in Order service");
+                "Time spent deserializing OrderAssetReservationSucceededEvent messages in Order service");
         this.confirmAllTimer = stageTimer(
                 registry,
                 "eap_order_asset_reservation_confirmed_confirm_all_duration",
                 "Time spent appending OrderAssetReservationConfirmed events in Order service");
+        this.inboxIntakeTimer = stageTimer(
+                registry,
+                "eap_order_asset_reservation_result_inbox_intake_duration",
+                "Time spent durably recording Wallet asset reservation results before RabbitMQ acknowledgement");
         this.statusUpdateTimer = stageTimer(
                 registry,
                 "eap_order_asset_reservation_confirmed_status_update_duration",
@@ -37,9 +42,9 @@ public class OrderAssetReservationMetrics {
         this.ackTimer = stageTimer(
                 registry,
                 "eap_order_asset_reservation_confirmed_ack_duration",
-                "Time spent acknowledging OrderConfirmedEvent messages to RabbitMQ");
+                "Time spent acknowledging OrderAssetReservationSucceededEvent messages to RabbitMQ");
         this.batchSizeSummary = DistributionSummary.builder("eap_order_asset_reservation_confirmed_batch_size")
-                .description("Number of OrderConfirmedEvent messages per Order asset-reservation listener batch")
+                .description("Number of OrderAssetReservationSucceededEvent messages per Order asset-reservation listener batch")
                 .register(registry);
     }
 
@@ -57,6 +62,10 @@ public class OrderAssetReservationMetrics {
 
     public void recordConfirmAll(Duration duration) {
         confirmAllTimer.record(duration);
+    }
+
+    public void recordInboxIntake(Duration duration) {
+        inboxIntakeTimer.record(duration);
     }
 
     public void recordStatusUpdate(Duration duration) {

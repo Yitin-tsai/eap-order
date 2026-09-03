@@ -17,7 +17,7 @@ import static com.eap.common.constants.RabbitMQConstants.*;
  * Order Module RabbitMQ Configuration
  * 
  * This module consumes:
- * - order.confirmed events (for status updates after wallet validation)
+ * - order.asset-reservation.succeeded events (for status updates after wallet validation)
  * - trade.executed events (for matched order-state application)
  * - order.failed events (for failure handling)
  * - order.cancellation.result events (for the final cancellation decision)
@@ -65,8 +65,8 @@ public class RabbitMQConfig {
   // --- Order module queues (with DLX binding) ---
 
   @Bean
-  public Queue orderOrderConfirmedQueue() {
-    return QueueBuilder.durable(ORDER_ORDER_CONFIRMED_QUEUE)
+  public Queue orderAssetReservationSucceededQueue() {
+    return QueueBuilder.durable(ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE)
         .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
         .build();
   }
@@ -93,9 +93,17 @@ public class RabbitMQConfig {
   }
 
   @Bean
-  public Binding orderOrderConfirmedBinding(@Qualifier("orderOrderConfirmedQueue") Queue orderOrderConfirmedQueue,
+  public Queue orderAssetReservationReleasedQueue() {
+    return QueueBuilder.durable(ORDER_ASSET_RESERVATION_RELEASED_QUEUE)
+        .withArgument("x-dead-letter-exchange", DEAD_LETTER_EXCHANGE)
+        .build();
+  }
+
+  @Bean
+  public Binding orderAssetReservationSucceededBinding(
+      @Qualifier("orderAssetReservationSucceededQueue") Queue queue,
       @Qualifier("orderExchange") TopicExchange orderExchange) {
-    return BindingBuilder.bind(orderOrderConfirmedQueue).to(orderExchange).with(ORDER_CONFIRMED_KEY);
+    return BindingBuilder.bind(queue).to(orderExchange).with(ORDER_ASSET_RESERVATION_SUCCEEDED_KEY);
   }
 
   @Bean
@@ -116,6 +124,13 @@ public class RabbitMQConfig {
       @Qualifier("orderOrderCancellationResultQueue") Queue queue,
       @Qualifier("orderExchange") TopicExchange orderExchange) {
     return BindingBuilder.bind(queue).to(orderExchange).with(ORDER_CANCELLATION_RESULT_KEY);
+  }
+
+  @Bean
+  public Binding orderAssetReservationReleasedBinding(
+      @Qualifier("orderAssetReservationReleasedQueue") Queue queue,
+      @Qualifier("orderExchange") TopicExchange orderExchange) {
+    return BindingBuilder.bind(queue).to(orderExchange).with(ORDER_ASSET_RESERVATION_RELEASED_KEY);
   }
 
   // --- Auction Exchange and Queues ---

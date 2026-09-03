@@ -19,5 +19,6 @@ public class ListUserOrderRes {
         private String updateTime;
         private String orderId;
         private String status;
+        private String assetReservationStatus;
     }
 }

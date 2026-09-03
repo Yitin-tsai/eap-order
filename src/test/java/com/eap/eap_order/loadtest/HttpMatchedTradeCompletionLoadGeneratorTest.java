@@ -92,11 +92,34 @@ class HttpMatchedTradeCompletionLoadGeneratorTest {
         assertThat(summary.validSamples()).isZero();
     }
 
+    @Test
+    void orderReservationInboxBacklogSummary_isIndependentFromRabbitQueueBacklog() {
+        var summary = HttpMatchedTradeCompletionLoadGenerator
+                .summarizeOrderReservationInboxBacklog(List.of(
+                        sample(0, 0, 0, 5),
+                        sample(1, 0, 0, 15),
+                        sample(2, 0, 0, 25)));
+
+        assertThat(summary.start()).isEqualTo(5);
+        assertThat(summary.end()).isEqualTo(25);
+        assertThat(summary.max()).isEqualTo(25);
+        assertThat(summary.slopePerSecond()).isEqualTo(10.0);
+    }
+
     private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
             double elapsedSeconds,
             long queueBacklog,
             long queueReadFailures) {
+        return sample(elapsedSeconds, queueBacklog, queueReadFailures, 0);
+    }
+
+    private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
+            double elapsedSeconds,
+            long queueBacklog,
+            long queueReadFailures,
+            long orderReservationInboxBacklog) {
         return new HttpMatchedTradeCompletionLoadGenerator.SteadySample(
-                elapsedSeconds, 0, 0, 0, 0, 0, 0, queueBacklog, queueReadFailures);
+                elapsedSeconds, 0, 0, 0, 0, 0, 0,
+                queueBacklog, queueReadFailures, orderReservationInboxBacklog);
     }
 }

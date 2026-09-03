@@ -4,7 +4,7 @@ import com.eap.common.dto.AuctionBidRequest;
 import com.eap.common.dto.AuctionBidResponse;
 import com.eap.common.dto.AuctionConfigDto;
 import com.eap.common.dto.AuctionStatusDto;
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.dto.OrderBookResponseDto;
 import com.eap.common.dto.MarketSummaryDto;
 import org.springframework.cloud.openfeign.FeignClient;
@@ -17,7 +17,7 @@ import java.util.List;
 public interface EapMatchEngine {
 
     @GetMapping("/v1/order/query")
-    ResponseEntity<List<OrderConfirmedEvent>> queryOrder(@RequestParam("userId") String userId);
+    ResponseEntity<List<OrderAssetReservationSucceededEvent>> queryOrder(@RequestParam("userId") String userId);
 
     /**
      * 獲取訂單簿數據

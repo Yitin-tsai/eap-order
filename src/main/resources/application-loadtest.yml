@@ -81,9 +81,9 @@ eap:
     poll-interval-ms: ${EAP_ORDER_OUTBOX_POLL_INTERVAL_MS:100}
   order-projection:
     enabled: true
-    batch-size: 500
-    max-batches-per-tick: 1
-    poll-interval-ms: ${EAP_ORDER_PROJECTION_POLL_INTERVAL_MS:5000}
+    batch-size: ${EAP_ORDER_PROJECTION_BATCH_SIZE:500}
+    max-batches-per-tick: ${EAP_ORDER_PROJECTION_MAX_BATCHES_PER_TICK:4}
+    poll-interval-ms: ${EAP_ORDER_PROJECTION_POLL_INTERVAL_MS:100}
     repair:
       enabled: ${EAP_ORDER_PROJECTION_REPAIR_ENABLED:false}
       batch-size: 100

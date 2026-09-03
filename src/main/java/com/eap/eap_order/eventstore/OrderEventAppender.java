@@ -4,6 +4,8 @@ import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationAcceptedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationCompletedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
@@ -101,12 +103,14 @@ public class OrderEventAppender {
                 SET remaining_amount = matching_input.remaining_amount,
                     matched_amount = matching_input.matched_amount,
                     status = matching_input.order_status,
+                    asset_reservation_status = 'SUCCEEDED',
                     last_trade_id = matching_input.trade_id,
                     updated_at = CURRENT_TIMESTAMP
                 FROM matching_input
                 WHERE state.order_id = matching_input.order_id
                   AND state.remaining_amount = matching_input.previous_remaining_amount
-                  AND state.status IN ('OPEN', 'PARTIALLY_MATCHED')
+                  AND state.status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                  AND state.asset_reservation_status = 'SUCCEEDED'
                   AND state.remaining_amount >= matching_input.quantity
                 RETURNING 1
             )
@@ -192,13 +196,24 @@ public class OrderEventAppender {
             ),
             upserted_matching_state AS (
                 INSERT INTO order_service.order_matching_state
-                    (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-                SELECT aggregate_id, user_id, remaining_amount, 0, order_status, CURRENT_TIMESTAMP
+                    (order_id, user_id, remaining_amount, matched_amount, status,
+                     asset_reservation_status, updated_at)
+                SELECT aggregate_id, user_id, remaining_amount, 0, order_status,
+                       'SUCCEEDED', CURRENT_TIMESTAMP
                 FROM prepared
                 ON CONFLICT (order_id) DO UPDATE
                 SET user_id = EXCLUDED.user_id,
-                    remaining_amount = EXCLUDED.remaining_amount,
-                    status = EXCLUDED.status,
+                    remaining_amount = CASE
+                        WHEN order_service.order_matching_state.status = 'PENDING_ASSET_CHECK'
+                        THEN EXCLUDED.remaining_amount
+                        ELSE order_service.order_matching_state.remaining_amount
+                    END,
+                    status = CASE
+                        WHEN order_service.order_matching_state.status = 'PENDING_ASSET_CHECK'
+                        THEN EXCLUDED.status
+                        ELSE order_service.order_matching_state.status
+                    END,
+                    asset_reservation_status = 'SUCCEEDED',
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING order_id
             )
@@ -286,6 +301,10 @@ public class OrderEventAppender {
     }
 
     public OrderEventAppendResult appendFromConsumer(OrderEventAppendCommand command) {
+        if (isAssetReservationConfirmed(command)) {
+            return consumerTransactionTemplate.execute(status ->
+                    appendAssetReservationConfirmedInTransaction(command));
+        }
         return consumerTransactionTemplate.execute(status -> appendInTransaction(command, consumerJdbc));
     }
 
@@ -335,7 +354,7 @@ public class OrderEventAppender {
                         if (!appended) {
                             long fallbackStartedNanos = System.nanoTime();
                             for (OrderEventAppendCommand command : commands) {
-                                appendInTransaction(command, consumerJdbc);
+                                appendAssetReservationConfirmedInTransaction(command);
                             }
                             assetReservationAppendMetrics.record(
                                     "fallback_individual_append",
@@ -352,7 +371,7 @@ public class OrderEventAppender {
                             || heads.values().stream().anyMatch(head -> head.currentVersion() != 1)) {
                         long fallbackStartedNanos = System.nanoTime();
                         for (OrderEventAppendCommand command : commands) {
-                            appendInTransaction(command, consumerJdbc);
+                            appendAssetReservationConfirmedInTransaction(command);
                         }
                         assetReservationAppendMetrics.record("fallback_individual_append", fallbackStartedNanos);
                         return;
@@ -376,6 +395,31 @@ public class OrderEventAppender {
         }
     }
 
+    private boolean isAssetReservationConfirmed(OrderEventAppendCommand command) {
+        return command.integrationEvent() == null
+                && command.payload() instanceof OrderAssetReservationConfirmedV1
+                && "OrderAssetReservationConfirmedV1".equals(command.eventType());
+    }
+
+    private OrderEventAppendResult appendAssetReservationConfirmedInTransaction(
+            OrderEventAppendCommand draftCommand) {
+        ExistingEvent existing = findByEventId(consumerJdbc, draftCommand.eventId());
+        if (existing != null) {
+            return existingAppendResult(
+                    draftCommand,
+                    existing,
+                    serialize(draftCommand.payload()),
+                    serialize(draftCommand.metadata()));
+        }
+        StreamHead head = lockHead(consumerJdbc, draftCommand.aggregateId());
+        MatchingState matchingState = lockMatchingState(consumerJdbc, draftCommand.aggregateId());
+        if (matchingState != null && matchingState.hasAdvancedExecution()) {
+            head = alignHeadWithMatchingState(head, matchingState);
+        }
+        OrderEventAppendCommand command = withExpectedVersion(draftCommand, head.currentVersion());
+        return appendInTransactionWithLockedHead(command, consumerJdbc, head);
+    }
+
     public OrderEventAppendResult appendCancellationRequestIfCurrentStateAllows(
             OrderEventAppendCommand command) {
         return commandTransactionTemplate.execute(status ->
@@ -388,6 +432,14 @@ public class OrderEventAppender {
             int cancelledAmount) {
         return consumerTransactionTemplate.execute(status ->
                 appendCancellationAcceptedIfReadyInTransaction(command, cancellationId, cancelledAmount));
+    }
+
+    public OrderEventAppendResult appendCancellationCompletedIfReady(
+            OrderEventAppendCommand command,
+            UUID cancellationId,
+            int releasedQuantity) {
+        return consumerTransactionTemplate.execute(status ->
+                appendCancellationCompletedIfReadyInTransaction(command, cancellationId, releasedQuantity));
     }
 
     public TradeExecutionAppendResult appendTradeMatchedFromCaughtUpProjectionIfTradeApplicationAbsent(
@@ -698,14 +750,18 @@ public class OrderEventAppender {
             OrderEventAppendCommand draftCommand,
             UUID cancellationId,
             int cancelledAmount) {
-        if (!(draftCommand.payload() instanceof OrderCancelledV1 cancelled)) {
+        if (!(draftCommand.payload() instanceof OrderCancellationAcceptedV1 accepted)) {
             throw new IllegalArgumentException(
-                    "Accepted cancellation command must contain OrderCancelledV1 payload");
+                    "Accepted cancellation command must contain OrderCancellationAcceptedV1 payload");
         }
         if (cancelledAmount <= 0) {
             throw new IllegalArgumentException("Accepted cancellation amount must be positive");
         }
-        assertCancellationRequestMatches(draftCommand, cancelled, cancellationId);
+        if (!Objects.equals(accepted.cancellationId(), cancellationId)
+                || accepted.cancelledAmount() != cancelledAmount) {
+            throw new IllegalArgumentException("Accepted cancellation identity must match the result envelope");
+        }
+        assertCancellationRequestMatches(draftCommand, accepted.userId(), cancellationId);
         OrderEventAppendResult existing = existingResultIfPresent(draftCommand, consumerJdbc);
         if (existing != null) {
             return existing;
@@ -719,7 +775,7 @@ public class OrderEventAppender {
             throw new CancellationPrerequisiteNotReadyException(
                     "Order command state is not ready for cancellation: orderId=" + draftCommand.aggregateId());
         }
-        if (!cancelled.userId().equals(state.userId())) {
+        if (!accepted.userId().equals(state.userId())) {
             throw new IllegalStateException("Cancellation result user does not own Order state: orderId="
                     + draftCommand.aggregateId());
         }
@@ -745,9 +801,59 @@ public class OrderEventAppender {
                 command, consumerJdbc, alignHeadWithMatchingState(head, state));
     }
 
+    private OrderEventAppendResult appendCancellationCompletedIfReadyInTransaction(
+            OrderEventAppendCommand draftCommand,
+            UUID cancellationId,
+            int releasedQuantity) {
+        if (!(draftCommand.payload() instanceof OrderCancellationCompletedV1 completed)) {
+            throw new IllegalArgumentException(
+                    "Completed cancellation command must contain OrderCancellationCompletedV1 payload");
+        }
+        if (releasedQuantity <= 0
+                || !Objects.equals(completed.cancellationId(), cancellationId)
+                || completed.releasedQuantity() != releasedQuantity) {
+            throw new IllegalArgumentException("Released cancellation identity must be positive and consistent");
+        }
+        assertCancellationRequestMatches(draftCommand, completed.userId(), cancellationId);
+        OrderEventAppendResult existing = existingResultIfPresent(draftCommand, consumerJdbc);
+        if (existing != null) {
+            return existing;
+        }
+
+        MatchingState state = lockMatchingState(consumerJdbc, draftCommand.aggregateId());
+        if (state == null) {
+            state = lockStreamHeadAsMatchingState(consumerJdbc, draftCommand.aggregateId());
+        }
+        if (state == null
+                || "OPEN".equals(state.status())
+                || "PARTIALLY_MATCHED".equals(state.status())) {
+            throw new CancellationPrerequisiteNotReadyException(
+                    "Order is waiting for the MatchEngine cancellation decision: orderId="
+                            + draftCommand.aggregateId());
+        }
+        if (!completed.userId().equals(state.userId())) {
+            throw new IllegalStateException("Released reservation user does not own Order state: orderId="
+                    + draftCommand.aggregateId());
+        }
+        if (!"CANCELLING".equals(state.status())) {
+            throw new IllegalStateException("Cannot complete cancellation in status " + state.status()
+                    + " for orderId=" + draftCommand.aggregateId());
+        }
+        if (state.remainingAmount() != releasedQuantity) {
+            throw new IllegalStateException("Released quantity conflicts with Order remainder: orderId="
+                    + draftCommand.aggregateId() + ", remaining=" + state.remainingAmount()
+                    + ", released=" + releasedQuantity);
+        }
+
+        StreamHead head = lockHead(consumerJdbc, draftCommand.aggregateId());
+        OrderEventAppendCommand command = withExpectedVersion(draftCommand, head.currentVersion());
+        return appendInTransactionWithLockedHead(
+                command, consumerJdbc, alignHeadWithMatchingState(head, state));
+    }
+
     private void assertCancellationRequestMatches(
             OrderEventAppendCommand resultCommand,
-            OrderCancelledV1 cancelled,
+            UUID userId,
             UUID cancellationId) {
         if (cancellationId == null) {
             throw new IllegalArgumentException("Cancellation result requires cancellationId");
@@ -765,7 +871,7 @@ public class OrderEventAppender {
         OrderCancellationRequestedV1 request = deserializeCancellationRequest(requestEvent.payloadCanonical());
         if (!cancellationId.equals(request.cancellationId())
                 || !resultCommand.aggregateId().equals(request.orderId())
-                || !cancelled.userId().equals(request.userId())) {
+                || !userId.equals(request.userId())) {
             throw new IllegalStateException("Cancellation result conflicts with the persisted request: "
                     + cancellationId);
         }
@@ -874,9 +980,16 @@ public class OrderEventAppender {
             int sellerMatchedQuantity,
             OrderTradeApplication tradeApplication) {
         validateDistinctTradeOrders(buyerDraftCommand, sellerDraftCommand);
-        long lockStartedNanos = System.nanoTime();
-        Map<UUID, MatchingState> states = lockMatchingStatesInStableOrder(
+        List<UUID> orderIds = List.of(
                 buyerDraftCommand.aggregateId(), sellerDraftCommand.aggregateId());
+        long lockStartedNanos = System.nanoTime();
+        Map<UUID, MatchingState> states = lockMatchingStatesInStableOrder(orderIds);
+        if (states.size() != orderIds.size()) {
+            Set<UUID> missingOrderIds = new HashSet<>(orderIds);
+            missingOrderIds.removeAll(states.keySet());
+            ensureMatchingStatesForTrade(missingOrderIds);
+            states = lockMatchingStatesInStableOrder(orderIds);
+        }
         tradeApplyMetrics.record("lock_heads", lockStartedNanos);
         MatchingState buyerState = states.get(buyerDraftCommand.aggregateId());
         MatchingState sellerState = states.get(sellerDraftCommand.aggregateId());
@@ -936,6 +1049,12 @@ public class OrderEventAppender {
         }
         long lockStartedNanos = System.nanoTime();
         Map<UUID, MatchingState> states = lockMatchingStatesInStableOrder(aggregateIds);
+        if (states.size() != aggregateIds.size()) {
+            Set<UUID> missingOrderIds = new HashSet<>(aggregateIds);
+            missingOrderIds.removeAll(states.keySet());
+            ensureMatchingStatesForTrade(missingOrderIds);
+            states = lockMatchingStatesInStableOrder(aggregateIds);
+        }
         tradeApplyMetrics.record("batch_lock_heads", lockStartedNanos);
         if (states.size() != aggregateIds.size()) {
             return TradeApplicationBatchAppendResult.notBatchable(
@@ -1022,7 +1141,8 @@ public class OrderEventAppender {
     private Map<UUID, MatchingState> lockMatchingStatesInStableOrder(Collection<UUID> orderIds) {
         Map<UUID, MatchingState> states = new HashMap<>();
         consumerJdbc.query("""
-                SELECT order_id, user_id, remaining_amount, matched_amount, status
+                SELECT order_id, user_id, remaining_amount, matched_amount, status,
+                       asset_reservation_status
                 FROM order_service.order_matching_state
                 WHERE order_id IN (:orderIds)
                 ORDER BY order_id
@@ -1034,7 +1154,8 @@ public class OrderEventAppender {
                             rs.getObject("user_id", UUID.class),
                             rs.getInt("remaining_amount"),
                             rs.getInt("matched_amount"),
-                            rs.getString("status")));
+                            rs.getString("status"),
+                            rs.getString("asset_reservation_status")));
         });
         return states;
     }
@@ -1043,7 +1164,8 @@ public class OrderEventAppender {
             NamedParameterJdbcTemplate jdbc,
             UUID orderId) {
         List<MatchingState> states = jdbc.query("""
-                SELECT user_id, remaining_amount, matched_amount, status
+                SELECT user_id, remaining_amount, matched_amount, status,
+                       asset_reservation_status
                 FROM order_service.order_matching_state
                 WHERE order_id = :orderId
                 FOR UPDATE
@@ -1052,7 +1174,8 @@ public class OrderEventAppender {
                         rs.getObject("user_id", UUID.class),
                         rs.getInt("remaining_amount"),
                         rs.getInt("matched_amount"),
-                        rs.getString("status")));
+                        rs.getString("status"),
+                        rs.getString("asset_reservation_status")));
         return states.isEmpty() ? null : states.get(0);
     }
 
@@ -1071,8 +1194,42 @@ public class OrderEventAppender {
                                 ? 0
                                 : rs.getInt("remaining_amount"),
                         0,
-                        rs.getString("status")));
+                        rs.getString("status"),
+                        inferredAssetReservationStatus(rs.getString("status"))));
         return states.isEmpty() ? null : states.get(0);
+    }
+
+    private void ensureMatchingStatesForTrade(Collection<UUID> orderIds) {
+        if (orderIds.isEmpty()) {
+            return;
+        }
+        consumerJdbc.update("""
+                INSERT INTO order_service.order_matching_state
+                    (order_id, user_id, remaining_amount, matched_amount, status,
+                     asset_reservation_status, updated_at)
+                SELECT aggregate_id, user_id, remaining_amount, 0, status,
+                       'SUCCEEDED', CURRENT_TIMESTAMP
+                FROM order_service.order_stream_heads
+                WHERE aggregate_id IN (:orderIds)
+                  AND user_id IS NOT NULL
+                  AND remaining_amount IS NOT NULL
+                  AND status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                ON CONFLICT (order_id) DO UPDATE
+                SET asset_reservation_status = 'SUCCEEDED',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE order_service.order_matching_state.status
+                          IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                  AND order_service.order_matching_state.asset_reservation_status = 'PENDING'
+                """, Map.of("orderIds", orderIds));
+    }
+
+    private String inferredAssetReservationStatus(String executionStatus) {
+        return switch (executionStatus) {
+            case "PENDING_ASSET_CHECK" -> "PENDING";
+            case "REJECTED" -> "REJECTED";
+            case "CANCELLED" -> "RELEASED";
+            default -> "SUCCEEDED";
+        };
     }
 
     private boolean existingTradeApplicationMatches(OrderTradeApplication tradeApplication) {
@@ -1137,13 +1294,15 @@ public class OrderEventAppender {
                     SET remaining_amount = input.remaining_amount,
                         matched_amount = input.matched_amount,
                         status = input.order_status,
+                        asset_reservation_status = 'SUCCEEDED',
                         last_trade_id = input.last_trade_id,
                         updated_at = CURRENT_TIMESTAMP
                     FROM input
                     WHERE EXISTS (SELECT 1 FROM trade_application)
                       AND state.order_id = input.order_id
                       AND state.remaining_amount = input.previous_remaining_amount
-                      AND state.status IN ('OPEN', 'PARTIALLY_MATCHED')
+                      AND state.status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                      AND state.asset_reservation_status = 'SUCCEEDED'
                       AND state.remaining_amount >= input.quantity
                     RETURNING 1
                 )
@@ -1198,11 +1357,13 @@ public class OrderEventAppender {
                 SET remaining_amount = :remainingAmount,
                     matched_amount = :matchedAmount,
                     status = :orderStatus,
+                    asset_reservation_status = 'SUCCEEDED',
                     last_trade_id = :tradeId,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE order_id = :orderId
                   AND remaining_amount = :previousRemainingAmount
-                  AND status IN ('OPEN', 'PARTIALLY_MATCHED')
+                  AND status IN ('PENDING_ASSET_CHECK', 'OPEN', 'PARTIALLY_MATCHED')
+                  AND asset_reservation_status = 'SUCCEEDED'
                   AND remaining_amount >= :quantity
                 """, params.toArray(MapSqlParameterSource[]::new));
         assertBatchCount("matching state", params.size(), counts);
@@ -1656,13 +1817,24 @@ public class OrderEventAppender {
                     ),
                     upserted_matching_state AS (
                         INSERT INTO order_service.order_matching_state
-                            (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
-                        SELECT aggregate_id, user_id, remaining_amount, 0, order_status, CURRENT_TIMESTAMP
+                            (order_id, user_id, remaining_amount, matched_amount, status,
+                             asset_reservation_status, updated_at)
+                        SELECT aggregate_id, user_id, remaining_amount, 0, order_status,
+                               'SUCCEEDED', CURRENT_TIMESTAMP
                         FROM input
                         ON CONFLICT (order_id) DO UPDATE
                         SET user_id = EXCLUDED.user_id,
-                            remaining_amount = EXCLUDED.remaining_amount,
-                            status = EXCLUDED.status,
+                            remaining_amount = CASE
+                                WHEN order_service.order_matching_state.status = 'PENDING_ASSET_CHECK'
+                                THEN EXCLUDED.remaining_amount
+                                ELSE order_service.order_matching_state.remaining_amount
+                            END,
+                            status = CASE
+                                WHEN order_service.order_matching_state.status = 'PENDING_ASSET_CHECK'
+                                THEN EXCLUDED.status
+                                ELSE order_service.order_matching_state.status
+                            END,
+                            asset_reservation_status = 'SUCCEEDED',
                             updated_at = CURRENT_TIMESTAMP
                         RETURNING order_id
                     )
@@ -2118,21 +2290,82 @@ public class OrderEventAppender {
                     nextState);
             return;
         }
+        if (command.payload() instanceof OrderAssetReservationConfirmedV1) {
+            upsertAssetReservationConfirmedMatchingState(jdbc, command, nextState);
+            return;
+        }
+        if (command.payload() instanceof OrderAssetReservationFailedV1) {
+            MatchingState current = lockMatchingState(jdbc, command.aggregateId());
+            if (current != null && ("SUCCEEDED".equals(current.assetReservationStatus())
+                    || current.matchedAmount() > 0)) {
+                throw new AssetReservationResultContradictionException(
+                        "Asset reservation rejection contradicts an accepted trade: orderId="
+                                + command.aggregateId());
+            }
+        }
+        String assetReservationStatus = assetReservationStatus(command, nextState);
         jdbc.update("""
                 INSERT INTO order_service.order_matching_state
-                    (order_id, user_id, remaining_amount, matched_amount, status, updated_at)
+                    (order_id, user_id, remaining_amount, matched_amount, status,
+                     asset_reservation_status, updated_at)
                 VALUES
-                    (:orderId, :userId, :remainingAmount, 0, :orderStatus, CURRENT_TIMESTAMP)
+                    (:orderId, :userId, :remainingAmount, 0, :orderStatus,
+                     :assetReservationStatus, CURRENT_TIMESTAMP)
                 ON CONFLICT (order_id) DO UPDATE
                 SET user_id = EXCLUDED.user_id,
                     remaining_amount = EXCLUDED.remaining_amount,
                     status = EXCLUDED.status,
+                    asset_reservation_status = EXCLUDED.asset_reservation_status,
+                    updated_at = CURRENT_TIMESTAMP
+                """, new MapSqlParameterSource()
+                .addValue("orderId", command.aggregateId())
+                .addValue("userId", nextState.userId())
+                .addValue("remainingAmount", nextState.remainingAmount())
+                .addValue("orderStatus", nextState.status())
+                .addValue("assetReservationStatus", assetReservationStatus));
+    }
+
+    private void upsertAssetReservationConfirmedMatchingState(
+            NamedParameterJdbcTemplate jdbc,
+            OrderEventAppendCommand command,
+            CommandState nextState) {
+        jdbc.update("""
+                INSERT INTO order_service.order_matching_state
+                    (order_id, user_id, remaining_amount, matched_amount, status,
+                     asset_reservation_status, updated_at)
+                VALUES
+                    (:orderId, :userId, :remainingAmount, 0, :orderStatus,
+                     'SUCCEEDED', CURRENT_TIMESTAMP)
+                ON CONFLICT (order_id) DO UPDATE
+                SET user_id = EXCLUDED.user_id,
+                    remaining_amount = CASE
+                        WHEN order_service.order_matching_state.status = 'PENDING_ASSET_CHECK'
+                        THEN EXCLUDED.remaining_amount
+                        ELSE order_service.order_matching_state.remaining_amount
+                    END,
+                    status = CASE
+                        WHEN order_service.order_matching_state.status = 'PENDING_ASSET_CHECK'
+                        THEN EXCLUDED.status
+                        ELSE order_service.order_matching_state.status
+                    END,
+                    asset_reservation_status = 'SUCCEEDED',
                     updated_at = CURRENT_TIMESTAMP
                 """, new MapSqlParameterSource()
                 .addValue("orderId", command.aggregateId())
                 .addValue("userId", nextState.userId())
                 .addValue("remainingAmount", nextState.remainingAmount())
                 .addValue("orderStatus", nextState.status()));
+    }
+
+    private String assetReservationStatus(OrderEventAppendCommand command, CommandState nextState) {
+        if (command.payload() instanceof OrderAssetReservationFailedV1) {
+            return "REJECTED";
+        }
+        if (command.payload() instanceof OrderCancellationCompletedV1
+                || command.payload() instanceof OrderCancelledV1) {
+            return "RELEASED";
+        }
+        return inferredAssetReservationStatus(nextState.status());
     }
 
     private void updateMatchingStateFromEventStoreMatch(
@@ -2146,6 +2379,7 @@ public class OrderEventAppender {
                 SET remaining_amount = :remainingAmount,
                     matched_amount = matched_amount + :quantity,
                     status = :orderStatus,
+                    asset_reservation_status = 'SUCCEEDED',
                     last_trade_id = :tradeId,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE order_id = :orderId
@@ -2168,7 +2402,10 @@ public class OrderEventAppender {
             return new CommandState(requested.userId(), requested.amount(), "PENDING_ASSET_CHECK");
         }
         if (payload instanceof OrderAssetReservationConfirmedV1 confirmed) {
-            return new CommandState(confirmed.userId(), head.remainingAmount(), "OPEN");
+            String nextStatus = "PENDING_ASSET_CHECK".equals(head.status())
+                    ? "OPEN"
+                    : head.status();
+            return new CommandState(confirmed.userId(), head.remainingAmount(), nextStatus);
         }
         if (payload instanceof OrderAssetReservationFailedV1 failed) {
             return new CommandState(failed.userId(), head.remainingAmount(), "REJECTED");
@@ -2183,6 +2420,12 @@ public class OrderEventAppender {
         }
         if (payload instanceof OrderCancelledV1 cancelled) {
             return new CommandState(cancelled.userId(), head.remainingAmount(), "CANCELLED");
+        }
+        if (payload instanceof OrderCancellationAcceptedV1 accepted) {
+            return new CommandState(accepted.userId(), head.remainingAmount(), "CANCELLING");
+        }
+        if (payload instanceof OrderCancellationCompletedV1 completed) {
+            return new CommandState(completed.userId(), head.remainingAmount(), "CANCELLED");
         }
         if ("OrderMatchedV1".equals(command.eventType()) && payload instanceof Map<?, ?> map) {
             int amount = ((Number) map.get("amount")).intValue();
@@ -2395,14 +2638,18 @@ public class OrderEventAppender {
             UUID userId,
             int remainingAmount,
             int matchedAmount,
-            String status) {
+            String status,
+            String assetReservationStatus) {
 
         private int originalAmount() {
             return Math.addExact(remainingAmount, matchedAmount);
         }
 
         private boolean canMatch(int quantity) {
-            return ("OPEN".equals(status) || "PARTIALLY_MATCHED".equals(status))
+            return ("PENDING_ASSET_CHECK".equals(status)
+                    || "OPEN".equals(status)
+                    || "PARTIALLY_MATCHED".equals(status))
+                    && "SUCCEEDED".equals(assetReservationStatus)
                     && quantity > 0
                     && remainingAmount >= quantity;
         }
@@ -2421,7 +2668,15 @@ public class OrderEventAppender {
                     userId,
                     nextRemaining,
                     matchedAmount + quantity,
-                    nextRemaining == 0 ? "MATCHED" : "PARTIALLY_MATCHED");
+                    nextRemaining == 0 ? "MATCHED" : "PARTIALLY_MATCHED",
+                    "SUCCEEDED");
+        }
+
+        private boolean hasAdvancedExecution() {
+            return "PARTIALLY_MATCHED".equals(status)
+                    || "MATCHED".equals(status)
+                    || "CANCELLING".equals(status)
+                    || "CANCELLED".equals(status);
         }
     }
 

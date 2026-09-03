@@ -14,6 +14,7 @@ public class OrderAggregate {
     private int originalAmount;
     private int matchedAmount;
     private OrderLifecycleStatus status = OrderLifecycleStatus.NOT_CREATED;
+    private OrderAssetReservationStatus assetReservationStatus = OrderAssetReservationStatus.NOT_REQUESTED;
     private long version;
 
     public OrderSubmissionRequestedV1 request(
@@ -38,7 +39,10 @@ public class OrderAggregate {
     }
 
     public OrderAssetReservationConfirmedV1 confirmAssetReservation(LocalDateTime confirmedAt) {
-        requireStatus(OrderLifecycleStatus.PENDING_ASSET_CHECK, "confirm");
+        if (assetReservationStatus != OrderAssetReservationStatus.PENDING
+                && assetReservationStatus != OrderAssetReservationStatus.SUCCEEDED) {
+            throw new IllegalStateException("Cannot confirm asset reservation in status " + assetReservationStatus);
+        }
         OrderAssetReservationConfirmedV1 event = new OrderAssetReservationConfirmedV1(orderId, userId, confirmedAt);
         apply(event);
         return event;
@@ -86,18 +90,36 @@ public class OrderAggregate {
             originalAmount = requested.amount();
             matchedAmount = 0;
             status = OrderLifecycleStatus.PENDING_ASSET_CHECK;
+            assetReservationStatus = OrderAssetReservationStatus.PENDING;
         } else if (event instanceof OrderAssetReservationConfirmedV1) {
-            status = OrderLifecycleStatus.OPEN;
+            assetReservationStatus = OrderAssetReservationStatus.SUCCEEDED;
+            if (status == OrderLifecycleStatus.PENDING_ASSET_CHECK) {
+                status = OrderLifecycleStatus.OPEN;
+            }
         } else if (event instanceof OrderAssetReservationFailedV1) {
+            if (assetReservationStatus == OrderAssetReservationStatus.SUCCEEDED
+                    || status == OrderLifecycleStatus.PARTIALLY_MATCHED
+                    || status == OrderLifecycleStatus.MATCHED) {
+                throw new IllegalStateException("Asset reservation rejection contradicts an accepted trade");
+            }
+            assetReservationStatus = OrderAssetReservationStatus.REJECTED;
             status = OrderLifecycleStatus.REJECTED;
         } else if (event instanceof OrderMatchedV1 matched) {
+            assetReservationStatus = OrderAssetReservationStatus.SUCCEEDED;
             matchedAmount += matched.amount();
             status = matchedAmount == originalAmount
                     ? OrderLifecycleStatus.MATCHED
                     : OrderLifecycleStatus.PARTIALLY_MATCHED;
         } else if (event instanceof OrderCancellationRequestedV1) {
             // Cancellation intent does not change matchability until MatchEngine arbitrates it.
+        } else if (event instanceof OrderCancellationAcceptedV1) {
+            status = OrderLifecycleStatus.CANCELLING;
+        } else if (event instanceof OrderCancellationCompletedV1) {
+            assetReservationStatus = OrderAssetReservationStatus.RELEASED;
+            status = OrderLifecycleStatus.CANCELLED;
         } else if (event instanceof OrderCancelledV1) {
+            // Legacy one-step cancellation event retained for old event streams.
+            assetReservationStatus = OrderAssetReservationStatus.RELEASED;
             status = OrderLifecycleStatus.CANCELLED;
         } else {
             throw new IllegalArgumentException("Unsupported Order domain event: " + event.getClass().getName());
@@ -121,5 +143,6 @@ public class OrderAggregate {
     public int matchedAmount() { return matchedAmount; }
     public int remainingAmount() { return originalAmount - matchedAmount; }
     public OrderLifecycleStatus status() { return status; }
+    public OrderAssetReservationStatus assetReservationStatus() { return assetReservationStatus; }
     public long version() { return version; }
 }

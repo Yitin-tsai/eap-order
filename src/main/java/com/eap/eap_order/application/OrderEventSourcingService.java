@@ -1,15 +1,17 @@
 package com.eap.eap_order.application;
 
-import com.eap.common.event.OrderConfirmedEvent;
+import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.OrderCancellationRequestedEvent;
 import com.eap.common.event.OrderCancellationResultEvent;
+import com.eap.common.event.OrderAssetReservationReleasedEvent;
 import com.eap.common.event.OrderFailedEvent;
 import com.eap.common.event.OrderSubmittedEvent;
 import com.eap.common.event.TradeExecutedEvent;
 import com.eap.eap_order.domain.ordersourcing.OrderAggregate;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationConfirmedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderAssetReservationFailedV1;
-import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationAcceptedV1;
+import com.eap.eap_order.domain.ordersourcing.OrderCancellationCompletedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderCancellationRequestedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
@@ -18,6 +20,7 @@ import com.eap.eap_order.eventstore.OrderEventAppender;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchAppendCommand;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchAppendResult;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchAppendStatus;
+import com.eap.eap_order.eventstore.OrderEventAppender.TradeApplicationBatchNotBatchableReason;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendResult;
 import com.eap.eap_order.eventstore.OrderEventAppender.TradeExecutionAppendStatus;
 import com.eap.eap_order.eventstore.OrderEventStreamReader;
@@ -69,11 +72,11 @@ public class OrderEventSourcingService {
                 occurredAt, new OrderIntegrationEvent(ORDER_EXCHANGE, ORDER_SUBMITTED_KEY, integrationEvent));
     }
 
-    public void confirm(OrderConfirmedEvent source) {
+    public void confirm(OrderAssetReservationSucceededEvent source) {
         appender.appendFromConsumer(confirmationCommand(source));
     }
 
-    public void confirmAll(List<OrderConfirmedEvent> sources) {
+    public void confirmAll(List<OrderAssetReservationSucceededEvent> sources) {
         if (sources == null || sources.isEmpty()) {
             return;
         }
@@ -86,7 +89,7 @@ public class OrderEventSourcingService {
                 .toList());
     }
 
-    private OrderEventAppendCommand confirmationCommand(OrderConfirmedEvent source) {
+    private OrderEventAppendCommand confirmationCommand(OrderAssetReservationSucceededEvent source) {
         LocalDateTime occurredAt = source.getCreatedAt() == null
                 ? LocalDateTime.now()
                 : source.getCreatedAt();
@@ -146,6 +149,11 @@ public class OrderEventSourcingService {
         if (result.status() == TradeApplicationBatchAppendStatus.APPLIED) {
             batchMetrics.batchApplied(result.appliedCount());
             return;
+        }
+        if (result.notBatchableReason() == TradeApplicationBatchNotBatchableReason.MISSING_HEAD) {
+            batchMetrics.fallback(result.notBatchableReason().metricName(), preparedTrades.size());
+            throw new TradeProjectionNotReadyException(
+                    "Order command state has not caught up for TradeExecuted batch: size=" + preparedTrades.size());
         }
         applyTradesIndividually(preparedTrades);
         batchMetrics.fallback(result.notBatchableReason().metricName(), preparedTrades.size());
@@ -329,13 +337,14 @@ public class OrderEventSourcingService {
         LocalDateTime cancelledAt = result.getDecidedAt() == null
                 ? LocalDateTime.now()
                 : result.getDecidedAt();
-        OrderCancelledV1 event = new OrderCancelledV1(
-                result.getOrderId(), result.getUserId(), cancelledAt);
+        OrderCancellationAcceptedV1 event = new OrderCancellationAcceptedV1(
+                result.getCancellationId(), result.getOrderId(), result.getUserId(),
+                result.getCancelledAmount(), cancelledAt);
         appender.appendCancellationAcceptedIfReady(new OrderEventAppendCommand(
                 result.getOrderId(),
                 0,
                 eventId(result.getOrderId(), "CANCELLATION_RESULT:" + result.getCancellationId()),
-                "OrderCancelledV1",
+                "OrderCancellationAcceptedV1",
                 event,
                 Map.of(
                         "correlationId", result.getCancellationId().toString(),
@@ -345,6 +354,34 @@ public class OrderEventSourcingService {
                 null),
                 result.getCancellationId(),
                 result.getCancelledAmount());
+    }
+
+    public void completeCancellation(OrderAssetReservationReleasedEvent source) {
+        if (source == null || source.getEventId() == null || source.getCancellationId() == null
+                || source.getOrderId() == null || source.getUserId() == null
+                || source.getReleasedQuantity() == null || source.getReleasedQuantity() <= 0) {
+            throw new IllegalArgumentException("Released reservation event requires complete positive identity");
+        }
+        LocalDateTime completedAt = source.getReleasedAt() == null
+                ? LocalDateTime.now()
+                : source.getReleasedAt();
+        OrderCancellationCompletedV1 event = new OrderCancellationCompletedV1(
+                source.getCancellationId(), source.getOrderId(), source.getUserId(),
+                source.getReleasedQuantity(), completedAt);
+        appender.appendCancellationCompletedIfReady(new OrderEventAppendCommand(
+                source.getOrderId(),
+                0,
+                source.getEventId(),
+                "OrderCancellationCompletedV1",
+                event,
+                Map.of(
+                        "correlationId", source.getCancellationId().toString(),
+                        "userId", source.getUserId().toString()),
+                1,
+                completedAt,
+                null),
+                source.getCancellationId(),
+                source.getReleasedQuantity());
     }
 
     private void append(
