@@ -43,6 +43,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.Function;
 import java.util.function.ToLongFunction;
 
 import static com.eap.common.constants.RabbitMQConstants.DEAD_LETTER_QUEUE;
@@ -62,9 +63,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
     private static final int PRICE = 100;
     private static final int AMOUNT = 1;
-    private static final int BENCHMARK_SCHEMA_VERSION = 2;
+    private static final int BENCHMARK_SCHEMA_VERSION = 3;
     private static final int MAX_STEADY_SCHEDULING_OVERRUN_SECONDS = 30;
     private static final String HTTP_MARKET_ID = "ENERGY-SPOT";
+    private static final String EXTERNAL_MONITOR_HEADER =
+            "epoch_millis,match_trades,order_trades,wallet_trades,completed_trades,"
+                    + "queue_backlog,queue_read_failures,order_reservation_inbox_backlog,"
+                    + "order_inbox_backlog,order_inbox_oldest_age_seconds,order_inbox_terminal_debt,"
+                    + "wallet_inbox_backlog,wallet_inbox_oldest_age_seconds,wallet_inbox_terminal_debt,"
+                    + "match_inbox_backlog,match_inbox_oldest_age_seconds,match_inbox_terminal_debt";
     private static final List<String> CHAIN_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
             ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
@@ -1287,6 +1294,79 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         return summarizeBacklog(samples, SteadySample::orderReservationInboxBacklog);
     }
 
+    static InboxDebtWindow summarizeInboxDebt(
+            List<SteadySample> samples,
+            Function<SteadySample, InboxDebtSnapshot> debtExtractor) {
+        BacklogWindow activeBacklog = summarizeBacklog(
+                samples,
+                sample -> debtExtractor.apply(sample).activeBacklog());
+        long maxOldestAgeSeconds = samples.stream()
+                .map(debtExtractor)
+                .mapToLong(InboxDebtSnapshot::oldestUnresolvedAgeSeconds)
+                .max()
+                .orElse(0);
+        long maxTerminalDebt = samples.stream()
+                .map(debtExtractor)
+                .mapToLong(InboxDebtSnapshot::terminalDebt)
+                .max()
+                .orElse(0);
+        return new InboxDebtWindow(activeBacklog, maxOldestAgeSeconds, maxTerminalDebt);
+    }
+
+    static List<String> inboxDebtInvalidReasons(
+            String service,
+            InboxDebtWindow debt,
+            double observedSeconds,
+            int targetOrderTps,
+            double maxBacklogGrowthPerSecond,
+            long maxSteadyBacklog,
+            long maxInboxOldestAgeSeconds) {
+        List<String> reasons = new ArrayList<>();
+        BacklogWindow backlog = debt.activeBacklog();
+        if (exceedsMeaningfulBacklogGrowth(
+                backlog.slopePerSecond(),
+                backlog.start(),
+                backlog.end(),
+                observedSeconds,
+                targetOrderTps,
+                maxBacklogGrowthPerSecond)) {
+            reasons.add("steady_" + service + "_inbox_backlog_growing");
+        }
+        if (backlog.max() > maxSteadyBacklog) {
+            reasons.add("steady_" + service + "_inbox_backlog_above_limit");
+        }
+        if (debt.maxOldestUnresolvedAgeSeconds() > maxInboxOldestAgeSeconds) {
+            reasons.add("steady_" + service + "_inbox_oldest_age_above_limit");
+        }
+        if (debt.maxTerminalDebt() > 0) {
+            reasons.add("steady_" + service + "_inbox_terminal_debt");
+        }
+        return List.copyOf(reasons);
+    }
+
+    static void validateExternalMonitorHeader(String header) throws IOException {
+        if (!EXTERNAL_MONITOR_HEADER.equals(header)) {
+            throw new IOException("invalid external monitor CSV header: " + header);
+        }
+    }
+
+    static void validateExternalMonitorTimestamp(long previousEpochMillis, long currentEpochMillis)
+            throws IOException {
+        if (previousEpochMillis != Long.MIN_VALUE && currentEpochMillis <= previousEpochMillis) {
+            throw new IOException(
+                    "external monitor timestamps must be strictly increasing: previous="
+                            + previousEpochMillis + ", current=" + currentEpochMillis);
+        }
+    }
+
+    static void validateNonNegativeInboxDebt(long... values) throws IOException {
+        for (long value : values) {
+            if (value < 0) {
+                throw new IOException("external monitor inbox debt must be non-negative: " + value);
+            }
+        }
+    }
+
     private static BacklogWindow summarizeBacklog(
             List<SteadySample> validSamples,
             ToLongFunction<SteadySample> valueExtractor) {
@@ -1742,7 +1822,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         System.out.printf(
                                 "steady progress elapsed=%.1fs accepted=%d completed=%d "
                                         + "match=%d order=%d wallet=%d queueBacklog=%d "
-                                        + "orderReservationInboxBacklog=%d failures=%d%n",
+                                        + "inboxBacklog(order=%d,wallet=%d,match=%d) "
+                                        + "inboxOldestAge(order=%ds,wallet=%ds,match=%ds) "
+                                        + "inboxTerminal(order=%d,wallet=%d,match=%d) failures=%d%n",
                                 sample.elapsedSeconds(),
                                 sample.httpAccepted(),
                                 sample.completedTrades(),
@@ -1750,7 +1832,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                                 sample.orderTrades(),
                                 sample.walletTrades(),
                                 sample.queueBacklog(),
-                                sample.orderReservationInboxBacklog(),
+                                sample.orderInboxDebt().activeBacklog(),
+                                sample.walletInboxDebt().activeBacklog(),
+                                sample.matchInboxDebt().activeBacklog(),
+                                sample.orderInboxDebt().oldestUnresolvedAgeSeconds(),
+                                sample.walletInboxDebt().oldestUnresolvedAgeSeconds(),
+                                sample.matchInboxDebt().oldestUnresolvedAgeSeconds(),
+                                sample.orderInboxDebt().terminalDebt(),
+                                sample.walletInboxDebt().terminalDebt(),
+                                sample.matchInboxDebt().terminalDebt(),
                                 sample.httpFailures());
                     }
                     nextSampleAt += TimeUnit.SECONDS.toNanos(config.sampleIntervalSeconds());
@@ -1790,6 +1880,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     databases.order(),
                     "SELECT count(*) FROM order_service.order_asset_reservation_result_inbox "
                             + "WHERE status IN ('PENDING', 'FAILED_RETRYABLE', 'IN_PROGRESS')");
+            InboxDebtSnapshot orderInboxDebt = orderInboxDebtSnapshot(databases.order());
+            InboxDebtSnapshot walletInboxDebt = walletInboxDebtSnapshot(databases.wallet());
+            InboxDebtSnapshot matchInboxDebt = matchInboxDebtSnapshot(
+                    databases.match(), common.marketId());
             return new SteadySample(
                     elapsedSince(startedAtNanos),
                     counters.accepted(),
@@ -1800,7 +1894,93 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     Math.min(matchTrades, Math.min(orderTrades, walletTrades)),
                     queues.backlog(),
                     queues.readFailures(),
-                    orderReservationInboxBacklog);
+                    orderReservationInboxBacklog,
+                    orderInboxDebt,
+                    walletInboxDebt,
+                    matchInboxDebt);
+        }
+
+        private InboxDebtSnapshot orderInboxDebtSnapshot(Connection order) throws Exception {
+            return queryInboxDebt(order, """
+                    SELECT
+                        count(*) FILTER (
+                            WHERE status NOT IN ('APPLIED', 'FAILED_PERMANENT')) AS active_backlog,
+                        COALESCE(MAX(CASE WHEN status != 'APPLIED'
+                            THEN GREATEST(0,
+                                FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at)))::bigint)
+                            ELSE 0 END), 0) AS oldest_unresolved_age_seconds,
+                        count(*) FILTER (
+                            WHERE status = 'FAILED_PERMANENT'
+                               OR conflict_detected_at IS NOT NULL) AS terminal_debt
+                    FROM (
+                        SELECT status, received_at, conflict_detected_at
+                        FROM order_service.order_asset_reservation_result_inbox
+                        UNION ALL
+                        SELECT status, received_at, NULL::timestamp AS conflict_detected_at
+                        FROM order_service.order_trade_execution_inbox
+                        UNION ALL
+                        SELECT status, received_at, NULL::timestamp AS conflict_detected_at
+                        FROM order_service.order_cancellation_result_inbox
+                        UNION ALL
+                        SELECT status, received_at, conflict_detected_at
+                        FROM order_service.order_asset_reservation_released_inbox
+                    ) inbox
+                    """);
+        }
+
+        private InboxDebtSnapshot walletInboxDebtSnapshot(Connection wallet) throws Exception {
+            return queryInboxDebt(wallet, """
+                    SELECT
+                        count(*) FILTER (
+                            WHERE status NOT IN ('APPLIED', 'FAILED_PERMANENT')) AS active_backlog,
+                        COALESCE(MAX(CASE WHEN status != 'APPLIED'
+                            THEN GREATEST(0,
+                                FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at)))::bigint)
+                            ELSE 0 END), 0) AS oldest_unresolved_age_seconds,
+                        count(*) FILTER (
+                            WHERE status = 'FAILED_PERMANENT'
+                               OR conflict_detected_at IS NOT NULL) AS terminal_debt
+                    FROM wallet_service.message_inbox
+                    """);
+        }
+
+        private InboxDebtSnapshot matchInboxDebtSnapshot(
+                Connection match,
+                String marketId) throws Exception {
+            return queryInboxDebt(match, """
+                    SELECT
+                        count(*) FILTER (
+                            WHERE status NOT IN ('APPLIED', 'FAILED_PERMANENT')) AS active_backlog,
+                        COALESCE(MAX(CASE WHEN status != 'APPLIED'
+                            THEN GREATEST(0,
+                                FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at)))::bigint)
+                            ELSE 0 END), 0) AS oldest_unresolved_age_seconds,
+                        count(*) FILTER (
+                            WHERE status = 'FAILED_PERMANENT'
+                               OR conflict_detected_at IS NOT NULL) AS terminal_debt
+                    FROM match_engine.order_admission_inbox
+                    WHERE market_id = ?
+                    """, marketId);
+        }
+
+        private InboxDebtSnapshot queryInboxDebt(
+                Connection connection,
+                String sql,
+                Object... values) throws Exception {
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                for (int i = 0; i < values.length; i++) {
+                    statement.setObject(i + 1, values[i]);
+                }
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    if (!resultSet.next()) {
+                        return InboxDebtSnapshot.empty();
+                    }
+                    return new InboxDebtSnapshot(
+                            resultSet.getLong("active_backlog"),
+                            resultSet.getLong("oldest_unresolved_age_seconds"),
+                            resultSet.getLong("terminal_debt"));
+                }
+            }
         }
 
         private SteadyWindow deriveSteadyWindow(List<SteadySample> samples) {
@@ -1837,6 +2017,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             BacklogWindow backlog = summarizeBacklog(windowSamples);
             BacklogWindow orderReservationInboxBacklog =
                     summarizeOrderReservationInboxBacklog(windowSamples);
+            InboxDebtWindow orderInboxDebt = summarizeInboxDebt(
+                    windowSamples, SteadySample::orderInboxDebt);
+            InboxDebtWindow walletInboxDebt = summarizeInboxDebt(
+                    windowSamples, SteadySample::walletInboxDebt);
+            InboxDebtWindow matchInboxDebt = summarizeInboxDebt(
+                    windowSamples, SteadySample::matchInboxDebt);
             long queueReadFailures = windowSamples.stream().mapToLong(SteadySample::queueReadFailures).sum();
             return new SteadyWindow(
                     first.elapsedSeconds(),
@@ -1857,6 +2043,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     orderReservationInboxBacklog.end(),
                     orderReservationInboxBacklog.max(),
                     orderReservationInboxBacklog.slopePerSecond(),
+                    orderInboxDebt,
+                    walletInboxDebt,
+                    matchInboxDebt,
                     queueReadFailures,
                     windowSamples.size());
         }
@@ -1958,6 +2147,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         databases.order(), common.marketId());
                 MatchAdmissionInboxSnapshot matchInbox =
                         matchAdmissionInboxSnapshot(databases.match(), common.marketId());
+                InboxDebtSnapshot orderInboxDebt = orderInboxDebtSnapshot(databases.order());
+                InboxDebtSnapshot walletInboxDebt = walletInboxDebtSnapshot(databases.wallet());
+                InboxDebtSnapshot matchInboxDebt = matchInboxDebtSnapshot(
+                        databases.match(), common.marketId());
+                DurableDebtSnapshot durableDebt = durableDebtSnapshot(databases);
                 long matchedOrders = runDelta(queryLong(
                         databases.order(),
                         """
@@ -2004,6 +2198,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         && matchInbox.rows() == expectedOutcome.acceptedOrders()
                         && matchInbox.appliedRows() == expectedOutcome.acceptedOrders()
                         && matchInbox.nonAppliedRows() == 0
+                        && orderInboxDebt.converged()
+                        && walletInboxDebt.converged()
+                        && matchInboxDebt.converged()
+                        && durableDebt.converged()
                         && matchedOrders == expectedOutcome.pairableTrades() * 2L
                         && matchTrades == expectedOutcome.pairableTrades()
                         && orderTrades == expectedOutcome.pairableTrades()
@@ -2048,6 +2246,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         matchInbox.rows(),
                         matchInbox.appliedRows(),
                         matchInbox.nonAppliedRows(),
+                        orderInboxDebt,
+                        walletInboxDebt,
+                        matchInboxDebt,
+                        durableDebt,
                         matchedOrders,
                         matchTrades,
                         orderTrades,
@@ -2068,6 +2270,41 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 TimeUnit.MILLISECONDS.sleep(500);
             }
             return latest;
+        }
+
+        private DurableDebtSnapshot durableDebtSnapshot(DatabaseHandles databases)
+                throws Exception {
+            return new DurableDebtSnapshot(
+                    queryLong(
+                            databases.order(),
+                            "SELECT count(*) FROM order_service.order_event_outbox "
+                                    + "WHERE status NOT IN ('SENT', 'FAILED')"),
+                    queryLong(
+                            databases.order(),
+                            "SELECT count(*) FROM order_service.order_event_outbox "
+                                    + "WHERE status = 'FAILED'"),
+                    queryLong(
+                            databases.wallet(),
+                            "SELECT count(*) FROM wallet_service.outbox "
+                                    + "WHERE status NOT IN ('SENT', 'FAILED')"),
+                    queryLong(
+                            databases.wallet(),
+                            "SELECT count(*) FROM wallet_service.outbox WHERE status = 'FAILED'"),
+                    queryLong(
+                            databases.match(),
+                            "SELECT count(*) FROM match_engine.trade_outbox "
+                                    + "WHERE status NOT IN ('SENT', 'FAILED')"),
+                    queryLong(
+                            databases.match(),
+                            "SELECT count(*) FROM match_engine.trade_outbox WHERE status = 'FAILED'"),
+                    queryLong(
+                            databases.match(),
+                            "SELECT count(*) FROM match_engine.reservation_cleanup_tasks "
+                                    + "WHERE status NOT IN ('COMPLETED', 'FAILED')"),
+                    queryLong(
+                            databases.match(),
+                            "SELECT count(*) FROM match_engine.reservation_cleanup_tasks "
+                                    + "WHERE status = 'FAILED'"));
         }
 
         private OrderProjectionSnapshot orderProjectionSnapshot(
@@ -2317,6 +2554,18 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (window.orderReservationInboxBacklogMax() > config.maxSteadyBacklog()) {
                 reasons.add("steady_order_reservation_inbox_backlog_above_limit");
             }
+            reasons.addAll(inboxDebtInvalidReasons(
+                    "order", window.orderInboxDebt(), window.observedSeconds(),
+                    config.targetOrderTps(), config.maxBacklogGrowthPerSecond(),
+                    config.maxSteadyBacklog(), config.maxInboxOldestAgeSeconds()));
+            reasons.addAll(inboxDebtInvalidReasons(
+                    "wallet", window.walletInboxDebt(), window.observedSeconds(),
+                    config.targetOrderTps(), config.maxBacklogGrowthPerSecond(),
+                    config.maxSteadyBacklog(), config.maxInboxOldestAgeSeconds()));
+            reasons.addAll(inboxDebtInvalidReasons(
+                    "match", window.matchInboxDebt(), window.observedSeconds(),
+                    config.targetOrderTps(), config.maxBacklogGrowthPerSecond(),
+                    config.maxSteadyBacklog(), config.maxInboxOldestAgeSeconds()));
             if (window.queueReadFailures() != 0) {
                 reasons.add("steady_queue_metrics_read_failures");
             }
@@ -2340,6 +2589,18 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     || completion.matchAdmissionInboxAppliedRows() != expectedOutcome.acceptedOrders()
                     || completion.matchAdmissionInboxNonAppliedRows() != 0) {
                 reasons.add("match_admission_inbox_not_converged");
+            }
+            if (!completion.orderInboxDebt().converged()) {
+                reasons.add("final_order_inbox_debt");
+            }
+            if (!completion.walletInboxDebt().converged()) {
+                reasons.add("final_wallet_inbox_debt");
+            }
+            if (!completion.matchInboxDebt().converged()) {
+                reasons.add("final_match_inbox_debt");
+            }
+            if (!completion.durableDebt().converged()) {
+                reasons.add("final_outbox_or_cleanup_debt");
             }
             if (completion.matchTrades() != expectedOutcome.pairableTrades()
                     || completion.orderTrades() != expectedOutcome.pairableTrades()
@@ -2384,12 +2645,15 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             try (BufferedWriter writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8)) {
                 writer.write("elapsed_seconds,http_accepted,http_failures,match_trades,order_trades,"
                         + "wallet_trades,completed_trades,queue_backlog,queue_read_failures,"
-                        + "order_reservation_inbox_backlog\n");
+                        + "order_reservation_inbox_backlog,"
+                        + "order_inbox_backlog,order_inbox_oldest_age_seconds,order_inbox_terminal_debt,"
+                        + "wallet_inbox_backlog,wallet_inbox_oldest_age_seconds,wallet_inbox_terminal_debt,"
+                        + "match_inbox_backlog,match_inbox_oldest_age_seconds,match_inbox_terminal_debt\n");
                 synchronized (samples) {
                     for (SteadySample sample : samples) {
                         writer.write(String.format(
                                 java.util.Locale.ROOT,
-                                "%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                                "%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
                                 sample.elapsedSeconds(),
                                 sample.httpAccepted(),
                                 sample.httpFailures(),
@@ -2399,7 +2663,16 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                                 sample.completedTrades(),
                                 sample.queueBacklog(),
                                 sample.queueReadFailures(),
-                                sample.orderReservationInboxBacklog()));
+                                sample.orderReservationInboxBacklog(),
+                                sample.orderInboxDebt().activeBacklog(),
+                                sample.orderInboxDebt().oldestUnresolvedAgeSeconds(),
+                                sample.orderInboxDebt().terminalDebt(),
+                                sample.walletInboxDebt().activeBacklog(),
+                                sample.walletInboxDebt().oldestUnresolvedAgeSeconds(),
+                                sample.walletInboxDebt().terminalDebt(),
+                                sample.matchInboxDebt().activeBacklog(),
+                                sample.matchInboxDebt().oldestUnresolvedAgeSeconds(),
+                                sample.matchInboxDebt().terminalDebt()));
                     }
                 }
             }
@@ -2418,7 +2691,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 List<String> invalidReasons) {
             Config common = config.common();
             System.out.println("{");
-            System.out.println("  \"benchmarkSchemaVersion\": 2,");
+            System.out.printf("  \"benchmarkSchemaVersion\": %d,%n", BENCHMARK_SCHEMA_VERSION);
             String benchmarkContract = config.httpDriverMode().startsWith("external-")
                     ? ExternalHttpMatchedManifest.CONTRACT
                     : "http-matched-steady-state-chain";
@@ -2491,11 +2764,16 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     window.orderReservationInboxBacklogMax());
             System.out.printf("  \"steadyOrderReservationInboxBacklogSlopePerSecond\": %.4f,%n",
                     window.orderReservationInboxBacklogSlopePerSecond());
+            printInboxDebtWindow("Order", window.orderInboxDebt());
+            printInboxDebtWindow("Wallet", window.walletInboxDebt());
+            printInboxDebtWindow("Match", window.matchInboxDebt());
             System.out.printf("  \"minOfferedLoadRatio\": %.4f,%n", config.minOfferedLoadRatio());
             System.out.printf("  \"minCompletionRatio\": %.4f,%n", config.minCompletionRatio());
             System.out.printf("  \"maxBacklogGrowthPerSecond\": %.4f,%n",
                     config.maxBacklogGrowthPerSecond());
             System.out.printf("  \"maxSteadyBacklog\": %d,%n", config.maxSteadyBacklog());
+            System.out.printf("  \"maxInboxOldestAgeSeconds\": %d,%n",
+                    config.maxInboxOldestAgeSeconds());
             System.out.printf("  \"finalOrderSubmissionRows\": %d,%n", completion.submitted());
             System.out.printf("  \"finalWalletReservationRows\": %d,%n", completion.reservationClaims());
             System.out.printf("  \"finalOrderConfirmationRows\": %d,%n", completion.confirmed());
@@ -2524,6 +2802,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     completion.matchAdmissionInboxAppliedRows());
             System.out.printf("  \"matchAdmissionInboxNonAppliedRows\": %d,%n",
                     completion.matchAdmissionInboxNonAppliedRows());
+            printFinalInboxDebt("Order", completion.orderInboxDebt());
+            printFinalInboxDebt("Wallet", completion.walletInboxDebt());
+            printFinalInboxDebt("Match", completion.matchInboxDebt());
+            printDurableDebt(completion.durableDebt());
             System.out.printf("  \"finalMatchedOrderRows\": %d,%n", completion.matchedOrders());
             System.out.printf("  \"finalMatchTradeRows\": %d,%n", completion.matchTrades());
             System.out.printf("  \"finalOrderTradeRows\": %d,%n", completion.orderTrades());
@@ -2534,6 +2816,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"walletTradeIdCount\": %d,%n", completion.tradeIds().walletCount());
             System.out.printf("  \"tradeIdFingerprint\": \"%s\",%n",
                     completion.tradeIds().fingerprint());
+            System.out.printf("  \"assetReconciliationPassed\": %s,%n",
+                    balancesConverged(
+                            expectedOutcome,
+                            initialBuyerBalances,
+                            initialSellerBalances,
+                            completion.buyerBalances(),
+                            completion.sellerBalances()));
             printBalances("initialBuyer", initialBuyerBalances);
             printBalances("initialSeller", initialSellerBalances);
             printBalances("finalBuyer", completion.buyerBalances());
@@ -2542,6 +2831,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"remainingSellOrders\": %d,%n", completion.sellBook());
             System.out.printf("  \"activeMatchReservations\": %d,%n", completion.activeReservations());
             System.out.printf("  \"finalQueueBacklog\": %d,%n", completion.finalQueueBacklog());
+            QueueDepth deadLetters = completion.finalQueueDepths().get(DEAD_LETTER_QUEUE);
+            long finalDlqBacklog = deadLetters == null
+                    ? -1
+                    : deadLetters.ready() + deadLetters.unacked();
+            System.out.printf("  \"finalDlqBacklog\": %d,%n", finalDlqBacklog);
             System.out.printf("  \"queueMetricsReadFailures\": %d,%n",
                     window.queueReadFailures() + completion.queueReadFailures());
             printQueueDepths(completion.finalQueueDepths());
@@ -2553,6 +2847,41 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"validForSustainedCapacity\": %s,%n", invalidReasons.isEmpty());
             System.out.printf("  \"capacityInvalidReasons\": %s%n", jsonArray(invalidReasons));
             System.out.println("}");
+        }
+
+        private void printInboxDebtWindow(String service, InboxDebtWindow debt) {
+            System.out.printf("  \"steady%sInboxBacklogStart\": %d,%n",
+                    service, debt.activeBacklog().start());
+            System.out.printf("  \"steady%sInboxBacklogEnd\": %d,%n",
+                    service, debt.activeBacklog().end());
+            System.out.printf("  \"steady%sInboxBacklogMax\": %d,%n",
+                    service, debt.activeBacklog().max());
+            System.out.printf("  \"steady%sInboxBacklogSlopePerSecond\": %.4f,%n",
+                    service, debt.activeBacklog().slopePerSecond());
+            System.out.printf("  \"steady%sInboxOldestAgeMaxSeconds\": %d,%n",
+                    service, debt.maxOldestUnresolvedAgeSeconds());
+            System.out.printf("  \"steady%sInboxTerminalDebtMax\": %d,%n",
+                    service, debt.maxTerminalDebt());
+        }
+
+        private void printFinalInboxDebt(String service, InboxDebtSnapshot debt) {
+            System.out.printf("  \"final%sInboxBacklog\": %d,%n",
+                    service, debt.activeBacklog());
+            System.out.printf("  \"final%sInboxOldestAgeSeconds\": %d,%n",
+                    service, debt.oldestUnresolvedAgeSeconds());
+            System.out.printf("  \"final%sInboxTerminalDebt\": %d,%n",
+                    service, debt.terminalDebt());
+        }
+
+        private void printDurableDebt(DurableDebtSnapshot debt) {
+            System.out.printf("  \"finalOrderOutboxActiveDebt\": %d,%n", debt.orderOutboxActive());
+            System.out.printf("  \"finalOrderOutboxTerminalDebt\": %d,%n", debt.orderOutboxTerminal());
+            System.out.printf("  \"finalWalletOutboxActiveDebt\": %d,%n", debt.walletOutboxActive());
+            System.out.printf("  \"finalWalletOutboxTerminalDebt\": %d,%n", debt.walletOutboxTerminal());
+            System.out.printf("  \"finalMatchOutboxActiveDebt\": %d,%n", debt.matchOutboxActive());
+            System.out.printf("  \"finalMatchOutboxTerminalDebt\": %d,%n", debt.matchOutboxTerminal());
+            System.out.printf("  \"finalMatchCleanupActiveDebt\": %d,%n", debt.matchCleanupActive());
+            System.out.printf("  \"finalMatchCleanupTerminalDebt\": %d,%n", debt.matchCleanupTerminal());
         }
 
         private UUID deterministicSteadyOrderId(String runId, String side, int index) {
@@ -2676,8 +3005,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
             try (DatabaseHandles databases = DatabaseHandles.open(config.common());
                  BufferedWriter writer = Files.newBufferedWriter(monitorOutputPath, StandardCharsets.UTF_8)) {
-                writer.write("epoch_millis,match_trades,order_trades,wallet_trades,completed_trades,"
-                        + "queue_backlog,queue_read_failures,order_reservation_inbox_backlog\n");
+                writer.write(EXTERNAL_MONITOR_HEADER);
+                writer.newLine();
                 writeMonitorSample(writer, databases, baseline);
                 Files.writeString(monitorReadyPath, "ready\n", StandardCharsets.UTF_8);
                 System.out.printf("external monitor ready: %s%n", monitorReadyPath);
@@ -2790,7 +3119,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     baseline);
             writer.write(String.format(
                     java.util.Locale.ROOT,
-                    "%d,%d,%d,%d,%d,%d,%d,%d%n",
+                    "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
                     System.currentTimeMillis(),
                     sample.matchTrades(),
                     sample.orderTrades(),
@@ -2798,7 +3127,16 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     sample.completedTrades(),
                     sample.queueBacklog(),
                     sample.queueReadFailures(),
-                    sample.orderReservationInboxBacklog()));
+                    sample.orderReservationInboxBacklog(),
+                    sample.orderInboxDebt().activeBacklog(),
+                    sample.orderInboxDebt().oldestUnresolvedAgeSeconds(),
+                    sample.orderInboxDebt().terminalDebt(),
+                    sample.walletInboxDebt().activeBacklog(),
+                    sample.walletInboxDebt().oldestUnresolvedAgeSeconds(),
+                    sample.walletInboxDebt().terminalDebt(),
+                    sample.matchInboxDebt().activeBacklog(),
+                    sample.matchInboxDebt().oldestUnresolvedAgeSeconds(),
+                    sample.matchInboxDebt().terminalDebt()));
             writer.flush();
         }
 
@@ -2886,16 +3224,23 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long accepted = 0;
             long failures = 0;
             List<String> lines = Files.readAllLines(monitorOutputPath, StandardCharsets.UTF_8);
+            if (lines.isEmpty()) {
+                throw new IOException("external monitor CSV is empty");
+            }
+            validateExternalMonitorHeader(lines.get(0));
+            long previousSampleEpochMillis = Long.MIN_VALUE;
             for (int lineNumber = 1; lineNumber < lines.size(); lineNumber++) {
                 String line = lines.get(lineNumber);
                 if (line.isBlank()) {
                     continue;
                 }
                 String[] values = line.split(",", -1);
-                if (values.length != 8) {
+                if (values.length != 17) {
                     throw new IOException("invalid external monitor CSV row: " + line);
                 }
                 long sampleEpochMillis = Long.parseLong(values[0]);
+                validateExternalMonitorTimestamp(previousSampleEpochMillis, sampleEpochMillis);
+                previousSampleEpochMillis = sampleEpochMillis;
                 long sampleEpochNanos = Math.multiplyExact(sampleEpochMillis, 1_000_000L);
                 while (completedResponses < resultsByCompletion.size()
                         && resultsByCompletion.get(completedResponses).completionEpochNanos()
@@ -2907,6 +3252,27 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     }
                     completedResponses++;
                 }
+                long orderReservationInboxBacklog = Long.parseLong(values[7]);
+                long orderInboxBacklog = Long.parseLong(values[8]);
+                long orderInboxOldestAge = Long.parseLong(values[9]);
+                long orderInboxTerminalDebt = Long.parseLong(values[10]);
+                long walletInboxBacklog = Long.parseLong(values[11]);
+                long walletInboxOldestAge = Long.parseLong(values[12]);
+                long walletInboxTerminalDebt = Long.parseLong(values[13]);
+                long matchInboxBacklog = Long.parseLong(values[14]);
+                long matchInboxOldestAge = Long.parseLong(values[15]);
+                long matchInboxTerminalDebt = Long.parseLong(values[16]);
+                validateNonNegativeInboxDebt(
+                        orderReservationInboxBacklog,
+                        orderInboxBacklog,
+                        orderInboxOldestAge,
+                        orderInboxTerminalDebt,
+                        walletInboxBacklog,
+                        walletInboxOldestAge,
+                        walletInboxTerminalDebt,
+                        matchInboxBacklog,
+                        matchInboxOldestAge,
+                        matchInboxTerminalDebt);
                 samples.add(new SteadySample(
                         (sampleEpochNanos - externalResults.results().get(0).requestEpochNanos())
                                 / 1_000_000_000.0,
@@ -2918,7 +3284,19 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         Long.parseLong(values[4]),
                         Long.parseLong(values[5]),
                         Long.parseLong(values[6]),
-                        Long.parseLong(values[7])));
+                        orderReservationInboxBacklog,
+                        new InboxDebtSnapshot(
+                                orderInboxBacklog,
+                                orderInboxOldestAge,
+                                orderInboxTerminalDebt),
+                        new InboxDebtSnapshot(
+                                walletInboxBacklog,
+                                walletInboxOldestAge,
+                                walletInboxTerminalDebt),
+                        new InboxDebtSnapshot(
+                                matchInboxBacklog,
+                                matchInboxOldestAge,
+                                matchInboxTerminalDebt)));
             }
             return List.copyOf(samples);
         }
@@ -3783,7 +4161,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long completedTrades,
             long queueBacklog,
             long queueReadFailures,
-            long orderReservationInboxBacklog) {
+            long orderReservationInboxBacklog,
+            InboxDebtSnapshot orderInboxDebt,
+            InboxDebtSnapshot walletInboxDebt,
+            InboxDebtSnapshot matchInboxDebt) {
     }
 
     record BacklogWindow(
@@ -3792,6 +4173,31 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long max,
             double slopePerSecond,
             int validSamples) {
+    }
+
+    record InboxDebtSnapshot(
+            long activeBacklog,
+            long oldestUnresolvedAgeSeconds,
+            long terminalDebt) {
+        static InboxDebtSnapshot empty() {
+            return new InboxDebtSnapshot(0, 0, 0);
+        }
+
+        private boolean converged() {
+            return activeBacklog == 0 && terminalDebt == 0;
+        }
+    }
+
+    record InboxDebtWindow(
+            BacklogWindow activeBacklog,
+            long maxOldestUnresolvedAgeSeconds,
+            long maxTerminalDebt) {
+        private static InboxDebtWindow empty() {
+            return new InboxDebtWindow(
+                    new BacklogWindow(0, 0, 0, Double.POSITIVE_INFINITY, 0),
+                    0,
+                    0);
+        }
     }
 
     private record SteadyWindow(
@@ -3813,13 +4219,45 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long orderReservationInboxBacklogEnd,
             long orderReservationInboxBacklogMax,
             double orderReservationInboxBacklogSlopePerSecond,
+            InboxDebtWindow orderInboxDebt,
+            InboxDebtWindow walletInboxDebt,
+            InboxDebtWindow matchInboxDebt,
             long queueReadFailures,
             int samples) {
         private static SteadyWindow empty() {
             return new SteadyWindow(
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, Double.POSITIVE_INFINITY,
-                    0, 0, 0, Double.POSITIVE_INFINITY, 0, 0);
+                    0, 0, 0, Double.POSITIVE_INFINITY,
+                    InboxDebtWindow.empty(),
+                    InboxDebtWindow.empty(),
+                    InboxDebtWindow.empty(),
+                    0, 0);
+        }
+    }
+
+    private record DurableDebtSnapshot(
+            long orderOutboxActive,
+            long orderOutboxTerminal,
+            long walletOutboxActive,
+            long walletOutboxTerminal,
+            long matchOutboxActive,
+            long matchOutboxTerminal,
+            long matchCleanupActive,
+            long matchCleanupTerminal) {
+        private static DurableDebtSnapshot empty() {
+            return new DurableDebtSnapshot(0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        private boolean converged() {
+            return orderOutboxActive == 0
+                    && orderOutboxTerminal == 0
+                    && walletOutboxActive == 0
+                    && walletOutboxTerminal == 0
+                    && matchOutboxActive == 0
+                    && matchOutboxTerminal == 0
+                    && matchCleanupActive == 0
+                    && matchCleanupTerminal == 0;
         }
     }
 
@@ -3860,6 +4298,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long matchAdmissionInboxRows,
             long matchAdmissionInboxAppliedRows,
             long matchAdmissionInboxNonAppliedRows,
+            InboxDebtSnapshot orderInboxDebt,
+            InboxDebtSnapshot walletInboxDebt,
+            InboxDebtSnapshot matchInboxDebt,
+            DurableDebtSnapshot durableDebt,
             long matchedOrders,
             long matchTrades,
             long orderTrades,
@@ -3877,7 +4319,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         private static SteadyCompletion empty() {
             return new SteadyCompletion(
                     0, 0, 0, 0, 0, 0, 0, 0, Long.MAX_VALUE,
-                    0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0,
+                    InboxDebtSnapshot.empty(),
+                    InboxDebtSnapshot.empty(),
+                    InboxDebtSnapshot.empty(),
+                    DurableDebtSnapshot.empty(),
+                    0, 0, 0, 0,
                     RoleBalances.empty(), RoleBalances.empty(),
                     -1, -1, -1, TradeIdDigestCheck.empty(),
                     Long.MAX_VALUE, 0, Map.of(), 0);
@@ -4210,6 +4657,12 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
         private boolean usesPreparedDriver() {
             return PreparedHttpLoadDriver.MODE.equals(httpDriverMode);
+        }
+
+        private long maxInboxOldestAgeSeconds() {
+            long backlogBudgetSeconds = (long) Math.ceil(
+                    maxSteadyBacklog / (double) targetOrderTps);
+            return Math.max(sampleIntervalSeconds * 2L, backlogBudgetSeconds);
         }
 
         private static int intArg(String[] args, String name, int defaultValue) {

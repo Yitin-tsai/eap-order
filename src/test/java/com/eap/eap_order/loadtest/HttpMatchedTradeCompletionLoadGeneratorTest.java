@@ -106,6 +106,68 @@ class HttpMatchedTradeCompletionLoadGeneratorTest {
         assertThat(summary.slopePerSecond()).isEqualTo(10.0);
     }
 
+    @Test
+    void inboxDebtSummary_tracksBacklogAgeAndTerminalDebtIndependently() {
+        var samples = List.of(
+                sample(0, 0, 0, 0, new HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot(2, 1, 0)),
+                sample(1, 0, 0, 0, new HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot(4, 3, 0)),
+                sample(2, 0, 0, 0, new HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot(6, 5, 1)));
+
+        var summary = HttpMatchedTradeCompletionLoadGenerator.summarizeInboxDebt(
+                samples,
+                HttpMatchedTradeCompletionLoadGenerator.SteadySample::walletInboxDebt);
+
+        assertThat(summary.activeBacklog().start()).isEqualTo(2);
+        assertThat(summary.activeBacklog().end()).isEqualTo(6);
+        assertThat(summary.activeBacklog().slopePerSecond()).isEqualTo(2.0);
+        assertThat(summary.maxOldestUnresolvedAgeSeconds()).isEqualTo(5);
+        assertThat(summary.maxTerminalDebt()).isEqualTo(1);
+    }
+
+    @Test
+    void inboxDebtGate_rejectsGrowthSizeAgeAndTerminalDebt() {
+        var debt = new HttpMatchedTradeCompletionLoadGenerator.InboxDebtWindow(
+                new HttpMatchedTradeCompletionLoadGenerator.BacklogWindow(0, 301, 301, 5.0, 61),
+                61,
+                1);
+
+        var reasons = HttpMatchedTradeCompletionLoadGenerator.inboxDebtInvalidReasons(
+                "wallet", debt, 60, 100, 1.0, 200, 30);
+
+        assertThat(reasons).containsExactly(
+                "steady_wallet_inbox_backlog_growing",
+                "steady_wallet_inbox_backlog_above_limit",
+                "steady_wallet_inbox_oldest_age_above_limit",
+                "steady_wallet_inbox_terminal_debt");
+    }
+
+    @Test
+    void inboxDebtGate_rejectsAppliedIdentityConflictWithoutActiveBacklog() {
+        var appliedConflictDebt = new HttpMatchedTradeCompletionLoadGenerator.InboxDebtWindow(
+                new HttpMatchedTradeCompletionLoadGenerator.BacklogWindow(0, 0, 0, 0, 3),
+                0,
+                1);
+
+        var reasons = HttpMatchedTradeCompletionLoadGenerator.inboxDebtInvalidReasons(
+                "wallet", appliedConflictDebt, 60, 100, 1.0, 3_000, 30);
+
+        assertThat(reasons).containsExactly("steady_wallet_inbox_terminal_debt");
+    }
+
+    @Test
+    void externalMonitorContract_rejectsWrongHeaderOutOfOrderTimeAndNegativeDebt() {
+        assertThatThrownBy(() ->
+                HttpMatchedTradeCompletionLoadGenerator.validateExternalMonitorHeader(
+                        "epoch_millis,wrong_columns"))
+                .hasMessageContaining("invalid external monitor CSV header");
+        assertThatThrownBy(() ->
+                HttpMatchedTradeCompletionLoadGenerator.validateExternalMonitorTimestamp(2_000, 2_000))
+                .hasMessageContaining("strictly increasing");
+        assertThatThrownBy(() ->
+                HttpMatchedTradeCompletionLoadGenerator.validateNonNegativeInboxDebt(0, 1, -1))
+                .hasMessageContaining("must be non-negative");
+    }
+
     private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
             double elapsedSeconds,
             long queueBacklog,
@@ -118,8 +180,24 @@ class HttpMatchedTradeCompletionLoadGeneratorTest {
             long queueBacklog,
             long queueReadFailures,
             long orderReservationInboxBacklog) {
+        return sample(
+                elapsedSeconds,
+                queueBacklog,
+                queueReadFailures,
+                orderReservationInboxBacklog,
+                HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot.empty());
+    }
+
+    private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
+            double elapsedSeconds,
+            long queueBacklog,
+            long queueReadFailures,
+            long orderReservationInboxBacklog,
+            HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot walletInboxDebt) {
+        var empty = HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot.empty();
         return new HttpMatchedTradeCompletionLoadGenerator.SteadySample(
                 elapsedSeconds, 0, 0, 0, 0, 0, 0,
-                queueBacklog, queueReadFailures, orderReservationInboxBacklog);
+                queueBacklog, queueReadFailures, orderReservationInboxBacklog,
+                empty, walletInboxDebt, empty);
     }
 }
