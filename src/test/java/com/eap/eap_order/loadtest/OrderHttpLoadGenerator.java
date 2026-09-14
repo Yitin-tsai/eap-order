@@ -70,17 +70,12 @@ public class OrderHttpLoadGenerator {
 
     public static void main(String[] args) throws Exception {
         Config config = Config.from(args);
+        requireTrafficOnly(config.resetData());
         ObjectMapper objectMapper = new ObjectMapper();
         ExecutorService httpExecutor = Executors.newFixedThreadPool(config.workers());
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
-
-        if (config.resetData()) {
-            resetOrderAdmissionData(config, httpClient, objectMapper);
-        } else if (config.orderAdmissionGate()) {
-            redisDel(config, orderbookKey(config.marketId(), "buy"), orderbookKey(config.marketId(), "sell"));
-        }
 
         System.out.printf("registering %d users through %s%n", config.users(), config.walletUrl());
         List<UUID> users = registerUsers(config, httpClient, objectMapper);
@@ -710,116 +705,6 @@ public class OrderHttpLoadGenerator {
         return users;
     }
 
-    private static void resetOrderAdmissionData(Config config, HttpClient httpClient, ObjectMapper objectMapper)
-            throws Exception {
-        System.out.println("resetting order-admission benchmark data");
-        purgeQueues(config, httpClient, objectMapper);
-        truncateOrderAdmissionOrderData(config);
-        truncateOrderAdmissionWalletData(config);
-        truncateOrderAdmissionMatchData(config);
-        purgeQueues(config, httpClient, objectMapper);
-        if (config.flushRedisOnReset()) {
-            redisCommand(config, command("FLUSHDB"));
-        } else {
-            redisDel(config,
-                    orderbookKey(config.marketId(), "buy"),
-                    orderbookKey(config.marketId(), "sell"));
-        }
-    }
-
-    private static void truncateOrderAdmissionOrderData(Config config) throws Exception {
-        try (Connection connection = DriverManager.getConnection(
-                config.orderJdbcUrl(), config.orderJdbcUser(), config.orderJdbcPassword());
-             PreparedStatement statement = connection.prepareStatement("""
-                     DO $$
-                     BEGIN
-                         IF to_regclass('order_service.order_cancellation_result_inbox') IS NOT NULL THEN
-                             TRUNCATE TABLE order_service.order_cancellation_result_inbox;
-                         END IF;
-                     END $$;
-                     TRUNCATE TABLE
-                         order_service.match_history,
-                         order_service.order_trade_execution_inbox,
-                         order_service.order_trade_applications,
-                         order_service.order_event_store_relay_checkpoints,
-                         order_service.order_event_outbox,
-                         order_service.order_matching_state,
-                         order_service.orders_current,
-                         order_service.projection_checkpoints,
-                         order_service.order_event_store,
-                         order_service.order_stream_heads
-                     RESTART IDENTITY CASCADE
-                     """)) {
-            statement.execute();
-        }
-    }
-
-    private static void truncateOrderAdmissionWalletData(Config config) throws Exception {
-        try (Connection connection = DriverManager.getConnection(
-                config.walletJdbcUrl(), config.walletJdbcUser(), config.walletJdbcPassword());
-             PreparedStatement statement = connection.prepareStatement("""
-                     DO $$
-                     BEGIN
-                         IF to_regclass('wallet_service.order_cancellation_applications') IS NOT NULL THEN
-                             TRUNCATE TABLE wallet_service.order_cancellation_applications;
-                         END IF;
-                     END $$;
-                     TRUNCATE TABLE
-                         wallet_service.trade_settlements,
-                         wallet_service.outbox,
-                         wallet_service.order_submission_idempotency,
-                         wallet_service.settlement_idempotency,
-                         wallet_service.wallets
-                     RESTART IDENTITY CASCADE
-                     """)) {
-            statement.execute();
-        }
-    }
-
-    private static void truncateOrderAdmissionMatchData(Config config) throws Exception {
-        try (Connection connection = DriverManager.getConnection(
-                config.matchJdbcUrl(), config.matchJdbcUser(), config.matchJdbcPassword());
-             PreparedStatement statement = connection.prepareStatement("""
-                     DO $$
-                     BEGIN
-                         IF to_regclass('match_engine.order_admission_inbox') IS NOT NULL THEN
-                             TRUNCATE TABLE match_engine.order_admission_inbox RESTART IDENTITY CASCADE;
-                         END IF;
-                     END $$;
-                     """)) {
-            statement.execute();
-        }
-    }
-
-    private static void purgeQueues(Config config, HttpClient httpClient, ObjectMapper objectMapper) {
-        for (String queue : ORDER_ADMISSION_QUEUES) {
-            purgeQueue(config, httpClient, queue);
-        }
-    }
-
-    private static void purgeQueue(Config config, HttpClient httpClient, String queue) {
-        try {
-            String encodedQueue = URLEncoder.encode(queue, StandardCharsets.UTF_8).replace("+", "%20");
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(config.rabbitManagementUrl()
-                            + "/api/queues/%2F/" + encodedQueue + "/contents"))
-                    .timeout(Duration.ofSeconds(5))
-                    .header("Authorization", basicAuth(config.rabbitManagementUser(), config.rabbitManagementPassword()))
-                    .DELETE()
-                    .build();
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 404) {
-                throw new IllegalStateException("RabbitMQ queue not found during purge: " + queue);
-            }
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new IllegalStateException(
-                        "RabbitMQ queue purge failed: queue=" + queue + ", status=" + response.statusCode());
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to purge RabbitMQ queue " + queue, e);
-        }
-    }
-
     private static AdmissionSnapshot waitForOrderAdmission(
             Config config,
             HttpClient httpClient,
@@ -1345,8 +1230,11 @@ public class OrderHttpLoadGenerator {
         return UUID.nameUUIDFromBytes((runId + ":order:" + index).getBytes(StandardCharsets.UTF_8));
     }
 
-    private static void redisDel(Config config, String... keys) throws IOException {
-        redisCommand(config, command("DEL", keys));
+    static void requireTrafficOnly(boolean resetData) {
+        if (resetData) {
+            throw new IllegalArgumentException(
+                    "OrderHttpLoadGenerator is traffic-only; stop services and use the load-test reset harness first");
+        }
     }
 
     private static long redisZcard(Config config, String key) throws IOException {
@@ -1646,7 +1534,7 @@ public class OrderHttpLoadGenerator {
                     booleanArg(args, "--order-submission-event-store-relay-enabled", false),
                     intArg(args, "--wait-timeout-seconds", 120),
                     booleanArg(args, "--order-admission-gate", true),
-                    booleanArg(args, "--reset-data", true),
+                    booleanArg(args, "--reset-data", false),
                     stringArg(args, "--market-id", "ENERGY-SPOT"),
                     stringArg(args, "--order-url", DEFAULT_ORDER_URL),
                     stringArg(args, "--wallet-url", DEFAULT_WALLET_URL),

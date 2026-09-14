@@ -722,14 +722,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         if (config.flushRedisOnReset()) {
             redisCommand(config, "FLUSHDB");
         } else {
-            redisCommand(
-                    config,
-                    "DEL",
-                    orderbookKey(config.marketId(), "buy"),
-                    orderbookKey(config.marketId(), "sell"));
-            deleteRedisKeys(config, "order:reservation:*");
-            deleteRedisKeys(config, "order:cancellation:*");
-            deleteRedisKeys(config, "order:cancellation-intent:*");
+            throw new IllegalArgumentException(
+                    "matched-chain reset now requires --flush-redis-on-reset true so a fresh generation can be verified");
         }
         awaitResetQueueQuiescence(rabbit, 10);
     }
@@ -830,6 +824,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     END IF;
                     IF to_regclass('match_engine.order_admission_inbox') IS NOT NULL THEN
                         TRUNCATE TABLE match_engine.order_admission_inbox RESTART IDENTITY CASCADE;
+                    END IF;
+                    IF to_regclass('match_engine.order_book_runtime_control') IS NOT NULL THEN
+                        TRUNCATE TABLE match_engine.order_book_runtime_control RESTART IDENTITY CASCADE;
                     END IF;
                 END $$;
                 TRUNCATE TABLE
@@ -4856,7 +4853,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     workers,
                     intArg(args, "--max-in-flight", workers * 2),
                     intArg(args, "--wait-timeout-seconds", 300),
-                    booleanArg(args, "--reset-data", true),
+                    booleanArg(args, "--reset-data", false),
                     booleanArg(args, "--flush-redis-on-reset", true),
                     stringArg(args, "--order-url", "http://localhost:8080/eap-order"),
                     stringArg(args, "--wallet-url", "http://localhost:8081/eap-wallet"),
