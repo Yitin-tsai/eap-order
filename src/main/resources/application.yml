@@ -62,7 +62,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,prometheus,orderAssetReservationResultInbox
+        include: health,metrics,prometheus,durableDebt,orderAssetReservationResultInbox
   metrics:
     tags:
       application: eap-order

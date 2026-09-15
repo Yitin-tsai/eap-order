@@ -569,4 +569,33 @@
         </sql>
     </changeSet>
 
+    <changeSet id="order-es-030" author="eap">
+        <comment>Expose bounded durable-debt snapshots and persist current projection failures</comment>
+        <sql>
+            ALTER TABLE order_service.projection_checkpoints
+                ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN first_failure_at TIMESTAMP,
+                ADD COLUMN last_failure_at TIMESTAMP,
+                ADD COLUMN last_error TEXT,
+                ADD CONSTRAINT ck_projection_failure_count_non_negative
+                    CHECK (failure_count &gt;= 0);
+
+            CREATE INDEX idx_order_asset_reservation_result_debt_age
+                ON order_service.order_asset_reservation_result_inbox(received_at)
+                WHERE status &lt;&gt; 'APPLIED' OR conflict_detected_at IS NOT NULL;
+            CREATE INDEX idx_order_trade_execution_debt_age
+                ON order_service.order_trade_execution_inbox(received_at)
+                WHERE status &lt;&gt; 'APPLIED';
+            CREATE INDEX idx_order_cancellation_result_debt_age
+                ON order_service.order_cancellation_result_inbox(received_at)
+                WHERE status &lt;&gt; 'APPLIED';
+            CREATE INDEX idx_order_asset_release_debt_age
+                ON order_service.order_asset_reservation_released_inbox(received_at)
+                WHERE status &lt;&gt; 'APPLIED' OR conflict_detected_at IS NOT NULL;
+            CREATE INDEX idx_order_outbox_debt_age
+                ON order_service.order_event_outbox(created_at)
+                WHERE status &lt;&gt; 'SENT';
+        </sql>
+    </changeSet>
+
 </databaseChangeLog>

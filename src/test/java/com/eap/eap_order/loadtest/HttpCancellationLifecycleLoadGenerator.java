@@ -99,11 +99,21 @@ public final class HttpCancellationLifecycleLoadGenerator {
             RaceSummary race = runMatchCancellationRaces(
                     config, http, mapper, order, wallet, match);
 
-            await("all cancellation queues and DLQ drained", config.timeoutSeconds(), () -> {
+            await("all cancellation queues, DLQ, and durable work converged", config.timeoutSeconds(), () -> {
                 RabbitManagementClient.QueueSnapshot queues = rabbit.readQueues(CHAIN_QUEUES);
-                return queues.readFailures() == 0 && queues.backlog() == 0;
+                HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot durableDebt =
+                        readDurableDebt(config, http, mapper);
+                return queues.readFailures() == 0
+                        && queues.backlog() == 0
+                        && durableDebt.converged();
             });
             RabbitManagementClient.QueueSnapshot queues = rabbit.readQueues(CHAIN_QUEUES);
+            HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot durableDebt =
+                    readDurableDebt(config, http, mapper);
+            RabbitManagementClient.QueueDepth dlq = queues.depths().get(DEAD_LETTER_QUEUE);
+            long finalDlqBacklog = dlq == null ? -1 : dlq.ready() + dlq.unacked();
+            long activeMatchReservations = new RedisRespClient(
+                    config.redisHost(), config.redisPort()).countKeys("order:reservation:*");
 
             long orderOutboxDebt = scalarLong(order,
                     "SELECT count(*) FROM order_service.order_event_outbox WHERE status <> 'SENT'");
@@ -151,8 +161,23 @@ public final class HttpCancellationLifecycleLoadGenerator {
                                 + walletReleasePublications + ", orderCompletions="
                                 + orderCancellationCompletions);
             }
+            boolean businessComplete = queues.readFailures() == 0
+                    && queues.backlog() == 0
+                    && finalDlqBacklog == 0
+                    && durableDebt.converged()
+                    && activeMatchReservations == 0
+                    && partial.threeServiceTradeIdsEqual();
+            if (!businessComplete) {
+                throw new IllegalStateException(
+                        "cancellation lifecycle did not reach business completion: queueBacklog="
+                                + queues.backlog() + ", queueReadFailures=" + queues.readFailures()
+                                + ", dlqBacklog=" + finalDlqBacklog
+                                + ", activeMatchReservations=" + activeMatchReservations
+                                + ", durableDebtHealthy=" + durableDebt.observationsHealthy());
+            }
 
             Map<String, Object> result = new LinkedHashMap<>();
+            result.put("benchmarkSchemaVersion", 4);
             result.put("benchmarkContract", "http-cancellation-lifecycle");
             result.put("runId", config.runId());
             result.put("marketId", MARKET_ID);
@@ -166,6 +191,9 @@ public final class HttpCancellationLifecycleLoadGenerator {
             result.put("partialMatchedAmount", 1);
             result.put("partialCancelledAmount", 1);
             result.put("threeServiceTradeIdsEqual", partial.threeServiceTradeIdsEqual());
+            result.put("assetReconciliationPassed", true);
+            result.put("orderReadModelConverged",
+                    durableDebt.component("eap-order", "orders_current_projection").totalCount() == 0);
             result.put("raceIterations", config.raceIterations());
             result.put("raceCancellationWins", race.cancellationWins());
             result.put("raceMatchingWins", race.matchingWins());
@@ -178,10 +206,14 @@ public final class HttpCancellationLifecycleLoadGenerator {
             result.put("orderOutboxDebt", orderOutboxDebt);
             result.put("walletOutboxDebt", walletOutboxDebt);
             result.put("matchOutboxDebt", matchOutboxDebt);
+            result.put("activeMatchReservations", activeMatchReservations);
             result.put("finalQueueBacklog", queues.backlog());
+            result.put("finalDlqBacklog", finalDlqBacklog);
             result.put("queueMetricsReadFailures", queues.readFailures());
+            result.put("finalDurableDebtObservationsHealthy", durableDebt.observationsHealthy());
+            result.put("finalDurableDebtComponents", durableDebt.workByService());
             result.put("finalQueues", queues.depths());
-            result.put("valid", true);
+            result.put("valid", businessComplete);
             System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
         }
     }
@@ -582,6 +614,14 @@ public final class HttpCancellationLifecycleLoadGenerator {
         return DriverManager.getConnection(jdbcUrl, config.jdbcUser(), config.jdbcPassword());
     }
 
+    private static HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot readDurableDebt(
+            Config config,
+            HttpClient http,
+            ObjectMapper mapper) {
+        return HttpMatchedTradeCompletionLoadGenerator.readDurableDebtSnapshot(
+                config.orderUrl(), config.walletUrl(), config.matchUrl(), http, mapper);
+    }
+
     private static WalletBalance walletBalance(Connection connection, UUID userId) throws Exception {
         try (PreparedStatement statement = connection.prepareStatement("""
                 SELECT available_amount, locked_amount, available_currency, locked_currency
@@ -828,6 +868,8 @@ public final class HttpCancellationLifecycleLoadGenerator {
             String rabbitVhost,
             String rabbitUser,
             String rabbitPassword,
+            String redisHost,
+            int redisPort,
             int timeoutSeconds,
             int raceIterations) {
 
@@ -853,6 +895,8 @@ public final class HttpCancellationLifecycleLoadGenerator {
                     System.getenv().getOrDefault("EAP_LOADTEST_RABBIT_VHOST", "/"),
                     values.getOrDefault("rabbit-user", "admin"),
                     System.getenv().getOrDefault("EAP_LOADTEST_RABBIT_PASSWORD", "admin123"),
+                    values.getOrDefault("redis-host", "localhost"),
+                    Integer.parseInt(values.getOrDefault("redis-port", "6379")),
                     Integer.parseInt(values.getOrDefault("timeout-seconds", "120")),
                     Integer.parseInt(values.getOrDefault("race-iterations", "10")));
         }

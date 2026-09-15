@@ -5,6 +5,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.amqp.AmqpException;
+import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.core.RabbitOperations;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -170,7 +171,13 @@ class OrderEventOutboxRelayPostgresIT {
         RabbitTemplate rabbitTemplate = mock(RabbitTemplate.class);
         doAnswer(invocation -> {
             RabbitOperations.OperationsCallback<?> callback = invocation.getArgument(0);
-            return callback.doInRabbit(mock(RabbitOperations.class));
+            RabbitOperations operations = mock(RabbitOperations.class);
+            doAnswer(sendInvocation -> {
+                Message message = sendInvocation.getArgument(2);
+                assertTrue(message.getMessageProperties().getTimestamp() != null);
+                return null;
+            }).when(operations).send(any(), any(), any(Message.class), any());
+            return callback.doInRabbit(operations);
         }).when(rabbitTemplate).invoke(any(RabbitOperations.OperationsCallback.class));
         return rabbitTemplate;
     }

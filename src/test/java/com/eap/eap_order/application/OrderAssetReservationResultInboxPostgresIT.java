@@ -2,12 +2,14 @@ package com.eap.eap_order.application;
 
 import com.eap.common.event.OrderAssetReservationSucceededEvent;
 import com.eap.common.event.OrderFailedEvent;
+import com.eap.eap_order.configuration.observability.OrderDurableDebtSnapshotProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -39,6 +41,8 @@ class OrderAssetReservationResultInboxPostgresIT {
     private OrderAssetReservationResultInbox inbox;
     @Autowired
     private JdbcTemplate jdbc;
+    @Autowired
+    private OrderDurableDebtSnapshotProvider durableDebt;
 
     private final List<UUID> orderIds = new ArrayList<>();
 
@@ -131,6 +135,123 @@ class OrderAssetReservationResultInboxPostgresIT {
 
         assertThat(inbox.retryPermanentFailure(event.getOrderId())).isTrue();
         assertThat(row(event.getOrderId()).status()).isEqualTo("FAILED_RETRYABLE");
+    }
+
+    @Test
+    void durableDebt_shouldKeepAppliedIdentityConflictVisibleAsTerminal() {
+        OrderAssetReservationSucceededEvent confirmed = confirmed();
+        OrderFailedEvent failed = failed(confirmed.getOrderId(), confirmed.getUserId());
+        inbox.receiveConfirmed(confirmed);
+        OrderAssetReservationResultInbox.InboxEntry entry =
+                inbox.claimRetryable(1, "worker-1", 30_000).get(0);
+        assertThat(inbox.markApplied(entry, "worker-1")).isTrue();
+        jdbc.update("""
+                UPDATE order_service.order_asset_reservation_result_inbox
+                SET received_at = CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+                WHERE order_id = ?
+                """, confirmed.getOrderId());
+        inbox.receiveFailed(failed);
+
+        ReflectionTestUtils.invokeMethod(durableDebt, "refresh");
+        var component = durableDebt.snapshot().components().stream()
+                .filter(debt -> debt.work().equals("asset_reservation_result_inbox"))
+                .findFirst()
+                .orElseThrow();
+
+        assertThat(component.totalCount()).isEqualTo(1);
+        assertThat(component.retryCount()).isZero();
+        assertThat(component.terminalCount()).isEqualTo(1);
+        assertThat(component.oldestUnresolvedAgeSeconds()).isGreaterThanOrEqualTo(119);
+    }
+
+    @Test
+    void durableDebt_shouldClassifyEveryOrderOwnedWorkFromAuthoritativeTables() {
+        UUID assetOrder = UUID.randomUUID();
+        UUID buyerOrder = UUID.randomUUID();
+        UUID sellerOrder = UUID.randomUUID();
+        UUID cancellationId = UUID.randomUUID();
+        UUID cancelledOrder = UUID.randomUUID();
+        UUID releaseCancellationId = UUID.randomUUID();
+        UUID releaseEventId = UUID.randomUUID();
+        UUID releasedOrder = UUID.randomUUID();
+        UUID eventId = UUID.randomUUID();
+        UUID aggregateId = UUID.randomUUID();
+        String tradeId = "REL103-" + UUID.randomUUID();
+        try {
+            jdbc.update("""
+                    INSERT INTO order_service.order_asset_reservation_result_inbox
+                        (order_id, result_type, payload, payload_hash, status, attempt_count,
+                         error_type, received_at)
+                    VALUES (?, 'CONFIRMED', '{}', 'hash', 'FAILED_RETRYABLE', 2,
+                            'TRANSIENT_DATA_STORE', CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                    """, assetOrder);
+            jdbc.update("""
+                    INSERT INTO order_service.order_trade_execution_inbox
+                        (trade_id, buyer_order_id, seller_order_id, deal_price, quantity, payload,
+                         status, attempt_count, received_at)
+                    VALUES (?, ?, ?, 100, 1, '{}', 'PENDING_PREREQUISITE', 2,
+                            CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                    """, tradeId, buyerOrder, sellerOrder);
+            jdbc.update("""
+                    INSERT INTO order_service.order_cancellation_result_inbox
+                        (cancellation_id, order_id, payload, status, attempt_count, received_at)
+                    VALUES (?, ?, '{}', 'FAILED_PERMANENT', 1,
+                            CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                    """, cancellationId, cancelledOrder);
+            jdbc.update("""
+                    INSERT INTO order_service.order_asset_reservation_released_inbox
+                        (cancellation_id, event_id, order_id, payload, payload_hash, status,
+                         attempt_count, error_type, received_at)
+                    VALUES (?, ?, ?, '{}', 'hash', 'FAILED_PERMANENT', 1,
+                            'PERMANENT_INVARIANT', CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                    """, releaseCancellationId, releaseEventId, releasedOrder);
+            jdbc.update("""
+                    INSERT INTO order_service.order_event_store
+                        (event_id, aggregate_id, aggregate_type, aggregate_version, event_type,
+                         payload_canonical, metadata_canonical, schema_version, occurred_at,
+                         prev_hash, hash)
+                    VALUES (?, ?, 'ORDER', 1, 'ProviderMatrixV1', '{}', '{}', 1,
+                            CURRENT_TIMESTAMP - INTERVAL '2 minutes', repeat('0', 64), repeat('1', 64))
+                    """, eventId, aggregateId);
+            jdbc.update("""
+                    INSERT INTO order_service.order_event_outbox
+                        (event_id, aggregate_id, exchange_name, routing_key, payload, status,
+                         attempt_count, message_type, created_at)
+                    VALUES (?, ?, 'test.exchange', 'test.routing', '{}', 'PENDING', 3,
+                            'java.lang.String', CURRENT_TIMESTAMP - INTERVAL '2 minutes')
+                    """, eventId, aggregateId);
+
+            ReflectionTestUtils.invokeMethod(durableDebt, "refresh");
+
+            assertDebt("asset_reservation_result_inbox", 1, 1, 0);
+            assertDebt("trade_execution_inbox", 1, 1, 0);
+            assertDebt("cancellation_result_inbox", 1, 0, 1);
+            assertDebt("asset_reservation_released_inbox", 1, 0, 1);
+            assertDebt("event_outbox", 1, 1, 0);
+            assertDebt("orders_current_projection", 1, 0, 0);
+        } finally {
+            jdbc.update("DELETE FROM order_service.order_event_outbox WHERE event_id = ?", eventId);
+            jdbc.update("DELETE FROM order_service.order_event_store WHERE event_id = ?", eventId);
+            jdbc.update("DELETE FROM order_service.order_asset_reservation_released_inbox WHERE event_id = ?",
+                    releaseEventId);
+            jdbc.update("DELETE FROM order_service.order_cancellation_result_inbox WHERE cancellation_id = ?",
+                    cancellationId);
+            jdbc.update("DELETE FROM order_service.order_trade_execution_inbox WHERE trade_id = ?", tradeId);
+            jdbc.update("DELETE FROM order_service.order_asset_reservation_result_inbox WHERE order_id = ?",
+                    assetOrder);
+            ReflectionTestUtils.invokeMethod(durableDebt, "refresh");
+        }
+    }
+
+    private void assertDebt(String work, long minimumTotal, long minimumRetry, long minimumTerminal) {
+        var component = durableDebt.snapshot().components().stream()
+                .filter(debt -> debt.work().equals(work))
+                .findFirst()
+                .orElseThrow();
+        assertThat(component.totalCount()).isGreaterThanOrEqualTo(minimumTotal);
+        assertThat(component.retryCount()).isGreaterThanOrEqualTo(minimumRetry);
+        assertThat(component.terminalCount()).isGreaterThanOrEqualTo(minimumTerminal);
+        assertThat(component.oldestUnresolvedAgeSeconds()).isGreaterThanOrEqualTo(119);
     }
 
     private OrderAssetReservationSucceededEvent confirmed() {

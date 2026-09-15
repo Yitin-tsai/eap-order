@@ -16,6 +16,7 @@ public class SchedulingConfig {
 
     public static final String DEFAULT_SCHEDULER = "taskScheduler";
     public static final String ORDER_CANCELLATION_SCHEDULER = "orderCancellationTaskScheduler";
+    public static final String DURABLE_DEBT_SCHEDULER = "durableDebtTaskScheduler";
 
     @Bean(name = DEFAULT_SCHEDULER)
     ThreadPoolTaskScheduler taskScheduler() {
@@ -25,6 +26,11 @@ public class SchedulingConfig {
     @Bean(name = ORDER_CANCELLATION_SCHEDULER)
     ThreadPoolTaskScheduler orderCancellationTaskScheduler() {
         return singleThreadScheduler("order-cancellation-");
+    }
+
+    @Bean(name = DURABLE_DEBT_SCHEDULER)
+    ThreadPoolTaskScheduler durableDebtTaskScheduler() {
+        return singleThreadScheduler("order-durable-debt-");
     }
 
     private ThreadPoolTaskScheduler singleThreadScheduler(String threadNamePrefix) {

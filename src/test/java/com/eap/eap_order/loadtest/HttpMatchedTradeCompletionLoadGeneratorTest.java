@@ -1,13 +1,19 @@
 package com.eap.eap_order.loadtest;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class HttpMatchedTradeCompletionLoadGeneratorTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
     void steadyExpectedOutcome_whenBalanced_shouldExpectNoOpenOrders() {
@@ -168,11 +174,173 @@ class HttpMatchedTradeCompletionLoadGeneratorTest {
                 .hasMessageContaining("must be non-negative");
     }
 
+    @Test
+    void businessCompletion_rejectsServiceDebtEvenWhenRabbitQueueIsEmpty() {
+        var debt = new HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot(
+                Map.of("eap-matchEngine", Map.of(
+                        "order_cancellation",
+                        new HttpMatchedTradeCompletionLoadGenerator.DurableWorkDebt(1, 1, 0, 5))),
+                true);
+        long rabbitQueueBacklog = 0;
+
+        assertThat(rabbitQueueBacklog).isZero();
+        assertThat(debt.converged()).isFalse();
+    }
+
+    @Test
+    void businessCompletion_rejectsUnavailableOrStaleDebtObservation() {
+        var debt = new HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot(
+                Map.of("eap-order", Map.of(
+                        "event_outbox",
+                        new HttpMatchedTradeCompletionLoadGenerator.DurableWorkDebt(0, 0, 0, 0))),
+                false);
+
+        assertThat(debt.converged()).isFalse();
+    }
+
+    @Test
+    void durableDebtContract_acceptsOnlyFreshExactVersionedServiceSnapshot() {
+        ObjectNode valid = validOrderDebt();
+
+        assertThat(HttpMatchedTradeCompletionLoadGenerator
+                .parseServiceDebt(valid, "eap-order").healthy()).isTrue();
+
+        for (ObjectNode invalid : List.of(
+                mutate(valid, node -> node.put("contractVersion", 2)),
+                mutate(valid, node -> node.put("contractVersion", "1")),
+                mutate(valid, node -> node.put("service", "eap-wallet")),
+                mutate(valid, node -> node.put("observationSuccess", false)),
+                mutate(valid, node -> node.put("observationSuccess", "true")),
+                mutate(valid, node -> node.put("snapshotAgeSeconds", 16)),
+                mutate(valid, node -> node.put("snapshotAgeSeconds", "0")),
+                mutate(valid, node -> node.remove("observedAt")),
+                mutate(valid, node -> node.put("observedAt", "not-an-instant")),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).remove(0)),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).add(component("unknown", 0, 0, 0, 0))),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).add(component(
+                        "event_outbox", 0, 0, 0, 0))),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).set(
+                        0, component("asset_reservation_result_inbox", -1, 0, 0, 0))),
+                mutate(valid, node -> ((ObjectNode) node.withArray("components").get(0))
+                        .put("totalCount", "0")),
+                mutate(valid, node -> ((ObjectNode) node.withArray("components").get(0))
+                        .put("oldestUnresolvedAgeSeconds", 0.5)),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).set(
+                        0, component("asset_reservation_result_inbox", 1, 2, 0, 1))),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).set(
+                        0, component("asset_reservation_result_inbox", 1, 0, 2, 1))),
+                mutate(valid, node -> ((ArrayNode) node.get("components")).set(
+                        0, component("asset_reservation_result_inbox", 0, 0, 0, 1))))) {
+            assertThat(HttpMatchedTradeCompletionLoadGenerator
+                    .parseServiceDebt(invalid, "eap-order").healthy()).isFalse();
+        }
+    }
+
+    @Test
+    void durableDebtSample_roundTripsEveryFixedWorkForExternalMonitor() throws Exception {
+        var expected = durableSnapshot(3, 1, 0, 7);
+
+        String encoded = HttpMatchedTradeCompletionLoadGenerator.encodeDurableDebtSample(expected);
+
+        assertThat(HttpMatchedTradeCompletionLoadGenerator.decodeDurableDebtSample(encoded))
+                .isEqualTo(expected);
+        assertThatThrownBy(() -> HttpMatchedTradeCompletionLoadGenerator
+                .decodeDurableDebtSample("not-base64!"))
+                .isInstanceOf(java.io.IOException.class);
+    }
+
+    @Test
+    void durableDebtWindow_rejectsCleanupThatAccumulatesDuringTrafficThenCouldDrainLater() {
+        var samples = List.of(
+                sample(0, durableSnapshot(0, 0, 0, 0)),
+                sample(30, durableSnapshot(150, 20, 0, 15)),
+                sample(60, durableSnapshot(301, 40, 1, 31)));
+
+        var window = HttpMatchedTradeCompletionLoadGenerator.summarizeDurableDebt(samples);
+        var reasons = HttpMatchedTradeCompletionLoadGenerator.durableDebtInvalidReasons(
+                "steady", window, 60, 100, 1.0, 200, 30);
+
+        assertThat(reasons).containsExactly(
+                "steady_match_engine_reservation_cleanup_backlog_growing",
+                "steady_match_engine_reservation_cleanup_backlog_above_limit",
+                "steady_match_engine_reservation_cleanup_oldest_age_above_limit",
+                "steady_match_engine_reservation_cleanup_terminal_debt");
+    }
+
+    private ObjectNode validOrderDebt() {
+        ObjectNode root = objectMapper.createObjectNode();
+        root.put("contractVersion", 1);
+        root.put("service", "eap-order");
+        root.put("observedAt", "2026-09-15T00:00:00Z");
+        root.put("observationSuccess", true);
+        root.put("snapshotAgeSeconds", 0);
+        ArrayNode components = root.putArray("components");
+        components.add(component("asset_reservation_result_inbox", 0, 0, 0, 0));
+        components.add(component("trade_execution_inbox", 0, 0, 0, 0));
+        components.add(component("cancellation_result_inbox", 0, 0, 0, 0));
+        components.add(component("asset_reservation_released_inbox", 0, 0, 0, 0));
+        components.add(component("event_outbox", 0, 0, 0, 0));
+        components.add(component("orders_current_projection", 0, 0, 0, 0));
+        return root;
+    }
+
+    private static HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot durableSnapshot(
+            long cleanupTotal, long cleanupRetry, long cleanupTerminal, long cleanupAge) {
+        var zero = new HttpMatchedTradeCompletionLoadGenerator.DurableWorkDebt(0, 0, 0, 0);
+        return new HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot(
+                Map.of(
+                        "eap-order", Map.of(
+                                "asset_reservation_result_inbox", zero,
+                                "trade_execution_inbox", zero,
+                                "cancellation_result_inbox", zero,
+                                "asset_reservation_released_inbox", zero,
+                                "event_outbox", zero,
+                                "orders_current_projection", zero),
+                        "eap-wallet", Map.of(
+                                "order_submission_inbox", zero,
+                                "cancellation_result_inbox", zero,
+                                "trade_execution_inbox", zero,
+                                "event_outbox", zero),
+                        "eap-matchEngine", Map.of(
+                                "order_admission_inbox", zero,
+                                "trade_outbox", zero,
+                                "reservation_cleanup", new HttpMatchedTradeCompletionLoadGenerator.DurableWorkDebt(
+                                        cleanupTotal, cleanupRetry, cleanupTerminal, cleanupAge),
+                                "order_cancellation", zero,
+                                "reservation_reconciliation", zero)),
+                true);
+    }
+
+    private ObjectNode component(String work, long total, long retry, long terminal, long age) {
+        ObjectNode component = objectMapper.createObjectNode();
+        component.put("work", work);
+        component.put("totalCount", total);
+        component.put("retryCount", retry);
+        component.put("terminalCount", terminal);
+        component.put("oldestUnresolvedAgeSeconds", age);
+        return component;
+    }
+
+    private ObjectNode mutate(ObjectNode source, java.util.function.Consumer<ObjectNode> mutation) {
+        ObjectNode copy = source.deepCopy();
+        mutation.accept(copy);
+        return copy;
+    }
+
     private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
             double elapsedSeconds,
             long queueBacklog,
             long queueReadFailures) {
         return sample(elapsedSeconds, queueBacklog, queueReadFailures, 0);
+    }
+
+    private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
+            double elapsedSeconds,
+            HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot durableDebt) {
+        var empty = HttpMatchedTradeCompletionLoadGenerator.InboxDebtSnapshot.empty();
+        return new HttpMatchedTradeCompletionLoadGenerator.SteadySample(
+                elapsedSeconds, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, empty, empty, empty, durableDebt);
     }
 
     private static HttpMatchedTradeCompletionLoadGenerator.SteadySample sample(
@@ -198,6 +366,7 @@ class HttpMatchedTradeCompletionLoadGeneratorTest {
         return new HttpMatchedTradeCompletionLoadGenerator.SteadySample(
                 elapsedSeconds, 0, 0, 0, 0, 0, 0,
                 queueBacklog, queueReadFailures, orderReservationInboxBacklog,
-                empty, walletInboxDebt, empty);
+                empty, walletInboxDebt, empty,
+                new HttpMatchedTradeCompletionLoadGenerator.DurableDebtSnapshot(Map.of(), false));
     }
 }

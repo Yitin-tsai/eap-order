@@ -63,7 +63,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
 
     private static final int PRICE = 100;
     private static final int AMOUNT = 1;
-    private static final int BENCHMARK_SCHEMA_VERSION = 3;
+    private static final int BENCHMARK_SCHEMA_VERSION = 4;
     private static final int MAX_STEADY_SCHEDULING_OVERRUN_SECONDS = 30;
     private static final String HTTP_MARKET_ID = "ENERGY-SPOT";
     private static final String EXTERNAL_MONITOR_HEADER =
@@ -71,7 +71,24 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     + "queue_backlog,queue_read_failures,order_reservation_inbox_backlog,"
                     + "order_inbox_backlog,order_inbox_oldest_age_seconds,order_inbox_terminal_debt,"
                     + "wallet_inbox_backlog,wallet_inbox_oldest_age_seconds,wallet_inbox_terminal_debt,"
-                    + "match_inbox_backlog,match_inbox_oldest_age_seconds,match_inbox_terminal_debt";
+                    + "match_inbox_backlog,match_inbox_oldest_age_seconds,match_inbox_terminal_debt,"
+                    + "durable_debt_snapshot_v1_base64";
+    private static final List<DurableWorkKey> DURABLE_WORK_KEYS = List.of(
+            new DurableWorkKey("eap-order", "asset_reservation_result_inbox"),
+            new DurableWorkKey("eap-order", "trade_execution_inbox"),
+            new DurableWorkKey("eap-order", "cancellation_result_inbox"),
+            new DurableWorkKey("eap-order", "asset_reservation_released_inbox"),
+            new DurableWorkKey("eap-order", "event_outbox"),
+            new DurableWorkKey("eap-order", "orders_current_projection"),
+            new DurableWorkKey("eap-wallet", "order_submission_inbox"),
+            new DurableWorkKey("eap-wallet", "cancellation_result_inbox"),
+            new DurableWorkKey("eap-wallet", "trade_execution_inbox"),
+            new DurableWorkKey("eap-wallet", "event_outbox"),
+            new DurableWorkKey("eap-matchEngine", "order_admission_inbox"),
+            new DurableWorkKey("eap-matchEngine", "trade_outbox"),
+            new DurableWorkKey("eap-matchEngine", "reservation_cleanup"),
+            new DurableWorkKey("eap-matchEngine", "order_cancellation"),
+            new DurableWorkKey("eap-matchEngine", "reservation_reconciliation"));
     private static final List<String> CHAIN_QUEUES = List.of(
             WALLET_ORDER_SUBMITTED_QUEUE,
             ORDER_ASSET_RESERVATION_SUCCEEDED_QUEUE,
@@ -379,6 +396,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             QueueSnapshot queues = readQueues(config, httpClient, objectMapper);
             queueReadFailures += queues.readFailures();
             maxQueueBacklog = Math.max(maxQueueBacklog, queues.backlog());
+            DurableDebtSnapshot durableDebt = readDurableDebtSnapshot(
+                    config, httpClient, objectMapper);
 
             RoleBalances buyerBalances = RoleBalances.empty();
             RoleBalances sellerBalances = RoleBalances.empty();
@@ -416,6 +435,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     && buyBook == 0
                     && sellBook == 0
                     && activeReservations == 0
+                    && durableDebt.converged()
                     && consecutiveDrainedSamples >= 3;
             double completionElapsedSeconds = elapsedSince(buyStartedAtNanos);
             double postCompletionVerificationSeconds = 0;
@@ -441,6 +461,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     sellBook,
                     activeReservations,
                     tradeIds,
+                    durableDebt,
                     queues.backlog(),
                     queueReadFailures,
                     maxQueueBacklog,
@@ -554,6 +575,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         if (completion.queueReadFailures() != 0) {
             reasons.add("queue_metrics_read_failures");
         }
+        if (!completion.durableDebt().converged()) {
+            reasons.add("final_durable_debt_or_observation_failure");
+        }
         return reasons;
     }
 
@@ -629,6 +653,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         System.out.printf("  \"walletTradeIdCount\": %d,%n", completion.tradeIds().walletCount());
         System.out.printf("  \"tradeIdUnionCount\": %d,%n", completion.tradeIds().unionCount());
         System.out.printf("  \"tradeIdFingerprint\": \"%s\",%n", completion.tradeIds().fingerprint());
+        System.out.printf("  \"assetReconciliationPassed\": %s,%n",
+                balancesSettled(
+                        config,
+                        initialBuyerBalances,
+                        initialSellerBalances,
+                        completion.buyerBalances(),
+                        completion.sellerBalances()));
         printBalances("initialBuyer", initialBuyerBalances);
         printBalances("initialSeller", initialSellerBalances);
         printBalances("finalBuyer", completion.buyerBalances());
@@ -636,7 +667,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         System.out.printf("  \"remainingBuyOrders\": %d,%n", completion.buyBook());
         System.out.printf("  \"remainingSellOrders\": %d,%n", completion.sellBook());
         System.out.printf("  \"activeMatchReservations\": %d,%n", completion.activeReservations());
+        printDurableDebtFields(completion.durableDebt(), new ObjectMapper());
         System.out.printf("  \"finalQueueBacklog\": %d,%n", completion.finalQueueBacklog());
+        QueueDepth deadLetters = completion.finalQueueDepths().get(DEAD_LETTER_QUEUE);
+        long finalDlqBacklog = deadLetters == null
+                ? -1
+                : deadLetters.ready() + deadLetters.unacked();
+        System.out.printf("  \"finalDlqBacklog\": %d,%n", finalDlqBacklog);
         System.out.printf("  \"maxQueueBacklog\": %d,%n", completion.maxQueueBacklog());
         System.out.printf("  \"queueMetricsReadFailures\": %d,%n", completion.queueReadFailures());
         printQueueDepths(completion.finalQueueDepths());
@@ -1151,6 +1188,319 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             HttpClient httpClient,
             ObjectMapper objectMapper) {
         return rabbitManagementClient(config, httpClient, objectMapper).readQueues(CHAIN_QUEUES);
+    }
+
+    private static DurableDebtSnapshot readDurableDebtSnapshot(
+            Config config,
+            HttpClient httpClient,
+            ObjectMapper objectMapper) {
+        return readDurableDebtSnapshot(
+                config.orderUrl(),
+                config.walletUrl(),
+                config.matchUrl(),
+                httpClient,
+                objectMapper);
+    }
+
+    static DurableDebtSnapshot readDurableDebtSnapshot(
+            String orderUrl,
+            String walletUrl,
+            String matchUrl,
+            HttpClient httpClient,
+            ObjectMapper objectMapper) {
+        List<ServiceDebtSnapshot> services = List.of(
+                readServiceDebt(
+                        orderUrl + "/actuator/durableDebt",
+                        "eap-order",
+                        httpClient,
+                        objectMapper),
+                readServiceDebt(
+                        walletUrl + "/actuator/durableDebt",
+                        "eap-wallet",
+                        httpClient,
+                        objectMapper),
+                readServiceDebt(
+                        matchUrl + "/actuator/durableDebt",
+                        "eap-matchEngine",
+                        httpClient,
+                        objectMapper));
+        Map<String, Map<String, DurableWorkDebt>> workByService = new LinkedHashMap<>();
+        for (ServiceDebtSnapshot service : services) {
+            workByService.put(service.service(), service.work());
+        }
+        return new DurableDebtSnapshot(
+                Map.copyOf(workByService),
+                services.stream().allMatch(ServiceDebtSnapshot::healthy));
+    }
+
+    private static ServiceDebtSnapshot readServiceDebt(
+            String url,
+            String expectedService,
+            HttpClient httpClient,
+            ObjectMapper objectMapper) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(3))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = httpClient.send(
+                    request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                return ServiceDebtSnapshot.unavailable(expectedService);
+            }
+            return parseServiceDebt(objectMapper.readTree(response.body()), expectedService);
+        } catch (Exception failure) {
+            return ServiceDebtSnapshot.unavailable(expectedService);
+        }
+    }
+
+    static ServiceDebtSnapshot parseServiceDebt(JsonNode root, String expectedService) {
+        if (root == null || !root.isObject()) {
+            return ServiceDebtSnapshot.unavailable(expectedService);
+        }
+        JsonNode contractVersionNode = root.get("contractVersion");
+        int contractVersion = contractVersionNode != null
+                && contractVersionNode.isIntegralNumber()
+                && contractVersionNode.canConvertToInt()
+                ? contractVersionNode.intValue() : -1;
+        JsonNode serviceNode = root.get("service");
+        String service = serviceNode != null && serviceNode.isTextual()
+                ? serviceNode.textValue() : "";
+        JsonNode observationSuccessNode = root.get("observationSuccess");
+        boolean observationSuccess = observationSuccessNode != null
+                && observationSuccessNode.isBoolean()
+                && observationSuccessNode.booleanValue();
+        long snapshotAgeSeconds = strictNonNegativeLong(root, "snapshotAgeSeconds");
+        boolean observedAtValid = isValidInstant(root.get("observedAt"));
+        Map<String, DurableWorkDebt> work = new LinkedHashMap<>();
+        if (!root.path("components").isArray()) {
+            return ServiceDebtSnapshot.unavailable(expectedService);
+        }
+        for (JsonNode component : root.path("components")) {
+            JsonNode workNode = component.get("work");
+            String name = workNode != null && workNode.isTextual()
+                    ? workNode.textValue() : "";
+            DurableWorkDebt debt = new DurableWorkDebt(
+                    strictNonNegativeLong(component, "totalCount"),
+                    strictNonNegativeLong(component, "retryCount"),
+                    strictNonNegativeLong(component, "terminalCount"),
+                    strictNonNegativeLong(component, "oldestUnresolvedAgeSeconds"));
+            if (name.isBlank() || !debt.valid() || work.put(name, debt) != null) {
+                return ServiceDebtSnapshot.unavailable(expectedService);
+            }
+        }
+        boolean healthy = contractVersion == 1
+                && expectedService.equals(service)
+                && observationSuccess
+                && observedAtValid
+                && snapshotAgeSeconds >= 0
+                && snapshotAgeSeconds <= 15
+                && work.keySet().equals(expectedDebtWork(expectedService));
+        return new ServiceDebtSnapshot(expectedService, Map.copyOf(work), healthy);
+    }
+
+    private static long strictNonNegativeLong(JsonNode parent, String field) {
+        JsonNode value = parent == null ? null : parent.get(field);
+        return value != null && value.isIntegralNumber() && value.canConvertToLong()
+                ? value.longValue() : -1;
+    }
+
+    private static boolean isValidInstant(JsonNode value) {
+        if (value == null || !value.isTextual()) {
+            return false;
+        }
+        try {
+            Instant.parse(value.textValue());
+            return true;
+        } catch (RuntimeException invalidTimestamp) {
+            return false;
+        }
+    }
+
+    static String encodeDurableDebtSample(DurableDebtSnapshot snapshot) {
+        StringJoiner encoded = new StringJoiner(";");
+        encoded.add("1");
+        encoded.add(snapshot.observationsHealthy() ? "1" : "0");
+        for (DurableWorkKey key : DURABLE_WORK_KEYS) {
+            DurableWorkDebt debt = snapshot.component(key.service(), key.work());
+            encoded.add(debt.totalCount() + ":" + debt.retryCount() + ":"
+                    + debt.terminalCount() + ":" + debt.oldestUnresolvedAgeSeconds());
+        }
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                encoded.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    static DurableDebtSnapshot decodeDurableDebtSample(String encoded) throws IOException {
+        final String payload;
+        try {
+            payload = new String(Base64.getUrlDecoder().decode(encoded), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException invalidBase64) {
+            throw new IOException("invalid durable-debt sample encoding", invalidBase64);
+        }
+        String[] tokens = payload.split(";", -1);
+        if (tokens.length != DURABLE_WORK_KEYS.size() + 2 || !"1".equals(tokens[0])
+                || !("0".equals(tokens[1]) || "1".equals(tokens[1]))) {
+            throw new IOException("invalid durable-debt sample contract");
+        }
+        boolean observationsHealthy = "1".equals(tokens[1]);
+        Map<String, Map<String, DurableWorkDebt>> mutable = new LinkedHashMap<>();
+        for (int i = 0; i < DURABLE_WORK_KEYS.size(); i++) {
+            DurableWorkKey key = DURABLE_WORK_KEYS.get(i);
+            String[] values = tokens[i + 2].split(":", -1);
+            if (values.length != 4) {
+                throw new IOException("invalid durable-debt component sample");
+            }
+            final DurableWorkDebt debt;
+            try {
+                debt = new DurableWorkDebt(
+                        Long.parseLong(values[0]),
+                        Long.parseLong(values[1]),
+                        Long.parseLong(values[2]),
+                        Long.parseLong(values[3]));
+            } catch (NumberFormatException invalidNumber) {
+                throw new IOException("invalid durable-debt component number", invalidNumber);
+            }
+            if (!debt.valid()) {
+                if (observationsHealthy) {
+                    throw new IOException("healthy durable-debt sample contains invalid component");
+                }
+                return DurableDebtSnapshot.empty();
+            }
+            mutable.computeIfAbsent(key.service(), ignored -> new LinkedHashMap<>())
+                    .put(key.work(), debt);
+        }
+        Map<String, Map<String, DurableWorkDebt>> immutable = new LinkedHashMap<>();
+        mutable.forEach((service, work) -> immutable.put(service, Map.copyOf(work)));
+        return new DurableDebtSnapshot(Map.copyOf(immutable), observationsHealthy);
+    }
+
+    private static Set<String> expectedDebtWork(String service) {
+        return switch (service) {
+            case "eap-order" -> Set.of(
+                    "asset_reservation_result_inbox",
+                    "trade_execution_inbox",
+                    "cancellation_result_inbox",
+                    "asset_reservation_released_inbox",
+                    "event_outbox",
+                    "orders_current_projection");
+            case "eap-wallet" -> Set.of(
+                    "order_submission_inbox",
+                    "cancellation_result_inbox",
+                    "trade_execution_inbox",
+                    "event_outbox");
+            case "eap-matchEngine" -> Set.of(
+                    "order_admission_inbox",
+                    "trade_outbox",
+                    "reservation_cleanup",
+                    "order_cancellation",
+                    "reservation_reconciliation");
+            default -> Set.of();
+        };
+    }
+
+    static DurableDebtWindow summarizeDurableDebt(List<SteadySample> samples) {
+        if (samples.isEmpty() || samples.stream()
+                .anyMatch(sample -> !sample.durableDebt().observationsHealthy())) {
+            return DurableDebtWindow.unavailable();
+        }
+        Map<String, Map<String, DurableWorkDebtWindow>> mutable = new LinkedHashMap<>();
+        for (DurableWorkKey key : DURABLE_WORK_KEYS) {
+            BacklogWindow total = summarizeBacklog(
+                    samples,
+                    sample -> sample.durableDebt().component(key.service(), key.work()).totalCount());
+            long maxRetry = samples.stream()
+                    .map(SteadySample::durableDebt)
+                    .mapToLong(snapshot -> snapshot.component(key.service(), key.work()).retryCount())
+                    .max().orElse(0);
+            long maxTerminal = samples.stream()
+                    .map(SteadySample::durableDebt)
+                    .mapToLong(snapshot -> snapshot.component(key.service(), key.work()).terminalCount())
+                    .max().orElse(0);
+            long maxOldestAge = samples.stream()
+                    .map(SteadySample::durableDebt)
+                    .mapToLong(snapshot -> snapshot.component(
+                            key.service(), key.work()).oldestUnresolvedAgeSeconds())
+                    .max().orElse(0);
+            mutable.computeIfAbsent(key.service(), ignored -> new LinkedHashMap<>())
+                    .put(key.work(), new DurableWorkDebtWindow(
+                            total, maxRetry, maxTerminal, maxOldestAge));
+        }
+        Map<String, Map<String, DurableWorkDebtWindow>> immutable = new LinkedHashMap<>();
+        mutable.forEach((service, work) -> immutable.put(service, Map.copyOf(work)));
+        return new DurableDebtWindow(Map.copyOf(immutable), true);
+    }
+
+    static List<String> durableDebtInvalidReasons(
+            String phase,
+            DurableDebtWindow window,
+            double observedSeconds,
+            int targetOrderTps,
+            double maxBacklogGrowthPerSecond,
+            long maxSteadyBacklog,
+            long maxOldestAgeSeconds) {
+        if (!window.observationsHealthy()) {
+            return List.of(phase + "_durable_debt_observation_unhealthy");
+        }
+        List<String> reasons = new ArrayList<>();
+        for (DurableWorkKey key : DURABLE_WORK_KEYS) {
+            DurableWorkDebtWindow debt = window.component(key.service(), key.work());
+            String component = reasonToken(key.service()) + "_" + reasonToken(key.work());
+            if (exceedsMeaningfulBacklogGrowth(
+                    debt.totalCount().slopePerSecond(),
+                    debt.totalCount().start(),
+                    debt.totalCount().end(),
+                    observedSeconds,
+                    targetOrderTps,
+                    maxBacklogGrowthPerSecond)) {
+                reasons.add(phase + "_" + component + "_backlog_growing");
+            }
+            if (debt.totalCount().max() > maxSteadyBacklog) {
+                reasons.add(phase + "_" + component + "_backlog_above_limit");
+            }
+            if (debt.maxOldestUnresolvedAgeSeconds() > maxOldestAgeSeconds) {
+                reasons.add(phase + "_" + component + "_oldest_age_above_limit");
+            }
+            if (debt.maxTerminalCount() > 0) {
+                reasons.add(phase + "_" + component + "_terminal_debt");
+            }
+        }
+        return List.copyOf(reasons);
+    }
+
+    private static String reasonToken(String value) {
+        return value.replace("eap-", "")
+                .replaceAll("([a-z])([A-Z])", "$1_$2")
+                .replaceAll("[^A-Za-z0-9]+", "_")
+                .toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static void printDurableDebtFields(
+            DurableDebtSnapshot debt,
+            ObjectMapper objectMapper) {
+        System.out.printf("  \"finalOrderOutboxActiveDebt\": %d,%n", debt.orderOutboxActive());
+        System.out.printf("  \"finalOrderOutboxTerminalDebt\": %d,%n", debt.orderOutboxTerminal());
+        System.out.printf("  \"finalWalletOutboxActiveDebt\": %d,%n", debt.walletOutboxActive());
+        System.out.printf("  \"finalWalletOutboxTerminalDebt\": %d,%n", debt.walletOutboxTerminal());
+        System.out.printf("  \"finalMatchOutboxActiveDebt\": %d,%n", debt.matchOutboxActive());
+        System.out.printf("  \"finalMatchOutboxTerminalDebt\": %d,%n", debt.matchOutboxTerminal());
+        System.out.printf("  \"finalMatchCleanupActiveDebt\": %d,%n", debt.matchCleanupActive());
+        System.out.printf("  \"finalMatchCleanupTerminalDebt\": %d,%n", debt.matchCleanupTerminal());
+        System.out.printf("  \"finalDurableDebtObservationsHealthy\": %s,%n",
+                debt.observationsHealthy());
+        try {
+            System.out.printf("  \"finalDurableDebtComponents\": %s,%n",
+                    objectMapper.writeValueAsString(debt.workByService()));
+        } catch (IOException failure) {
+            throw new IllegalStateException("Could not serialize final durable-debt snapshot", failure);
+        }
+    }
+
+    private static String jsonValue(Object value, ObjectMapper objectMapper, String description) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (IOException failure) {
+            throw new IllegalStateException("Could not serialize " + description, failure);
+        }
     }
 
     private static void purgeQueues(Config config, HttpClient httpClient) throws Exception {
@@ -1873,14 +2223,23 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     "SELECT count(*) FROM wallet_service.trade_settlements",
                     common.marketId()), baseline.walletTrades(), "wallet trades");
             QueueSnapshot queues = readQueues(config.common(), httpClient, objectMapper);
-            long orderReservationInboxBacklog = queryLong(
-                    databases.order(),
-                    "SELECT count(*) FROM order_service.order_asset_reservation_result_inbox "
-                            + "WHERE status IN ('PENDING', 'FAILED_RETRYABLE', 'IN_PROGRESS')");
-            InboxDebtSnapshot orderInboxDebt = orderInboxDebtSnapshot(databases.order());
-            InboxDebtSnapshot walletInboxDebt = walletInboxDebtSnapshot(databases.wallet());
-            InboxDebtSnapshot matchInboxDebt = matchInboxDebtSnapshot(
-                    databases.match(), common.marketId());
+            DurableDebtSnapshot durableDebt = durableDebtSnapshot();
+            InboxDebtSnapshot orderInboxDebt = durableDebt.inboxSummary(
+                    "eap-order", List.of(
+                            "asset_reservation_result_inbox",
+                            "trade_execution_inbox",
+                            "cancellation_result_inbox",
+                            "asset_reservation_released_inbox"));
+            InboxDebtSnapshot walletInboxDebt = durableDebt.inboxSummary(
+                    "eap-wallet", List.of(
+                            "order_submission_inbox",
+                            "cancellation_result_inbox",
+                            "trade_execution_inbox"));
+            InboxDebtSnapshot matchInboxDebt = durableDebt.inboxSummary(
+                    "eap-matchEngine", List.of("order_admission_inbox"));
+            long orderReservationInboxBacklog = durableDebt.component(
+                            "eap-order", "asset_reservation_result_inbox")
+                    .activeCount();
             return new SteadySample(
                     elapsedSince(startedAtNanos),
                     counters.accepted(),
@@ -1894,90 +2253,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     orderReservationInboxBacklog,
                     orderInboxDebt,
                     walletInboxDebt,
-                    matchInboxDebt);
-        }
-
-        private InboxDebtSnapshot orderInboxDebtSnapshot(Connection order) throws Exception {
-            return queryInboxDebt(order, """
-                    SELECT
-                        count(*) FILTER (
-                            WHERE status NOT IN ('APPLIED', 'FAILED_PERMANENT')) AS active_backlog,
-                        COALESCE(MAX(CASE WHEN status != 'APPLIED'
-                            THEN GREATEST(0,
-                                FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at)))::bigint)
-                            ELSE 0 END), 0) AS oldest_unresolved_age_seconds,
-                        count(*) FILTER (
-                            WHERE status = 'FAILED_PERMANENT'
-                               OR conflict_detected_at IS NOT NULL) AS terminal_debt
-                    FROM (
-                        SELECT status, received_at, conflict_detected_at
-                        FROM order_service.order_asset_reservation_result_inbox
-                        UNION ALL
-                        SELECT status, received_at, NULL::timestamp AS conflict_detected_at
-                        FROM order_service.order_trade_execution_inbox
-                        UNION ALL
-                        SELECT status, received_at, NULL::timestamp AS conflict_detected_at
-                        FROM order_service.order_cancellation_result_inbox
-                        UNION ALL
-                        SELECT status, received_at, conflict_detected_at
-                        FROM order_service.order_asset_reservation_released_inbox
-                    ) inbox
-                    """);
-        }
-
-        private InboxDebtSnapshot walletInboxDebtSnapshot(Connection wallet) throws Exception {
-            return queryInboxDebt(wallet, """
-                    SELECT
-                        count(*) FILTER (
-                            WHERE status NOT IN ('APPLIED', 'FAILED_PERMANENT')) AS active_backlog,
-                        COALESCE(MAX(CASE WHEN status != 'APPLIED'
-                            THEN GREATEST(0,
-                                FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at)))::bigint)
-                            ELSE 0 END), 0) AS oldest_unresolved_age_seconds,
-                        count(*) FILTER (
-                            WHERE status = 'FAILED_PERMANENT'
-                               OR conflict_detected_at IS NOT NULL) AS terminal_debt
-                    FROM wallet_service.message_inbox
-                    """);
-        }
-
-        private InboxDebtSnapshot matchInboxDebtSnapshot(
-                Connection match,
-                String marketId) throws Exception {
-            return queryInboxDebt(match, """
-                    SELECT
-                        count(*) FILTER (
-                            WHERE status NOT IN ('APPLIED', 'FAILED_PERMANENT')) AS active_backlog,
-                        COALESCE(MAX(CASE WHEN status != 'APPLIED'
-                            THEN GREATEST(0,
-                                FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - received_at)))::bigint)
-                            ELSE 0 END), 0) AS oldest_unresolved_age_seconds,
-                        count(*) FILTER (
-                            WHERE status = 'FAILED_PERMANENT'
-                               OR conflict_detected_at IS NOT NULL) AS terminal_debt
-                    FROM match_engine.order_admission_inbox
-                    WHERE market_id = ?
-                    """, marketId);
-        }
-
-        private InboxDebtSnapshot queryInboxDebt(
-                Connection connection,
-                String sql,
-                Object... values) throws Exception {
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                for (int i = 0; i < values.length; i++) {
-                    statement.setObject(i + 1, values[i]);
-                }
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    if (!resultSet.next()) {
-                        return InboxDebtSnapshot.empty();
-                    }
-                    return new InboxDebtSnapshot(
-                            resultSet.getLong("active_backlog"),
-                            resultSet.getLong("oldest_unresolved_age_seconds"),
-                            resultSet.getLong("terminal_debt"));
-                }
-            }
+                    matchInboxDebt,
+                    durableDebt);
         }
 
         private SteadyWindow deriveSteadyWindow(List<SteadySample> samples) {
@@ -2020,6 +2297,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     windowSamples, SteadySample::walletInboxDebt);
             InboxDebtWindow matchInboxDebt = summarizeInboxDebt(
                     windowSamples, SteadySample::matchInboxDebt);
+            DurableDebtWindow durableDebt = summarizeDurableDebt(windowSamples);
             long queueReadFailures = windowSamples.stream().mapToLong(SteadySample::queueReadFailures).sum();
             return new SteadyWindow(
                     first.elapsedSeconds(),
@@ -2043,6 +2321,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     orderInboxDebt,
                     walletInboxDebt,
                     matchInboxDebt,
+                    durableDebt,
                     queueReadFailures,
                     windowSamples.size());
         }
@@ -2144,11 +2423,20 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         databases.order(), common.marketId());
                 MatchAdmissionInboxSnapshot matchInbox =
                         matchAdmissionInboxSnapshot(databases.match(), common.marketId());
-                InboxDebtSnapshot orderInboxDebt = orderInboxDebtSnapshot(databases.order());
-                InboxDebtSnapshot walletInboxDebt = walletInboxDebtSnapshot(databases.wallet());
-                InboxDebtSnapshot matchInboxDebt = matchInboxDebtSnapshot(
-                        databases.match(), common.marketId());
-                DurableDebtSnapshot durableDebt = durableDebtSnapshot(databases);
+                DurableDebtSnapshot durableDebt = durableDebtSnapshot();
+                InboxDebtSnapshot orderInboxDebt = durableDebt.inboxSummary(
+                        "eap-order", List.of(
+                                "asset_reservation_result_inbox",
+                                "trade_execution_inbox",
+                                "cancellation_result_inbox",
+                                "asset_reservation_released_inbox"));
+                InboxDebtSnapshot walletInboxDebt = durableDebt.inboxSummary(
+                        "eap-wallet", List.of(
+                                "order_submission_inbox",
+                                "cancellation_result_inbox",
+                                "trade_execution_inbox"));
+                InboxDebtSnapshot matchInboxDebt = durableDebt.inboxSummary(
+                        "eap-matchEngine", List.of("order_admission_inbox"));
                 long matchedOrders = runDelta(queryLong(
                         databases.order(),
                         """
@@ -2269,39 +2557,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             return latest;
         }
 
-        private DurableDebtSnapshot durableDebtSnapshot(DatabaseHandles databases)
-                throws Exception {
-            return new DurableDebtSnapshot(
-                    queryLong(
-                            databases.order(),
-                            "SELECT count(*) FROM order_service.order_event_outbox "
-                                    + "WHERE status NOT IN ('SENT', 'FAILED')"),
-                    queryLong(
-                            databases.order(),
-                            "SELECT count(*) FROM order_service.order_event_outbox "
-                                    + "WHERE status = 'FAILED'"),
-                    queryLong(
-                            databases.wallet(),
-                            "SELECT count(*) FROM wallet_service.outbox "
-                                    + "WHERE status NOT IN ('SENT', 'FAILED')"),
-                    queryLong(
-                            databases.wallet(),
-                            "SELECT count(*) FROM wallet_service.outbox WHERE status = 'FAILED'"),
-                    queryLong(
-                            databases.match(),
-                            "SELECT count(*) FROM match_engine.trade_outbox "
-                                    + "WHERE status NOT IN ('SENT', 'FAILED')"),
-                    queryLong(
-                            databases.match(),
-                            "SELECT count(*) FROM match_engine.trade_outbox WHERE status = 'FAILED'"),
-                    queryLong(
-                            databases.match(),
-                            "SELECT count(*) FROM match_engine.reservation_cleanup_tasks "
-                                    + "WHERE status NOT IN ('COMPLETED', 'FAILED')"),
-                    queryLong(
-                            databases.match(),
-                            "SELECT count(*) FROM match_engine.reservation_cleanup_tasks "
-                                    + "WHERE status = 'FAILED'"));
+        private DurableDebtSnapshot durableDebtSnapshot() {
+            return readDurableDebtSnapshot(config.common(), httpClient, objectMapper);
         }
 
         private OrderProjectionSnapshot orderProjectionSnapshot(
@@ -2563,6 +2820,10 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     "match", window.matchInboxDebt(), window.observedSeconds(),
                     config.targetOrderTps(), config.maxBacklogGrowthPerSecond(),
                     config.maxSteadyBacklog(), config.maxInboxOldestAgeSeconds()));
+            reasons.addAll(durableDebtInvalidReasons(
+                    "steady", window.durableDebt(), window.observedSeconds(),
+                    config.targetOrderTps(), config.maxBacklogGrowthPerSecond(),
+                    config.maxSteadyBacklog(), config.maxInboxOldestAgeSeconds()));
             if (window.queueReadFailures() != 0) {
                 reasons.add("steady_queue_metrics_read_failures");
             }
@@ -2597,7 +2858,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 reasons.add("final_match_inbox_debt");
             }
             if (!completion.durableDebt().converged()) {
-                reasons.add("final_outbox_or_cleanup_debt");
+                reasons.add("final_durable_debt_or_observation_failure");
             }
             if (completion.matchTrades() != expectedOutcome.pairableTrades()
                     || completion.orderTrades() != expectedOutcome.pairableTrades()
@@ -2645,12 +2906,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         + "order_reservation_inbox_backlog,"
                         + "order_inbox_backlog,order_inbox_oldest_age_seconds,order_inbox_terminal_debt,"
                         + "wallet_inbox_backlog,wallet_inbox_oldest_age_seconds,wallet_inbox_terminal_debt,"
-                        + "match_inbox_backlog,match_inbox_oldest_age_seconds,match_inbox_terminal_debt\n");
+                        + "match_inbox_backlog,match_inbox_oldest_age_seconds,match_inbox_terminal_debt,"
+                        + "durable_debt_snapshot_v1_base64\n");
                 synchronized (samples) {
                     for (SteadySample sample : samples) {
                         writer.write(String.format(
                                 java.util.Locale.ROOT,
-                                "%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                                "%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s%n",
                                 sample.elapsedSeconds(),
                                 sample.httpAccepted(),
                                 sample.httpFailures(),
@@ -2669,7 +2931,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                                 sample.walletInboxDebt().terminalDebt(),
                                 sample.matchInboxDebt().activeBacklog(),
                                 sample.matchInboxDebt().oldestUnresolvedAgeSeconds(),
-                                sample.matchInboxDebt().terminalDebt()));
+                                sample.matchInboxDebt().terminalDebt(),
+                                encodeDurableDebtSample(sample.durableDebt())));
                     }
                 }
             }
@@ -2764,6 +3027,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             printInboxDebtWindow("Order", window.orderInboxDebt());
             printInboxDebtWindow("Wallet", window.walletInboxDebt());
             printInboxDebtWindow("Match", window.matchInboxDebt());
+            System.out.printf("  \"steadyDurableDebtObservationsHealthy\": %s,%n",
+                    window.durableDebt().observationsHealthy());
+            System.out.printf("  \"steadyDurableDebtComponents\": %s,%n",
+                    jsonValue(window.durableDebt().workByService(), objectMapper,
+                            "steady durable-debt window"));
             System.out.printf("  \"minOfferedLoadRatio\": %.4f,%n", config.minOfferedLoadRatio());
             System.out.printf("  \"minCompletionRatio\": %.4f,%n", config.minCompletionRatio());
             System.out.printf("  \"maxBacklogGrowthPerSecond\": %.4f,%n",
@@ -2871,14 +3139,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
         }
 
         private void printDurableDebt(DurableDebtSnapshot debt) {
-            System.out.printf("  \"finalOrderOutboxActiveDebt\": %d,%n", debt.orderOutboxActive());
-            System.out.printf("  \"finalOrderOutboxTerminalDebt\": %d,%n", debt.orderOutboxTerminal());
-            System.out.printf("  \"finalWalletOutboxActiveDebt\": %d,%n", debt.walletOutboxActive());
-            System.out.printf("  \"finalWalletOutboxTerminalDebt\": %d,%n", debt.walletOutboxTerminal());
-            System.out.printf("  \"finalMatchOutboxActiveDebt\": %d,%n", debt.matchOutboxActive());
-            System.out.printf("  \"finalMatchOutboxTerminalDebt\": %d,%n", debt.matchOutboxTerminal());
-            System.out.printf("  \"finalMatchCleanupActiveDebt\": %d,%n", debt.matchCleanupActive());
-            System.out.printf("  \"finalMatchCleanupTerminalDebt\": %d,%n", debt.matchCleanupTerminal());
+            printDurableDebtFields(debt, objectMapper);
         }
 
         private UUID deterministicSteadyOrderId(String runId, String side, int index) {
@@ -3116,7 +3377,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     baseline);
             writer.write(String.format(
                     java.util.Locale.ROOT,
-                    "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                    "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s%n",
                     System.currentTimeMillis(),
                     sample.matchTrades(),
                     sample.orderTrades(),
@@ -3133,7 +3394,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     sample.walletInboxDebt().terminalDebt(),
                     sample.matchInboxDebt().activeBacklog(),
                     sample.matchInboxDebt().oldestUnresolvedAgeSeconds(),
-                    sample.matchInboxDebt().terminalDebt()));
+                    sample.matchInboxDebt().terminalDebt(),
+                    encodeDurableDebtSample(sample.durableDebt())));
             writer.flush();
         }
 
@@ -3232,7 +3494,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     continue;
                 }
                 String[] values = line.split(",", -1);
-                if (values.length != 17) {
+                if (values.length != 18) {
                     throw new IOException("invalid external monitor CSV row: " + line);
                 }
                 long sampleEpochMillis = Long.parseLong(values[0]);
@@ -3293,7 +3555,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                         new InboxDebtSnapshot(
                                 matchInboxBacklog,
                                 matchInboxOldestAge,
-                                matchInboxTerminalDebt)));
+                                matchInboxTerminalDebt),
+                        decodeDurableDebtSample(values[17])));
             }
             return List.copyOf(samples);
         }
@@ -3759,6 +4022,25 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (window.maxBacklog() > maxBacklog) {
                 reasons.add("stage_queue_backlog_above_limit");
             }
+            long maxInboxOldestAgeSeconds = Math.max(
+                    config.sampleIntervalSeconds() * 2L,
+                    (long) Math.ceil(maxBacklog / (double) targetOrderTps));
+            reasons.addAll(inboxDebtInvalidReasons(
+                    "order", window.orderInboxDebt(), window.observedSeconds(),
+                    targetOrderTps, maxBacklogGrowth, maxBacklog,
+                    maxInboxOldestAgeSeconds));
+            reasons.addAll(inboxDebtInvalidReasons(
+                    "wallet", window.walletInboxDebt(), window.observedSeconds(),
+                    targetOrderTps, maxBacklogGrowth, maxBacklog,
+                    maxInboxOldestAgeSeconds));
+            reasons.addAll(inboxDebtInvalidReasons(
+                    "match", window.matchInboxDebt(), window.observedSeconds(),
+                    targetOrderTps, maxBacklogGrowth, maxBacklog,
+                    maxInboxOldestAgeSeconds));
+            reasons.addAll(durableDebtInvalidReasons(
+                    "stage", window.durableDebt(), window.observedSeconds(),
+                    targetOrderTps, maxBacklogGrowth, maxBacklog,
+                    maxInboxOldestAgeSeconds));
             if (window.queueReadFailures() != 0) {
                 reasons.add("stage_queue_metrics_read_failures");
             }
@@ -3833,6 +4115,9 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             if (completion.queueReadFailures() != 0) {
                 reasons.add("final_queue_metrics_read_failures");
             }
+            if (!completion.durableDebt().converged()) {
+                reasons.add("final_durable_debt_or_observation_failure");
+            }
             return reasons;
         }
 
@@ -3900,7 +4185,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     .orElse(0);
 
             System.out.println("{");
-            System.out.println("  \"benchmarkSchemaVersion\": 2,");
+            System.out.printf("  \"benchmarkSchemaVersion\": %d,%n", BENCHMARK_SCHEMA_VERSION);
             System.out.println("  \"benchmarkContract\": \"http-matched-staircase-chain\",");
             System.out.printf("  \"runId\": \"%s\",%n", json(config.common().runId()));
             System.out.printf("  \"marketId\": \"%s\",%n", json(config.common().marketId()));
@@ -3968,6 +4253,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                 System.out.printf("      \"maxBacklog\": %d,%n", window.maxBacklog());
                 System.out.printf("      \"backlogSlopePerSecond\": %.4f,%n",
                         window.backlogSlopePerSecond());
+                System.out.printf("      \"durableDebtObservationsHealthy\": %s,%n",
+                        window.durableDebt().observationsHealthy());
+                System.out.printf("      \"durableDebtComponents\": %s,%n",
+                        jsonValue(window.durableDebt().workByService(), objectMapper,
+                                "staircase durable-debt window"));
                 System.out.printf("      \"passed\": %s,%n", stage.passed());
                 System.out.printf("      \"invalidReasons\": %s%n",
                         jsonArray(stage.invalidReasons()));
@@ -4002,6 +4292,19 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     completion.matchAdmissionInboxAppliedRows());
             System.out.printf("  \"matchAdmissionInboxNonAppliedRows\": %d,%n",
                     completion.matchAdmissionInboxNonAppliedRows());
+            System.out.printf("  \"finalOrderInboxBacklog\": %d,%n",
+                    completion.orderInboxDebt().activeBacklog());
+            System.out.printf("  \"finalOrderInboxTerminalDebt\": %d,%n",
+                    completion.orderInboxDebt().terminalDebt());
+            System.out.printf("  \"finalWalletInboxBacklog\": %d,%n",
+                    completion.walletInboxDebt().activeBacklog());
+            System.out.printf("  \"finalWalletInboxTerminalDebt\": %d,%n",
+                    completion.walletInboxDebt().terminalDebt());
+            System.out.printf("  \"finalMatchInboxBacklog\": %d,%n",
+                    completion.matchInboxDebt().activeBacklog());
+            System.out.printf("  \"finalMatchInboxTerminalDebt\": %d,%n",
+                    completion.matchInboxDebt().terminalDebt());
+            printDurableDebtFields(completion.durableDebt(), objectMapper);
             System.out.printf("  \"finalMatchedOrderRows\": %d,%n", completion.matchedOrders());
             System.out.printf("  \"finalMatchTradeRows\": %d,%n", completion.matchTrades());
             System.out.printf("  \"finalOrderTradeRows\": %d,%n", completion.orderTrades());
@@ -4009,6 +4312,13 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"threeServiceTradeIdsEqual\": %s,%n", completion.tradeIds().equal());
             System.out.printf("  \"tradeIdFingerprint\": \"%s\",%n",
                     completion.tradeIds().fingerprint());
+            System.out.printf("  \"assetReconciliationPassed\": %s,%n",
+                    SteadyStateRunner.balancesConverged(
+                            expectedOutcome,
+                            initialBuyerBalances,
+                            initialSellerBalances,
+                            completion.buyerBalances(),
+                            completion.sellerBalances()));
             printBalances("initialBuyer", initialBuyerBalances);
             printBalances("initialSeller", initialSellerBalances);
             printBalances("finalBuyer", completion.buyerBalances());
@@ -4017,6 +4327,11 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             System.out.printf("  \"remainingSellOrders\": %d,%n", completion.sellBook());
             System.out.printf("  \"activeMatchReservations\": %d,%n", completion.activeReservations());
             System.out.printf("  \"finalQueueBacklog\": %d,%n", completion.finalQueueBacklog());
+            QueueDepth deadLetters = completion.finalQueueDepths().get(DEAD_LETTER_QUEUE);
+            long finalDlqBacklog = deadLetters == null
+                    ? -1
+                    : deadLetters.ready() + deadLetters.unacked();
+            System.out.printf("  \"finalDlqBacklog\": %d,%n", finalDlqBacklog);
             printQueueDepths(completion.finalQueueDepths());
             System.out.printf("  \"fullConvergenceSeconds\": %.4f,%n", fullConvergenceSeconds);
             System.out.printf("  \"fullConvergenceTradeTps\": %.2f,%n",
@@ -4042,6 +4357,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     original.flushRedisOnReset(),
                     original.orderUrl(),
                     original.walletUrl(),
+                    original.matchUrl(),
                     original.orderJdbcUrl(),
                     original.walletJdbcUrl(),
                     original.matchJdbcUrl(),
@@ -4161,7 +4477,8 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long orderReservationInboxBacklog,
             InboxDebtSnapshot orderInboxDebt,
             InboxDebtSnapshot walletInboxDebt,
-            InboxDebtSnapshot matchInboxDebt) {
+            InboxDebtSnapshot matchInboxDebt,
+            DurableDebtSnapshot durableDebt) {
     }
 
     record BacklogWindow(
@@ -4219,6 +4536,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             InboxDebtWindow orderInboxDebt,
             InboxDebtWindow walletInboxDebt,
             InboxDebtWindow matchInboxDebt,
+            DurableDebtWindow durableDebt,
             long queueReadFailures,
             int samples) {
         private static SteadyWindow empty() {
@@ -4229,32 +4547,133 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     InboxDebtWindow.empty(),
                     InboxDebtWindow.empty(),
                     InboxDebtWindow.empty(),
+                    DurableDebtWindow.unavailable(),
                     0, 0);
         }
     }
 
-    private record DurableDebtSnapshot(
-            long orderOutboxActive,
-            long orderOutboxTerminal,
-            long walletOutboxActive,
-            long walletOutboxTerminal,
-            long matchOutboxActive,
-            long matchOutboxTerminal,
-            long matchCleanupActive,
-            long matchCleanupTerminal) {
-        private static DurableDebtSnapshot empty() {
-            return new DurableDebtSnapshot(0, 0, 0, 0, 0, 0, 0, 0);
+    private record DurableWorkKey(String service, String work) {
+    }
+
+    record DurableWorkDebtWindow(
+            BacklogWindow totalCount,
+            long maxRetryCount,
+            long maxTerminalCount,
+            long maxOldestUnresolvedAgeSeconds) {
+    }
+
+    record DurableDebtWindow(
+            Map<String, Map<String, DurableWorkDebtWindow>> workByService,
+            boolean observationsHealthy) {
+        private static DurableDebtWindow unavailable() {
+            return new DurableDebtWindow(Map.of(), false);
         }
 
-        private boolean converged() {
-            return orderOutboxActive == 0
-                    && orderOutboxTerminal == 0
-                    && walletOutboxActive == 0
-                    && walletOutboxTerminal == 0
-                    && matchOutboxActive == 0
-                    && matchOutboxTerminal == 0
-                    && matchCleanupActive == 0
-                    && matchCleanupTerminal == 0;
+        private DurableWorkDebtWindow component(String service, String work) {
+            return workByService.getOrDefault(service, Map.of()).get(work);
+        }
+    }
+
+    record DurableDebtSnapshot(
+            Map<String, Map<String, DurableWorkDebt>> workByService,
+            boolean observationsHealthy) {
+        private static DurableDebtSnapshot empty() {
+            return new DurableDebtSnapshot(Map.of(), false);
+        }
+
+        boolean converged() {
+            return observationsHealthy
+                    && workByService.values().stream()
+                    .flatMap(work -> work.values().stream())
+                    .allMatch(debt -> debt.totalCount() == 0);
+        }
+
+        DurableWorkDebt component(String service, String work) {
+            return workByService.getOrDefault(service, Map.of())
+                    .getOrDefault(work, DurableWorkDebt.unavailable());
+        }
+
+        private InboxDebtSnapshot inboxSummary(String service, List<String> inboxWork) {
+            Map<String, DurableWorkDebt> serviceWork = workByService.get(service);
+            if (!observationsHealthy || serviceWork == null
+                    || !serviceWork.keySet().containsAll(inboxWork)) {
+                return new InboxDebtSnapshot(1, Long.MAX_VALUE, 1);
+            }
+            long active = 0;
+            long terminal = 0;
+            long oldest = 0;
+            for (String work : inboxWork) {
+                DurableWorkDebt debt = serviceWork.get(work);
+                active += debt.activeCount();
+                terminal += debt.terminalCount();
+                oldest = Math.max(oldest, debt.oldestUnresolvedAgeSeconds());
+            }
+            return new InboxDebtSnapshot(active, oldest, terminal);
+        }
+
+        private long orderOutboxActive() {
+            return component("eap-order", "event_outbox").activeCount();
+        }
+
+        private long orderOutboxTerminal() {
+            return component("eap-order", "event_outbox").terminalCount();
+        }
+
+        private long walletOutboxActive() {
+            return component("eap-wallet", "event_outbox").activeCount();
+        }
+
+        private long walletOutboxTerminal() {
+            return component("eap-wallet", "event_outbox").terminalCount();
+        }
+
+        private long matchOutboxActive() {
+            return component("eap-matchEngine", "trade_outbox").activeCount();
+        }
+
+        private long matchOutboxTerminal() {
+            return component("eap-matchEngine", "trade_outbox").terminalCount();
+        }
+
+        private long matchCleanupActive() {
+            return component("eap-matchEngine", "reservation_cleanup").activeCount();
+        }
+
+        private long matchCleanupTerminal() {
+            return component("eap-matchEngine", "reservation_cleanup").terminalCount();
+        }
+    }
+
+    record DurableWorkDebt(
+            long totalCount,
+            long retryCount,
+            long terminalCount,
+            long oldestUnresolvedAgeSeconds) {
+        private static DurableWorkDebt unavailable() {
+            return new DurableWorkDebt(-1, -1, -1, -1);
+        }
+
+        private boolean valid() {
+            return totalCount >= 0
+                    && retryCount >= 0
+                    && terminalCount >= 0
+                    && oldestUnresolvedAgeSeconds >= 0
+                    && retryCount <= totalCount
+                    && terminalCount <= totalCount
+                    && (totalCount > 0 || oldestUnresolvedAgeSeconds == 0);
+        }
+
+        private long activeCount() {
+            return totalCount < 0 ? -1 : Math.max(0, totalCount - terminalCount);
+        }
+    }
+
+    record ServiceDebtSnapshot(
+            String service,
+            Map<String, DurableWorkDebt> work,
+            boolean healthy) {
+        private static ServiceDebtSnapshot unavailable(String service) {
+            return new ServiceDebtSnapshot(service, Map.of(), false);
         }
     }
 
@@ -4481,6 +4900,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     parsed.flushRedisOnReset(),
                     parsed.orderUrl(),
                     parsed.walletUrl(),
+                    parsed.matchUrl(),
                     parsed.orderJdbcUrl(),
                     parsed.walletJdbcUrl(),
                     parsed.matchJdbcUrl(),
@@ -4606,6 +5026,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     parsed.flushRedisOnReset(),
                     parsed.orderUrl(),
                     parsed.walletUrl(),
+                    parsed.matchUrl(),
                     parsed.orderJdbcUrl(),
                     parsed.walletJdbcUrl(),
                     parsed.matchJdbcUrl(),
@@ -4758,6 +5179,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             long sellBook,
             long activeReservations,
             TradeIdSetCheck tradeIds,
+            DurableDebtSnapshot durableDebt,
             long finalQueueBacklog,
             long queueReadFailures,
             long maxQueueBacklog,
@@ -4769,6 +5191,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     RoleBalances.empty(), RoleBalances.empty(),
                     -1, -1, -1, TradeIdSetCheck.empty(),
+                    DurableDebtSnapshot.empty(),
                     Long.MAX_VALUE, 0, 0, Map.of(), 0, 0);
         }
     }
@@ -4830,6 +5253,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
             boolean flushRedisOnReset,
             String orderUrl,
             String walletUrl,
+            String matchUrl,
             String orderJdbcUrl,
             String walletJdbcUrl,
             String matchJdbcUrl,
@@ -4857,6 +5281,7 @@ public class HttpMatchedTradeCompletionLoadGenerator {
                     booleanArg(args, "--flush-redis-on-reset", true),
                     stringArg(args, "--order-url", "http://localhost:8080/eap-order"),
                     stringArg(args, "--wallet-url", "http://localhost:8081/eap-wallet"),
+                    stringArg(args, "--match-url", "http://localhost:8082/match-engine"),
                     stringArg(args, "--order-jdbc-url", "jdbc:postgresql://localhost:15432/eap_order_db"),
                     stringArg(args, "--wallet-jdbc-url", "jdbc:postgresql://localhost:15433/eap_wallet_db"),
                     stringArg(args, "--match-jdbc-url", "jdbc:postgresql://localhost:15434/eap_match_db"),

@@ -4,6 +4,7 @@ import com.eap.eap_order.domain.ordersourcing.OrderCancelledV1;
 import com.eap.eap_order.domain.ordersourcing.OrderMatchedV1;
 import com.eap.eap_order.domain.ordersourcing.OrderSubmissionRequestedV1;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,8 +16,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
+@Slf4j
 public class OrdersCurrentProjector {
 
     private static final String PROJECTION_NAME = "orders_current";
@@ -29,6 +32,7 @@ public class OrdersCurrentProjector {
     private final int maxBatchesPerTick;
     private final int repairBatchSize;
     private final boolean repairEnabled;
+    private final AtomicBoolean failureStateMayNeedClearing = new AtomicBoolean(true);
 
     public OrdersCurrentProjector(
             @Qualifier("orderProjectionJdbcTemplate") JdbcTemplate jdbc,
@@ -69,13 +73,79 @@ public class OrdersCurrentProjector {
     }
 
     private void projectBatches(int maxBatches) {
-        boolean fullBatch;
-        int batches = 0;
-        do {
-            Boolean result = transactionTemplate.execute(status -> projectBatch());
-            fullBatch = Boolean.TRUE.equals(result);
-            batches++;
-        } while (fullBatch && batches < maxBatches);
+        try {
+            boolean fullBatch;
+            int batches = 0;
+            do {
+                Boolean result = transactionTemplate.execute(status -> projectBatch());
+                fullBatch = Boolean.TRUE.equals(result);
+                batches++;
+            } while (fullBatch && batches < maxBatches);
+            clearRecordedFailureIfNeeded();
+        } catch (RuntimeException failure) {
+            recordFailure(failure);
+            throw failure;
+        }
+    }
+
+    private void recordFailure(RuntimeException failure) {
+        failureStateMayNeedClearing.set(true);
+        String message = failureDescription(failure);
+        try {
+            jdbc.update("""
+                    INSERT INTO order_service.projection_checkpoints
+                        (projection_name, last_global_position, updated_at, failure_count,
+                         first_failure_at, last_failure_at, last_error)
+                    VALUES (?, 0, CURRENT_TIMESTAMP, 1,
+                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                    ON CONFLICT (projection_name) DO UPDATE
+                    SET failure_count = projection_checkpoints.failure_count + 1,
+                        first_failure_at = COALESCE(
+                            projection_checkpoints.first_failure_at, CURRENT_TIMESTAMP),
+                        last_failure_at = CURRENT_TIMESTAMP,
+                        last_error = EXCLUDED.last_error
+                    """, PROJECTION_NAME, message);
+        } catch (RuntimeException recordingFailure) {
+            log.warn("Could not persist orders_current projection failure state", recordingFailure);
+        }
+    }
+
+    private static String failureDescription(Throwable failure) {
+        StringBuilder description = new StringBuilder();
+        Throwable current = failure;
+        int depth = 0;
+        while (current != null && depth < 5 && description.length() < 4_000) {
+            if (depth > 0) {
+                description.append("; caused by ");
+            }
+            description.append(current.getClass().getName());
+            if (current.getMessage() != null && !current.getMessage().isBlank()) {
+                description.append(": ").append(current.getMessage());
+            }
+            current = current.getCause();
+            depth++;
+        }
+        return description.substring(0, Math.min(description.length(), 4_000));
+    }
+
+    private void clearRecordedFailureIfNeeded() {
+        if (!failureStateMayNeedClearing.compareAndSet(true, false)) {
+            return;
+        }
+        try {
+            jdbc.update("""
+                    UPDATE order_service.projection_checkpoints
+                    SET failure_count = 0,
+                        first_failure_at = NULL,
+                        last_failure_at = NULL,
+                        last_error = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE projection_name = ? AND failure_count > 0
+                    """, PROJECTION_NAME);
+        } catch (RuntimeException failure) {
+            failureStateMayNeedClearing.set(true);
+            throw failure;
+        }
     }
 
     private boolean projectBatch() {
